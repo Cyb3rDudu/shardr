@@ -1,6 +1,6 @@
 # 002 — Runner, Modelfile & Runtime Configuration
 
-Status: **Draft v0**
+Status: **Draft v0** — vectors pending: Modelfile grammar, LABEL duplicates, config overlays, runtime allowlist
 
 ## 1. Purpose
 

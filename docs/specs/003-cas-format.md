@@ -1,6 +1,6 @@
 # 003 — CAS (shardhive's content-addressed store)
 
-Status: **Draft v0**
+Status: **Draft v0** — vectors pending: CAS layout, verify exit codes, state JSON, digest forms
 
 ## 1. Purpose
 

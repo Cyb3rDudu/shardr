@@ -1,6 +1,6 @@
 # 000 — References & URI Scheme
 
-Status: **Draft v0**
+Status: **Candidate v1 (surface)** — machine-checked by `docs/specs/vectors/000-reference.jsonl`
 
 ## 1. Purpose
 
