@@ -23,26 +23,33 @@ commands:
 `
 
 func main() {
-	if len(os.Args) < 2 {
+	os.Exit(run(os.Args[1:]))
+}
+
+// run dispatches CLI args and returns the process exit code: 0 success,
+// 2 usage/dispatch error. Verification exit semantics live in runVerify.
+func run(args []string) int {
+	if len(args) < 1 {
 		fmt.Fprint(os.Stderr, usage)
-		os.Exit(2)
+		return 2
 	}
-	switch os.Args[1] {
+	switch args[0] {
 	case "version":
 		fmt.Println("shardhive", version)
+		return 0
 	case "cas":
-		if len(os.Args) == 3 && os.Args[2] == "verify" {
+		if len(args) == 2 && args[1] == "verify" {
 			fmt.Fprintln(os.Stderr, "usage: shardhive cas verify <digest|--all>")
-			os.Exit(2)
+			return 2
 		}
-		if len(os.Args) == 4 && os.Args[2] == "verify" {
-			os.Exit(runVerify(os.Args[3]))
+		if len(args) == 3 && args[1] == "verify" {
+			return runVerify(args[2])
 		}
 		fmt.Fprint(os.Stderr, usage)
-		os.Exit(2)
+		return 2
 	default:
 		fmt.Fprint(os.Stderr, usage)
-		os.Exit(2)
+		return 2
 	}
 }
 

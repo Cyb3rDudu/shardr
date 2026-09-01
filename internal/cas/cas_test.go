@@ -326,6 +326,65 @@ func TestVerifyAllFindsMutatedAndMissing(t *testing.T) {
 	}
 }
 
+// errSourceFailed simulates a mid-stream source failure during an import.
+var errSourceFailed = errors.New("source stream failed")
+
+// failingReader yields a few bytes, then fails on every subsequent Read.
+type failingReader struct{ sent bool }
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		return copy(p, "partial-bytes"), errSourceFailed
+	}
+	return 0, errSourceFailed
+}
+
+func TestPutReaderErrorCleansPart(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.Put(digestOf([]byte("irrelevant")), &failingReader{}); !errors.Is(err, errSourceFailed) {
+		t.Fatalf("want source error to surface, got %v", err)
+	}
+	if leak := parts(t, s); len(leak) != 0 {
+		t.Fatalf("part leaked after reader failure: %v", leak)
+	}
+	if n := countBlobFiles(t, s); n != 0 {
+		t.Fatalf("blob promoted despite reader failure: %d blobs", n)
+	}
+}
+
+// --- VerifyAll: foreign files must not abort the walk ---
+
+func TestVerifyAllSkipsForeignFiles(t *testing.T) {
+	s := newTestStore(t)
+	content := []byte("clean")
+	d := digestOf(content)
+	if err := s.Put(d, bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{
+		filepath.Join(s.blobsDir(), ".DS_Store"),
+		filepath.Join(s.blobsDir(), "ab", "zz-not-hex"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("junk"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mismatched, missing, err := s.VerifyAll()
+	if err != nil {
+		t.Fatalf("foreign file aborted verification: %v", err)
+	}
+	if len(mismatched) != 0 || len(missing) != 0 {
+		t.Fatalf("mismatched=%v missing=%v, want both empty", mismatched, missing)
+	}
+	if err := s.Verify(d); err != nil {
+		t.Fatalf("clean blob flagged: %v", err)
+	}
+}
+
 // --- Read path ---
 
 func TestOpenReadsBlob(t *testing.T) {
