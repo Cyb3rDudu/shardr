@@ -21,7 +21,10 @@ shardr:///ns/name[:sel][@digest]
 ```
 ns     := [a-z0-9][a-z0-9._-]{0,63}
 name   := [a-z0-9][a-z0-9._-]{0,127}
-sel    := quant | tag["+"quant]     ; quant-only is the primary form
+sel    := quant | tag "+" quant     ; a quant is ALWAYS required — the
+                                    ; runner addresses a servable unit
+                                    ; (weights in a concrete quantization),
+                                    ; never a bare family
 tag    := [a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}   ; case-sensitive local alias
 quant  := per Appendix A
 digest := "sha256:" 64*HEXLOWER
