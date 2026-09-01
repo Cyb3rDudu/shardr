@@ -110,9 +110,10 @@ func runServe(args []string) int {
 	return 0
 }
 
-// normalizeVerifyArg accepts canonical "sha256:<hex>" digests and bare hex,
-// returning bare hex (the CLI-internal form). Anything else passes through
-// and fails digest validation loudly.
+// normalizeVerifyArg accepts canonical "sha256:<hex>" digests and bare
+// lowercase hex, returning bare hex (the CLI-internal form). Anything else
+// passes through unchanged and fails digest validation loudly — uppercase
+// hex is not canonicalized away (canonical or nothing).
 func normalizeVerifyArg(arg string) string {
 	return strings.TrimPrefix(arg, "sha256:")
 }
@@ -128,7 +129,7 @@ func runVerify(arg string) int {
 		return exitVerifyMissing
 	}
 	if arg != "--all" {
-		d := strings.ToLower(normalizeVerifyArg(arg))
+		d := normalizeVerifyArg(arg)
 		if err := store.Verify(d); err != nil {
 			fmt.Println("FAIL", err)
 			switch {

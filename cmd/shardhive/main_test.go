@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Cyb3rDudu/shardr/internal/cas"
@@ -172,4 +174,46 @@ func TestBlobPathMatchesLayout(t *testing.T) {
 	if p != want {
 		t.Fatalf("got %s want %s", p, want)
 	}
+}
+
+// --- Straggler c: cas verify accepts no uppercase hex (canonical or nothing) ---
+
+func TestVerifyRejectsUppercaseHex(t *testing.T) {
+	s := withTestCAS(t)
+	lower := put(t, s, []byte("canonical case"))
+	upper := strings.ToUpper(lower)
+
+	code, out := captureStdout(t, func() int { return runVerify(upper) })
+	if code != 2 {
+		t.Fatalf("uppercase hex: exit %d want 2", code)
+	}
+	if !strings.Contains(out, "uppercase") || !strings.Contains(out, "lowercase") {
+		t.Fatalf("error must point at the canonical form, got: %s", out)
+	}
+
+	// Same digest, canonical lowercase: verifies clean.
+	if code, _ := captureStdout(t, func() int { return runVerify(lower) }); code != 0 {
+		t.Fatalf("lowercase hex: exit %d want 0", code)
+	}
+	// Canonical sha256: prefix + lowercase still works.
+	if code, _ := captureStdout(t, func() int { return runVerify("sha256:" + lower) }); code != 0 {
+		t.Fatalf("sha256: prefix: exit %d want 0", code)
+	}
+}
+
+// captureStdout runs f, returning its exit code and everything printed to
+// stdout (and stderr, merged) for assertion.
+func captureStdout(t *testing.T, f func() int) (int, string) {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	code := f()
+	w.Close()
+	os.Stdout = old
+	b, _ := io.ReadAll(r)
+	return code, string(b)
 }

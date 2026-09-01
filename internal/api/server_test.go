@@ -15,9 +15,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Cyb3rDudu/shardr/internal/cas"
+	"github.com/Cyb3rDudu/shardr/internal/ref"
 )
 
 // harness spins up a real server on a Unix socket and hands out an HTTP
@@ -179,7 +181,7 @@ func seedRepo(t *testing.T, h *harness, nsKey, q8ManifestContent string) string 
 	index := `{"artifactType":"model-index","schemaVersion":1,"members":[` +
 		`{"quant":"q8_0","manifest":"sha256:` + q8 + `","weightsFormat":"gguf"},` +
 		`{"quant":"q4_0","manifest":"sha256:4081c843632a7f131bb8003ad639f3a16fa5bf1d7a6c3c05d16c11e818c23b63","weightsFormat":"gguf"},` +
-		`{"quant":"q4_1","manifest":"sha256:5ee17e428b0c834f96e83d2ce44c8084d2af36a158aef6dbd77b6dc8be276c","weightsFormat":"gguf"}]}`
+		`{"quant":"q4_1","manifest":"sha256:` + testDigestOf([]byte("q4_1-manifest-bytes")) + `","weightsFormat":"gguf"}]}`
 	d := h.putHashed([]byte(index))
 	if err := h.store.SetNamespace(nsKey, d); err != nil {
 		t.Fatal(err)
@@ -199,12 +201,11 @@ func TestResolvePureNoCASMutation(t *testing.T) {
 		ref   string
 		quant string
 	}{
-		{"unsloth/qwen3.8-27b-gguf:q8_0", "q8_0"},
-		{"unsloth/qwen3.8-27b-gguf:q8", "q8_0"},             // unique prefix
-		{"shardr:///unsloth/qwen3.8-27b-gguf:q8_0", "q8_0"}, // canonical URI
+		{"shardr:///unsloth/qwen3.8-27b-gguf:q8_0", "q8_0"}, // canonical URI only
+		{"shardr:///unsloth/qwen3.8-27b-gguf:q8", "q8_0"},   // unique prefix
 	}
 	for _, c := range cases {
-		code, body := h.get("/v1/resolve?ref=" + c.ref)
+		code, body := h.get("/v1/resolve?ref=" + url.QueryEscape(c.ref))
 		if code != http.StatusOK {
 			t.Fatalf("ref %s: status %d body %s", c.ref, code, body)
 		}
@@ -228,7 +229,7 @@ func TestResolveErrors(t *testing.T) {
 	seedRepo(t, h, "unsloth/other-model", "other-bytes")
 
 	// Unknown ref: loud, with same-namespace candidates, no network.
-	code, body := h.get("/v1/resolve?ref=unsloth/missing:q8_0")
+	code, body := h.get("/v1/resolve?ref=" + url.QueryEscape("shardr:///unsloth/missing:q8_0"))
 	if code != http.StatusNotFound {
 		t.Fatalf("status %d body %s", code, body)
 	}
@@ -249,7 +250,7 @@ func TestResolveErrors(t *testing.T) {
 	}
 
 	// Ambiguous prefix lists candidates (000 §3.1 via API).
-	code, body = h.get("/v1/resolve?ref=unsloth/qwen3.8-27b-gguf:q4")
+	code, body = h.get("/v1/resolve?ref=" + url.QueryEscape("shardr:///unsloth/qwen3.8-27b-gguf:q4"))
 	if code != http.StatusBadRequest {
 		t.Fatalf("ambiguous: status %d body %s", code, body)
 	}
@@ -260,12 +261,12 @@ func TestResolveErrors(t *testing.T) {
 	}
 
 	// No selector is a resolution error (000 §2).
-	code, body = h.get("/v1/resolve?ref=unsloth/qwen3.8-27b-gguf")
+	code, body = h.get("/v1/resolve?ref=" + url.QueryEscape("shardr:///unsloth/qwen3.8-27b-gguf"))
 	if code != http.StatusBadRequest {
 		t.Fatalf("no-selector: status %d body %s", code, body)
 	}
 	json.Unmarshal(body, &e)
-	if e.Error.Code != ErrInvalidRef {
+	if e.Error.Code != ref.ErrNoSelector {
 		t.Fatalf("no-selector code %s", e.Error.Code)
 	}
 
@@ -287,7 +288,7 @@ func TestResolveNoIndexBlob(t *testing.T) {
 	if err := h.store.SetNamespace("ns/ghost", strings.TrimPrefix(ghost, "sha256:")); err != nil {
 		t.Fatal(err)
 	}
-	code, body := h.get("/v1/resolve?ref=ns/ghost:q8_0")
+	code, body := h.get("/v1/resolve?ref=" + url.QueryEscape("shardr:///ns/ghost:q8_0"))
 	if code != http.StatusNotFound {
 		t.Fatalf("status %d body %s", code, body)
 	}
@@ -309,7 +310,7 @@ func TestEnsureLocalPresence(t *testing.T) {
 	manifestHex := testDigestOf([]byte(manifestContent))
 
 	// Missing manifest → failed with E_SOURCE_UNAVAILABLE naming reserved sources.
-	code, body := h.postJSON("/v1/ensure", map[string]string{"ref": "ns/models:q8_0"})
+	code, body := h.postJSON("/v1/ensure", map[string]string{"ref": "shardr:///ns/models:q8_0"})
 	if code != http.StatusCreated {
 		t.Fatalf("status %d body %s", code, body)
 	}
@@ -333,7 +334,7 @@ func TestEnsureLocalPresence(t *testing.T) {
 	}
 
 	// Unknown ref → failed with the resolution error, never a network fetch.
-	code, body = h.postJSON("/v1/ensure", map[string]string{"ref": "ns/nope:q8_0"})
+	code, body = h.postJSON("/v1/ensure", map[string]string{"ref": "shardr:///ns/nope:q8_0"})
 	if code != http.StatusCreated {
 		t.Fatalf("unknown ref: status %d body %s", code, body)
 	}
@@ -346,7 +347,7 @@ func TestEnsureLocalPresence(t *testing.T) {
 	if err := h.store.Put(manifestHex, strings.NewReader(manifestContent)); err != nil {
 		t.Fatal(err)
 	}
-	code, body = h.postJSON("/v1/ensure", map[string]string{"ref": "ns/models:q8_0"})
+	code, body = h.postJSON("/v1/ensure", map[string]string{"ref": "shardr:///ns/models:q8_0"})
 	if code != http.StatusCreated {
 		t.Fatalf("present: status %d body %s", code, body)
 	}
@@ -374,7 +375,7 @@ func TestOpenListsPathsAndMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	code, body := h.get("/v1/open?ref=ns/models:q8_0")
+	code, body := h.get("/v1/open?ref=" + url.QueryEscape("shardr:///ns/models:q8_0"))
 	if code != http.StatusOK {
 		t.Fatalf("status %d body %s", code, body)
 	}
@@ -397,7 +398,7 @@ func TestOpenListsPathsAndMissing(t *testing.T) {
 	}
 
 	// Absent manifest: listed as missing, never fetched.
-	code, body = h.get("/v1/open?ref=ns/models:q4_0")
+	code, body = h.get("/v1/open?ref=" + url.QueryEscape("shardr:///ns/models:q4_0"))
 	if code != http.StatusOK {
 		t.Fatalf("q4_0: status %d body %s", code, body)
 	}
@@ -484,7 +485,7 @@ func TestBlobRangeSemantics(t *testing.T) {
 
 func TestVersionNegotiation(t *testing.T) {
 	h := newHarness(t)
-	code, body := h.get("/v2/resolve?ref=ns/name:q8_0")
+	code, body := h.get("/v2/resolve?ref=x")
 	if code != http.StatusBadRequest {
 		t.Fatalf("v2: status %d", code)
 	}
@@ -539,7 +540,7 @@ func TestModelsInventory(t *testing.T) {
 	if err := h.store.SetNamespace("ns/ghost", ghost); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.store.SetTagAlias("stable", strings.TrimPrefix(present, "sha256:")); err != nil {
+	if err := h.store.SetTagAlias("ns/models", "stable", strings.TrimPrefix(present, "sha256:")); err != nil {
 		t.Fatal(err)
 	}
 	code, body := h.get("/v1/models")
@@ -547,17 +548,23 @@ func TestModelsInventory(t *testing.T) {
 		t.Fatalf("status %d body %s", code, body)
 	}
 	var inv struct {
+		Skeleton   bool `json:"skeleton"`
 		Namespaces []struct {
-			Name         string `json:"name"`
-			IndexPresent bool   `json:"indexPresent"`
+			Name         string   `json:"name"`
+			IndexPresent bool     `json:"indexPresent"`
+			Quants       []string `json:"quants"`
 		} `json:"namespaces"`
 		Tags []struct {
-			Alias       string `json:"alias"`
+			Repo        string `json:"repo"`
+			Tag         string `json:"tag"`
 			BlobPresent bool   `json:"blobPresent"`
 		} `json:"tags"`
 	}
 	if err := json.Unmarshal(body, &inv); err != nil {
 		t.Fatal(err)
+	}
+	if !inv.Skeleton {
+		t.Fatal("inventory must be marked as skeleton")
 	}
 	if len(inv.Namespaces) != 2 || len(inv.Tags) != 1 {
 		t.Fatalf("inventory %+v", inv)
@@ -579,11 +586,11 @@ func TestModelsInventory(t *testing.T) {
 func TestResolveViaTag(t *testing.T) {
 	h := newHarness(t)
 	indexD := seedRepo(t, h, "ns/models", "q8-manifest-bytes")
-	if err := h.store.SetTagAlias("Stable", strings.TrimPrefix(indexD, "sha256:")); err != nil {
+	if err := h.store.SetTagAlias("ns/models", "Stable", strings.TrimPrefix(indexD, "sha256:")); err != nil {
 		t.Fatal(err)
 	}
 	// Tag snapshot resolves like the current index; tag is case-sensitive.
-	code, body := h.get("/v1/resolve?ref=" + url.QueryEscape("ns/models:Stable+q8_0"))
+	code, body := h.get("/v1/resolve?ref=" + url.QueryEscape("shardr:///ns/models:Stable+q8_0"))
 	if code != http.StatusOK {
 		t.Fatalf("status %d body %s", code, body)
 	}
@@ -592,15 +599,346 @@ func TestResolveViaTag(t *testing.T) {
 	if res.Tag != "Stable" || res.ManifestDigest != "sha256:"+testDigestOf([]byte("q8-manifest-bytes")) {
 		t.Fatalf("res %+v", res)
 	}
-	code, body = h.get("/v1/resolve?ref=" + url.QueryEscape("ns/models:miss+q8_0"))
-	if code != http.StatusBadRequest {
+	code, body = h.get("/v1/resolve?ref=" + url.QueryEscape("shardr:///ns/models:miss+q8_0"))
+	if code != http.StatusNotFound { // unknown tag == unknown ref (R3 scoping)
 		t.Fatalf("unknown tag: %d", code)
 	}
 	var e struct {
 		Error APIError `json:"error"`
 	}
 	json.Unmarshal(body, &e)
-	if e.Error.Code != ErrInvalidRef {
+	if e.Error.Code != ErrUnknownRef {
 		t.Fatalf("unknown tag code %s", e.Error.Code)
+	}
+}
+
+// --- Fix 1: short refs are banished from the API (canonical form only) ---
+
+func TestAPIRejectsShortRefsWithCanonicalHint(t *testing.T) {
+	h := newHarness(t)
+	seedRepo(t, h, "ns/models", "x")
+
+	// resolve via query param
+	code, body := h.get("/v1/resolve?ref=ns/models:q8_0")
+	if code != http.StatusBadRequest {
+		t.Fatalf("short ref accepted: %d %s", code, body)
+	}
+	var e struct {
+		Error APIError `json:"error"`
+	}
+	json.Unmarshal(body, &e)
+	if !strings.Contains(e.Error.Message, "shardr:///ns/models:q8_0") {
+		t.Fatalf("message must name the canonical form, got: %s", e.Error.Message)
+	}
+
+	// ensure via JSON body
+	code, body = h.postJSON("/v1/ensure", map[string]string{"ref": "ns/models:q8_0"})
+	if code != http.StatusBadRequest {
+		t.Fatalf("short ref in ensure accepted: %d %s", code, body)
+	}
+	json.Unmarshal(body, &e)
+	if !strings.Contains(e.Error.Message, "shardr:///ns/models:q8_0") {
+		t.Fatalf("ensure message must name the canonical form, got: %s", e.Error.Message)
+	}
+
+	// Unparseable garbage does not get a canonical hint.
+	code, body = h.get("/v1/resolve?ref=garbage")
+	if code != http.StatusBadRequest {
+		t.Fatalf("garbage: %d", code)
+	}
+	json.Unmarshal(body, &e)
+	if strings.Contains(e.Error.Message, "use shardr:///") {
+		t.Fatalf("garbage must not get a canonical hint: %s", e.Error.Message)
+	}
+}
+
+// --- Fix 2: socket path protection (never delete non-sockets) ---
+
+func TestListenProtectsNonSocketPaths(t *testing.T) {
+	store, _ := cas.Open(t.TempDir())
+
+	// Short dir: nested Go test temp dirs exceed macOS's ~104-byte sun_path.
+	dir, err := os.MkdirTemp(os.TempDir(), "shxfix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	filePath := filepath.Join(dir, "precious.sock")
+	const payload = "not a socket — user data"
+	os.WriteFile(filePath, []byte(payload), 0o644)
+	srv, err := New(store, filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Listen(); err == nil {
+		srv.Close()
+		t.Fatal("Listen must refuse to replace a regular file")
+	}
+	b, _ := os.ReadFile(filePath)
+	if string(b) != payload {
+		t.Fatalf("regular file damaged: %q", b)
+	}
+
+	// Directory at the socket path.
+	dirPath := filepath.Join(dir, "dir.sock")
+	os.Mkdir(dirPath, 0o755)
+	srv, err = New(store, dirPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Listen(); err == nil {
+		srv.Close()
+		t.Fatal("Listen must refuse to replace a directory")
+	}
+	if fi, err := os.Stat(dirPath); err != nil || !fi.IsDir() {
+		t.Fatalf("directory damaged: %v", err)
+	}
+
+	// Symlink at the socket path.
+	target := filepath.Join(dir, "target")
+	os.WriteFile(target, nil, 0o644)
+	linkPath := filepath.Join(dir, "link.sock")
+	os.Symlink(target, linkPath)
+	srv, err = New(store, linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Listen(); err == nil {
+		srv.Close()
+		t.Fatal("Listen must refuse to replace a symlink")
+	}
+	if fi, err := os.Lstat(linkPath); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("symlink damaged: %v", err)
+	}
+
+	// Genuinely orphaned socket (dead listener): replaced cleanly.
+	sockPath := filepath.Join(dir, "orphan.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln.(*net.UnixListener).SetUnlinkOnClose(false)
+	ln.Close() // socket file remains, nothing accepts on it
+	srv, err = New(store, sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Listen(); err != nil {
+		t.Fatalf("orphaned socket must be replaceable: %v", err)
+	}
+	srv.Close()
+}
+
+// --- Fix 3: 416 responses stay in the JSON error envelope ---
+
+func TestBlob416ErrorEnvelope(t *testing.T) {
+	h := newHarness(t)
+	d := h.putHashed([]byte("0123456789"))
+
+	req, _ := http.NewRequest(http.MethodGet, h.base+"/v1/blob/"+d, nil)
+	req.Header.Set("Range", "bytes=99999-")
+	resp, err := h.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("status %d want 416", resp.StatusCode)
+	}
+	var e struct {
+		Error APIError `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&e); err != nil {
+		t.Fatalf("416 body is not the JSON error envelope: %v", err)
+	}
+	if e.Error.Code != ErrRangeInvalid || e.Error.Message == "" {
+		t.Fatalf("envelope payload: %+v", e.Error)
+	}
+	// Syntactically broken ranges must also be enveloped, not plain text.
+	req2, _ := http.NewRequest(http.MethodGet, h.base+"/v1/blob/"+d, nil)
+	req2.Header.Set("Range", "bytes=zzz")
+	resp2, err := h.client.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("bad syntax: status %d", resp2.StatusCode)
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&e); err != nil {
+		t.Fatalf("416 (bad syntax) body is not JSON: %v", err)
+	}
+	// Success responses must remain raw bytes (no envelope wrapping).
+	code, body := h.get("/v1/blob/" + d)
+	if code != http.StatusOK || string(body) != "0123456789" {
+		t.Fatalf("full body broken: %d %q", code, body)
+	}
+}
+
+// --- Fix 4: job map — terminal before publish, race-free ---
+
+func TestJobsConcurrentEnsureAndPoll(t *testing.T) {
+	h := newHarness(t)
+	seedRepo(t, h, "ns/models", "manifest-bytes")
+
+	var wg sync.WaitGroup
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 15; i++ {
+				_, body := h.postJSON("/v1/ensure", map[string]string{"ref": "shardr:///ns/models:q8_0"})
+				var job Job
+				if err := json.Unmarshal(body, &job); err != nil || job.ID == "" {
+					continue
+				}
+				// Poll the job while other ensures are still publishing and
+				// mutating — under the race detector this catches a Job
+				// mutated after publication.
+				for p := 0; p < 5; p++ {
+					if code, _ := h.get("/v1/jobs/" + job.ID); code != http.StatusOK {
+						return
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// --- Fix 5: index member validation (001) ---
+
+func TestIndexMemberValidation(t *testing.T) {
+	validManifest := "sha256:" + testDigestOf([]byte("m"))
+	bad := []struct {
+		name  string
+		index string
+	}{
+		{"wrong schemaVersion", `{"artifactType":"model-index","schemaVersion":2,"members":[{"quant":"q8_0","manifest":"` + validManifest + `"}]}`},
+		{"missing schemaVersion", `{"artifactType":"model-index","members":[{"quant":"q8_0","manifest":"` + validManifest + `"}]}`},
+		{"empty members", `{"artifactType":"model-index","schemaVersion":1,"members":[]}`},
+		{"quant syntax", `{"artifactType":"model-index","schemaVersion":1,"members":[{"quant":"bogus-tag","manifest":"` + validManifest + `"}]}`},
+		{"bare hex manifest", `{"artifactType":"model-index","schemaVersion":1,"members":[{"quant":"q8_0","manifest":"` + strings.TrimPrefix(validManifest, "sha256:") + `"}]}`},
+		{"short manifest", `{"artifactType":"model-index","schemaVersion":1,"members":[{"quant":"q8_0","manifest":"sha256:abcd"}]}`},
+		{"duplicate quant", `{"artifactType":"model-index","schemaVersion":1,"members":[{"quant":"q8_0","manifest":"` + validManifest + `"},{"quant":"q8_0","manifest":"` + validManifest + `"}]}`},
+	}
+	for _, tc := range bad {
+		h := newHarness(t)
+		d := h.putHashed([]byte(tc.index))
+		if err := h.store.SetNamespace("ns/models", d); err != nil {
+			t.Fatal(err)
+		}
+		code, body := h.get("/v1/resolve?ref=" + url.QueryEscape("shardr:///ns/models:q8_0"))
+		if code != http.StatusInternalServerError {
+			t.Fatalf("%s: status %d body %s", tc.name, code, body)
+		}
+		var e struct {
+			Error APIError `json:"error"`
+		}
+		json.Unmarshal(body, &e)
+		if e.Error.Code != ErrInvalidIndex {
+			t.Fatalf("%s: code %s want E_INVALID_INDEX", tc.name, e.Error.Code)
+		}
+	}
+	// Sanity: the valid shape still resolves.
+	h := newHarness(t)
+	d := h.putHashed([]byte(`{"artifactType":"model-index","schemaVersion":1,"members":[{"quant":"q8_0","manifest":"` + validManifest + `"}]}`))
+	h.store.SetNamespace("ns/models", d)
+	if code, _ := h.get("/v1/resolve?ref=" + url.QueryEscape("shardr:///ns/models:q8_0")); code != http.StatusOK {
+		t.Fatalf("valid index rejected")
+	}
+}
+
+// --- Fix 6 (R3): tags scoped per repository ---
+
+func TestTagsScopedPerRepo(t *testing.T) {
+	h := newHarness(t)
+	idxA := seedRepo(t, h, "a/models", "repo-a-manifest")
+	idxB := seedRepo(t, h, "b/models", "repo-b-manifest")
+	if idxA == idxB {
+		t.Fatal("fixtures must differ")
+	}
+	// Same tag name in two repos: independent aliases (000 §3.4, R3).
+	if err := h.store.SetTagAlias("a/models", "snap", idxA); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SetTagAlias("b/models", "snap", idxB); err != nil {
+		t.Fatal(err)
+	}
+
+	manA := "sha256:" + testDigestOf([]byte("repo-a-manifest"))
+	manB := "sha256:" + testDigestOf([]byte("repo-b-manifest"))
+	code, body := h.get("/v1/resolve?ref=" + url.QueryEscape("shardr:///a/models:snap+q8_0"))
+	if code != http.StatusOK {
+		t.Fatalf("a/models: %d %s", code, body)
+	}
+	var res resolveResult
+	json.Unmarshal(body, &res)
+	if res.ManifestDigest != manA {
+		t.Fatalf("a/models tag leaked: %s want %s", res.ManifestDigest, manA)
+	}
+	code, body = h.get("/v1/resolve?ref=" + url.QueryEscape("shardr:///b/models:snap+q8_0"))
+	if code != http.StatusOK {
+		t.Fatalf("b/models: %d %s", code, body)
+	}
+	json.Unmarshal(body, &res)
+	if res.ManifestDigest != manB {
+		t.Fatalf("b/models tag leaked: %s want %s", res.ManifestDigest, manB)
+	}
+
+	// A repo without that tag fails loudly as unknown-ref (not silent, not
+	// cross-repo leakage), with the repo's real tags as candidates.
+	code, body = h.get("/v1/resolve?ref=" + url.QueryEscape("shardr:///c/models:snap+q8_0"))
+	if code != http.StatusNotFound {
+		t.Fatalf("foreign repo: %d %s", code, body)
+	}
+	var e struct {
+		Error APIError `json:"error"`
+	}
+	json.Unmarshal(body, &e)
+	if e.Error.Code != ErrUnknownRef {
+		t.Fatalf("foreign repo code %s want E_UNKNOWN_REF", e.Error.Code)
+	}
+	// Candidates list this repo's tags (a/models has snap).
+	code, body = h.get("/v1/resolve?ref=" + url.QueryEscape("shardr:///a/models:miss+q8_0"))
+	json.Unmarshal(body, &e)
+	if len(e.Error.Candidates) != 1 || e.Error.Candidates[0] != "snap" {
+		t.Fatalf("candidates %v want [snap]", e.Error.Candidates)
+	}
+}
+
+// --- Straggler a: /models is a marked skeleton with quants when readable ---
+
+func TestModelsSkeletonWithQuants(t *testing.T) {
+	h := newHarness(t)
+	seedRepo(t, h, "ns/models", "bytes") // index with q8_0/q4_0/q4_1
+	if err := h.store.SetNamespace("ns/ghost", testDigestOf([]byte("ghost"))); err != nil {
+		t.Fatal(err)
+	}
+	_, body := h.get("/v1/models")
+	var inv struct {
+		Skeleton   bool   `json:"skeleton"`
+		Note       string `json:"note"`
+		Namespaces []struct {
+			Name         string   `json:"name"`
+			IndexPresent bool     `json:"indexPresent"`
+			Quants       []string `json:"quants"`
+		} `json:"namespaces"`
+	}
+	if err := json.Unmarshal(body, &inv); err != nil {
+		t.Fatal(err)
+	}
+	if !inv.Skeleton || inv.Note == "" {
+		t.Fatalf("skeleton not marked: %s", body)
+	}
+	byName := map[string][]string{}
+	for _, n := range inv.Namespaces {
+		byName[n.Name] = n.Quants
+	}
+	if got := byName["models"]; len(got) != 3 || got[0] != "q4_0" || got[1] != "q4_1" || got[2] != "q8_0" {
+		t.Fatalf("quants for models: %v", got)
+	}
+	if got := byName["ghost"]; got != nil {
+		t.Fatalf("ghost must have no quants: %v", got)
 	}
 }

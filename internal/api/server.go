@@ -15,12 +15,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -111,6 +113,8 @@ const (
 	ErrNotImplemented     = "E_NOT_IMPLEMENTED"
 	ErrNotFound           = "E_NOT_FOUND"
 	ErrUnsupportedVersion = "E_UNSUPPORTED_VERSION"
+	ErrInvalidIndex       = "E_INVALID_INDEX"
+	ErrRangeInvalid       = "E_RANGE_INVALID"
 	ErrInternal           = "E_INTERNAL"
 )
 
@@ -134,15 +138,31 @@ func New(store *cas.Store, socket string) (*Server, error) {
 func (s *Server) Path() string { return s.socket }
 
 // Listen creates the Unix socket with mode 0600 (the access boundary,
-// 005 §3). A socket file left by a crashed daemon is removed only if
-// nothing accepts connections on it.
+// 005 §3). A path left over from a crashed daemon is removed only if it
+// is a verifiably orphaned Unix socket: nothing accepts connections on it
+// AND lstat says it is a socket. Regular files, directories, and symlinks
+// are never touched — a wrong SHARDR_SOCKET must fail loudly, not delete
+// user data.
 func (s *Server) Listen() error {
 	if conn, err := net.Dial("unix", s.socket); err == nil {
 		conn.Close()
 		return fmt.Errorf("api: socket %s is in use by another shardhive", s.socket)
 	}
-	if err := os.Remove(s.socket); err != nil && !os.IsNotExist(err) {
-		return err
+	if fi, err := os.Lstat(s.socket); err == nil {
+		if fi.Mode()&fs.ModeSocket == 0 {
+			kind := "regular file"
+			switch {
+			case fi.Mode().IsDir():
+				kind = "directory"
+			case fi.Mode()&fs.ModeSymlink != 0:
+				kind = "symlink"
+			}
+			return fmt.Errorf("api: refusing to remove %s at socket path %s (not a Unix socket; unset or fix SHARDR_SOCKET/--socket)", kind, s.socket)
+		}
+		// Orphaned socket (no listener): safe to replace.
+		if err := os.Remove(s.socket); err != nil {
+			return err
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(s.socket), 0o700); err != nil {
 		return err
@@ -240,18 +260,33 @@ func (s *Server) handleUnknown(w http.ResponseWriter, r *http.Request) {
 
 var versionedPath = regexp.MustCompile(`^(/v[0-9]+/)`)
 
-// parseRefParam extracts and parses ?ref= (005 §3 accepts short refs; the
-// canonical URI is also accepted). Parse failures are loud with candidates.
+// parseRefParam extracts and parses ?ref=. The API accepts only the
+// canonical URI form (005 §1: APIs use the canonical URI — short forms
+// are interactive-CLI sugar, canonicalized by the client before the
+// call). Parse failures are loud; a parseable short form is reported
+// back with its canonical spelling so clients can self-correct.
 func parseRefParam(r *http.Request) (*ref.Ref, *httpError) {
 	raw := r.URL.Query().Get("ref")
 	if raw == "" {
 		return nil, &httpError{http.StatusBadRequest, &APIError{Code: ErrBadRequest, Message: "missing required query parameter: ref"}}
 	}
-	p, rerr := ref.ParseAny(raw)
+	p, rerr := ref.Parse(raw)
 	if rerr != nil {
-		return nil, &httpError{http.StatusBadRequest, &APIError{Code: ErrInvalidRef, Message: rerr.Message, Candidates: rerr.Candidates}}
+		return nil, &httpError{http.StatusBadRequest, &APIError{Code: rerr.Class, Message: shortRefHint(raw, rerr), Candidates: rerr.Candidates}}
 	}
 	return p, nil
+}
+
+// shortRefHint upgrades the parse error for non-canonical input: if the
+// input parses as a CLI short form, the message names its canonical
+// spelling; otherwise the raw parse error stands.
+func shortRefHint(raw string, rerr *ref.Error) string {
+	if !strings.HasPrefix(raw, ref.SchemePrefix) {
+		if sp, serr := ref.ParseShort(raw); serr == nil {
+			return "references at the API must be canonical URIs; use " + sp.Canonical
+		}
+	}
+	return rerr.Message
 }
 
 // resolveResult is the /resolve and /open response base. plan stays
@@ -295,14 +330,30 @@ func (s *Server) resolveLocal(p *ref.Ref) (*resolveResult, *httpError) {
 	}
 	var indexDigest string
 	if p.Tag != "" {
+		// R3 (000 §3.4): tags are scoped per repository — the state key is
+		// ns/name:tag, and a tag from another repository never resolves.
 		tags, err := s.store.TagAliases()
 		if err != nil {
 			return nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInternal, Message: "state: " + err.Error()}}
 		}
-		d, ok := tags[p.Tag]
+		tagKey := p.NS + "/" + p.Name + ":" + p.Tag
+		d, ok := tags[tagKey]
 		if !ok {
-			return nil, &httpError{http.StatusBadRequest, &APIError{
-				Code: ErrInvalidRef, Message: "unknown tag " + p.Tag, Candidates: []string{ref.ErrUnknownTag}}}
+			// Same loudness as an unknown repo ref: list the tags that DO
+			// exist for this ns/name so the caller can self-correct.
+			prefix := p.NS + "/" + p.Name + ":"
+			var candidates []string
+			for k := range tags {
+				if strings.HasPrefix(k, prefix) {
+					candidates = append(candidates, strings.TrimPrefix(k, prefix))
+				}
+			}
+			sort.Strings(candidates)
+			return nil, &httpError{http.StatusNotFound, &APIError{
+				Code: ErrUnknownRef,
+				Message: "no tag " + p.Tag + " for " + p.NS + "/" + p.Name +
+					"; tags are scoped per repository (000 §3.4)",
+				Candidates: candidates}}
 		}
 		indexDigest = d
 	} else {
@@ -349,13 +400,23 @@ func (s *Server) resolveLocal(p *ref.Ref) (*resolveResult, *httpError) {
 // indexMemberDoc is the minimal 001 model-index reader this slice needs:
 // artifactType "model-index" with members[{quant, manifest}].
 type indexMemberDoc struct {
-	ArtifactType string       `json:"artifactType"`
-	Members      []ref.Member `json:"members"`
+	ArtifactType  string       `json:"artifactType"`
+	SchemaVersion int          `json:"schemaVersion"`
+	Members       []ref.Member `json:"members"`
 }
 
-// readIndexMembers loads the index blob and decodes its members. A missing
-// index blob is E_NO_INDEX (loud; ensure's metadata phase would fetch it in
-// a later slice), a malformed one is E_INTERNAL.
+// readIndexMembers loads the index blob and decodes + validates its
+// members per spec 001: schemaVersion 1, non-empty members, quant syntax
+// per 000 Appendix A, canonical sha256:<hex> manifests, unique quants.
+// A missing index blob is E_NO_INDEX (loud; ensure's metadata phase would
+// fetch it in a later slice), an invalid one is E_INVALID_INDEX.
+//
+// Trust note (no re-hash before parsing): a blob in blobs/sha256/ entered
+// the store through the verifying write path (003 §3) or was re-hashed by
+// an explicit verify; it is immutable by contract (0444, never mutated in
+// place). Reading therefore cannot diverge from the digest — an implicit
+// re-hash before every parse would duplicate verification the CAS already
+// owns. Explicit re-verification remains `shardhive cas verify`.
 func (s *Server) readIndexMembers(indexDigest string) ([]ref.Member, *httpError) {
 	hexDigest := strings.TrimPrefix(indexDigest, ref.DigestSchemePrefix)
 	if !s.store.Has(hexDigest) {
@@ -369,12 +430,36 @@ func (s *Server) readIndexMembers(indexDigest string) ([]ref.Member, *httpError)
 	defer f.Close()
 	var doc indexMemberDoc
 	if err := json.NewDecoder(f).Decode(&doc); err != nil {
-		return nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInternal,
+		return nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInvalidIndex,
 			Message: "index " + indexDigest + ": not a valid model-index: " + err.Error()}}
 	}
 	if doc.ArtifactType != "model-index" {
-		return nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInternal,
+		return nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInvalidIndex,
 			Message: "index " + indexDigest + ": artifactType " + doc.ArtifactType + " != model-index"}}
+	}
+	if doc.SchemaVersion != 1 {
+		return nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInvalidIndex,
+			Message: fmt.Sprintf("index %s: schemaVersion %d != 1", indexDigest, doc.SchemaVersion)}}
+	}
+	if len(doc.Members) == 0 {
+		return nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInvalidIndex,
+			Message: "index " + indexDigest + ": empty members"}}
+	}
+	seen := map[string]bool{}
+	for i, m := range doc.Members {
+		if !ref.QuantSyntax(m.Quant) {
+			return nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInvalidIndex,
+				Message: fmt.Sprintf("index %s: member %d: quant %q is not valid quant syntax (000 App. A)", indexDigest, i, m.Quant)}}
+		}
+		if !ref.IsDigest(m.Manifest) {
+			return nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInvalidIndex,
+				Message: fmt.Sprintf("index %s: member %d: manifest %q is not canonical sha256:<64hex>", indexDigest, i, m.Manifest)}}
+		}
+		if seen[m.Quant] {
+			return nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInvalidIndex,
+				Message: fmt.Sprintf("index %s: duplicate quant %q", indexDigest, m.Quant)}}
+		}
+		seen[m.Quant] = true
 	}
 	return doc.Members, nil
 }
@@ -442,39 +527,41 @@ func (s *Server) handleEnsure(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, ErrBadRequest, "missing required field: ref")
 		return
 	}
-	p, rerr := ref.ParseAny(body.Ref)
+	p, rerr := ref.Parse(body.Ref) // canonical form only — see parseRefParam
 	if rerr != nil {
-		writeErr(w, http.StatusBadRequest, ErrInvalidRef, rerr.Message, rerr.Candidates...)
+		writeErr(w, http.StatusBadRequest, rerr.Class, shortRefHint(body.Ref, rerr), rerr.Candidates...)
 		return
 	}
+	// Compute the terminal state FIRST, publish afterwards: jobs are
+	// immutable once visible, so concurrent /jobs readers can never see a
+	// half-mutated Job (data race on the map entry).
 	job := &Job{ID: newJobID(), Ref: p.Canonical, State: "waiting"}
+	res, he := s.resolveLocal(p)
+	switch {
+	case he != nil:
+		job.State = "failed"
+		job.Error = he.err
+	default:
+		job.Manifest = res.ManifestDigest
+		if s.store.Has(strings.TrimPrefix(res.ManifestDigest, ref.DigestSchemePrefix)) {
+			job.State = "done"
+		} else {
+			job.State = "failed"
+			job.Error = &APIError{
+				Code: ErrSourceUnavail,
+				Message: "manifest " + res.ManifestDigest + " is not local; import/swarm sources are not implemented " +
+					"in this build (reserved: POST /v1/import/local, POST /v1/import/hf, POST /v1/import/bt, swarm 004)",
+			}
+		}
+	}
 	s.mu.Lock()
 	s.jobs[job.ID] = job
 	s.mu.Unlock()
-
-	// Fulfil synchronously: local presence only.
-	res, he := s.resolveLocal(p)
-	if he != nil {
-		job.State = "failed"
-		job.Error = he.err
-		writeJSON(w, http.StatusCreated, job)
-		return
-	}
-	job.Manifest = res.ManifestDigest
-	if s.store.Has(strings.TrimPrefix(res.ManifestDigest, ref.DigestSchemePrefix)) {
-		job.State = "done"
-	} else {
-		job.State = "failed"
-		job.Error = &APIError{
-			Code: ErrSourceUnavail,
-			Message: "manifest " + res.ManifestDigest + " is not local; import/swarm sources are not implemented " +
-				"in this build (reserved: POST /v1/import/local, POST /v1/import/hf, POST /v1/import/bt, swarm 004)",
-		}
-	}
 	writeJSON(w, http.StatusCreated, job)
 }
 
-// handleJob returns a job by id.
+// handleJob returns a job by id. The stored pointer is immutable after
+// publication; the copy keeps future mutation-safety obvious.
 func (s *Server) handleJob(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	s.mu.Lock()
@@ -484,7 +571,41 @@ func (s *Server) handleJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, ErrNotFound, "no such job: "+id)
 		return
 	}
-	writeJSON(w, http.StatusOK, job)
+	jobCopy := *job
+	writeJSON(w, http.StatusOK, &jobCopy)
+}
+
+// envelopeWriter rewrites any >=400 status emitted by http.ServeContent
+// into the API error envelope — ServeContent's built-in 416 (and any other
+// error it writes itself) is plain text otherwise, breaking the error
+// contract that every API error is {"error":{code,message,candidates?}}.
+type envelopeWriter struct {
+	http.ResponseWriter
+	errStatus int
+	wrote     bool
+}
+
+func (e *envelopeWriter) WriteHeader(code int) {
+	if code >= 400 {
+		e.errStatus = code
+		e.Header().Set("Content-Type", "application/json")
+	}
+	e.ResponseWriter.WriteHeader(code)
+}
+
+func (e *envelopeWriter) Write(p []byte) (int, error) {
+	if e.errStatus != 0 && !e.wrote {
+		e.wrote = true
+		code := ErrInternal
+		if e.errStatus == http.StatusRequestedRangeNotSatisfiable {
+			code = ErrRangeInvalid
+		}
+		body, _ := json.Marshal(map[string]any{"error": APIError{
+			Code: code, Message: strings.TrimSpace(string(p))}})
+		_, err := e.ResponseWriter.Write(body)
+		return len(p), err // report the original write length to the caller
+	}
+	return e.ResponseWriter.Write(p)
 }
 
 // handleBlob serves blob bytes read-through (005 §3): zero-copy, range
@@ -504,9 +625,10 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
-	// ServeContent implements Range/If-Range semantics incl. 206/416.
+	// ServeContent implements Range/If-Range semantics incl. 206/416; the
+	// envelopeWriter guarantees error responses stay in the API error form.
 	w.Header().Set("Content-Type", "application/octet-stream")
-	http.ServeContent(w, r, "", time.Time{}, f)
+	http.ServeContent(&envelopeWriter{ResponseWriter: w}, r, "", time.Time{}, f)
 }
 
 // handleImportReserved: 001 §8 imports are the next slice — loud, explicit
@@ -516,7 +638,10 @@ func (s *Server) handleImportReserved(w http.ResponseWriter, r *http.Request) {
 		r.Method+" "+r.URL.Path+" is reserved: imports land in the next slice (001 §8)")
 }
 
-// handleModels: inventory from state + CAS presence (005 §3).
+// handleModels: inventory from state + CAS presence (005 §3). This is a
+// SKELETON inventory: quants come from the current index when it is
+// present and valid, but seed state and sizes land with later slices —
+// the response says so explicitly instead of posing as complete.
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	ns, err := s.store.Namespaces()
 	if err != nil {
@@ -529,30 +654,53 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type nsEntry struct {
-		NS           string `json:"ns"`
-		Name         string `json:"name"`
-		IndexDigest  string `json:"indexDigest"`
-		IndexPresent bool   `json:"indexPresent"`
+		NS           string   `json:"ns"`
+		Name         string   `json:"name"`
+		IndexDigest  string   `json:"indexDigest"`
+		IndexPresent bool     `json:"indexPresent"`
+		Quants       []string `json:"quants,omitempty"`
 	}
 	type tagEntry struct {
-		Alias       string `json:"alias"`
+		Repo        string `json:"repo"` // ns/name the tag is scoped to (R3)
+		Tag         string `json:"tag"`
 		Digest      string `json:"digest"`
 		BlobPresent bool   `json:"blobPresent"`
 	}
 	out := struct {
+		Skeleton   bool       `json:"skeleton"`
+		Note       string     `json:"note"`
 		Namespaces []nsEntry  `json:"namespaces"`
 		Tags       []tagEntry `json:"tags"`
-	}{Namespaces: []nsEntry{}, Tags: []tagEntry{}}
+	}{
+		Skeleton:   true,
+		Note:       "skeleton inventory: seed state and sizes land with later slices (005 §3)",
+		Namespaces: []nsEntry{}, Tags: []tagEntry{},
+	}
 	for k, d := range ns {
 		e := nsEntry{IndexDigest: d}
 		e.NS, e.Name, _ = strings.Cut(k, "/")
 		e.IndexPresent = s.store.Has(strings.TrimPrefix(d, ref.DigestSchemePrefix))
+		if e.IndexPresent {
+			if members, he := s.readIndexMembers(d); he == nil {
+				for _, m := range members {
+					e.Quants = append(e.Quants, m.Quant)
+				}
+				sort.Strings(e.Quants)
+			}
+		}
 		out.Namespaces = append(out.Namespaces, e)
 	}
-	for a, d := range tags {
-		out.Tags = append(out.Tags, tagEntry{Alias: a, Digest: d,
+	sort.Slice(out.Namespaces, func(i, j int) bool {
+		return out.Namespaces[i].NS+"/"+out.Namespaces[i].Name < out.Namespaces[j].NS+"/"+out.Namespaces[j].Name
+	})
+	for k, d := range tags {
+		repo, tag, _ := strings.Cut(k, ":")
+		out.Tags = append(out.Tags, tagEntry{Repo: repo, Tag: tag, Digest: d,
 			BlobPresent: s.store.Has(strings.TrimPrefix(d, ref.DigestSchemePrefix))})
 	}
+	sort.Slice(out.Tags, func(i, j int) bool {
+		return out.Tags[i].Repo+":"+out.Tags[i].Tag < out.Tags[j].Repo+":"+out.Tags[j].Tag
+	})
 	writeJSON(w, http.StatusOK, out)
 }
 
