@@ -57,7 +57,10 @@ APIs, manifests, or shardrbay entries, which use the canonical URI.
   selection; `shardr:///ns/name@sha256:…` (no selector) addresses a
   manifest directly.
 4. Tags are **local aliases** managed by the shardhive owner; imports
-   create none. Tags whose lowercased form starts with `sha256-`/
+   create none. Tags are **scoped per repository**: a tag resolves only
+   within its own `ns/name` (`shardr:///a/models:snap+q8_0` and
+   `shardr:///b/models:snap+q8_0` are independent aliases; the state key
+   is `ns/name:tag`). Tags whose lowercased form starts with `sha256-`/
    `sha256:` or matches the quant syntax (Appendix A) are invalid —
    quant-shaped strings always select index members, never point at
    content themselves.
