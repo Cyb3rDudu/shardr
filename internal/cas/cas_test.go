@@ -1,0 +1,455 @@
+package cas
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io/fs"
+	"math/rand"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// newTestStore opens a store in a temp dir and returns it plus a helper
+// computing the digest of content.
+func newTestStore(t *testing.T) *Store {
+	t.Helper()
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func digestOf(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func parts(t *testing.T, s *Store) []string {
+	t.Helper()
+	entries, err := os.ReadDir(s.incomingDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range entries {
+		out = append(out, e.Name())
+	}
+	return out
+}
+
+// --- Layout & root resolution ---
+
+func TestLayoutDirsCreated(t *testing.T) {
+	s := newTestStore(t)
+	for _, d := range []string{s.blobsDir(), s.incomingDir(), s.stateDir()} {
+		if fi, err := os.Stat(d); err != nil || !fi.IsDir() {
+			t.Fatalf("expected dir %s", d)
+		}
+	}
+}
+
+func TestResolveRootOrder(t *testing.T) {
+	t.Setenv("SHARDR_CAS", "/custom/cas")
+	if r, _ := ResolveRoot(); r != "/custom/cas" {
+		t.Fatalf("SHARDR_CAS ignored: %s", r)
+	}
+	t.Setenv("SHARDR_CAS", "")
+	t.Setenv("XDG_DATA_HOME", "/xdg")
+	if r, _ := ResolveRoot(); r != "/xdg/shardr/cas" {
+		t.Fatalf("XDG ignored: %s", r)
+	}
+	t.Setenv("XDG_DATA_HOME", "")
+	home, _ := os.UserHomeDir()
+	want := filepath.Join(home, ".local", "share", "shardr", "cas")
+	if r, _ := ResolveRoot(); r != want {
+		t.Fatalf("default wrong: %s want %s", r, want)
+	}
+}
+
+func TestBlobPathShardedAndValidated(t *testing.T) {
+	s := newTestStore(t)
+	d := strings.Repeat("ab", 32)
+	p, err := s.BlobPath(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(s.blobsDir(), "ab", strings.Repeat("ab", 31))
+	if p != want {
+		t.Fatalf("path %s want %s", p, want)
+	}
+	for _, bad := range []string{
+		"", "short", strings.Repeat("z", 64), strings.Repeat("A", 64),
+		"../" + strings.Repeat("a", 60), d + "x",
+	} {
+		if _, err := s.BlobPath(bad); err == nil {
+			t.Fatalf("digest %q accepted", bad)
+		}
+	}
+}
+
+// --- Write path ---
+
+func TestPutHappyPath(t *testing.T) {
+	s := newTestStore(t)
+	content := []byte("hello shardhive")
+	d := digestOf(content)
+	if err := s.Put(d, bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := s.BlobPath(d)
+	got, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("blob not at %s: %v", p, err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("blob content %q want %q", got, content)
+	}
+	if fi, _ := os.Stat(p); fi.Mode().Perm() != 0o444 {
+		t.Fatalf("blob mode %o want 0444", fi.Mode().Perm())
+	}
+	if leak := parts(t, s); len(leak) != 0 {
+		t.Fatalf("part leaked: %v", leak)
+	}
+	if !s.Has(d) {
+		t.Fatal("Has=false after Put")
+	}
+}
+
+func TestPutMismatchLeavesNoTrace(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.Put(digestOf([]byte("wrong")), bytes.NewReader([]byte("other bytes"))); !errors.Is(err, ErrDigestMismatch) {
+		t.Fatalf("want ErrDigestMismatch, got %v", err)
+	}
+	if s.Has(digestOf([]byte("other bytes"))) {
+		t.Fatal("unverified bytes were promoted")
+	}
+	if leak := parts(t, s); len(leak) != 0 {
+		t.Fatalf("part leaked after mismatch: %v", leak)
+	}
+}
+
+func TestPutInvalidDigestRejected(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.Put("not-a-digest", bytes.NewReader(nil)); err == nil {
+		t.Fatal("invalid digest accepted")
+	}
+}
+
+func TestPutIdempotentDoubleWrite(t *testing.T) {
+	s := newTestStore(t)
+	content := []byte("same bytes")
+	d := digestOf(content)
+	if err := s.Put(d, bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := s.BlobPath(d)
+	before, _ := os.Stat(p)
+	if err := s.Put(d, bytes.NewReader(content)); err != nil {
+		t.Fatalf("second put: %v", err)
+	}
+	if leak := parts(t, s); len(leak) != 0 {
+		t.Fatalf("part leaked on idempotent write: %v", leak)
+	}
+	// One blob, still correct content.
+	got, _ := os.ReadFile(p)
+	if !bytes.Equal(got, content) {
+		t.Fatal("idempotent write changed content")
+	}
+	if fi, _ := os.Stat(p); !fi.ModTime().Equal(before.ModTime()) {
+		t.Fatal("idempotent write replaced the blob (should keep existing)")
+	}
+	if n := countBlobFiles(t, s); n != 1 {
+		t.Fatalf("blob count %d want 1", n)
+	}
+}
+
+func countBlobFiles(t *testing.T, s *Store) int {
+	t.Helper()
+	n := 0
+	filepath.WalkDir(s.blobsDir(), func(_ string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			n++
+		}
+		return nil
+	})
+	return n
+}
+
+// --- Concurrency ---
+
+func TestPutConcurrentSameDigest(t *testing.T) {
+	s := newTestStore(t)
+	content := bytes.Repeat([]byte("concurrent-payload"), 1000)
+	d := digestOf(content)
+	const writers = 16
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- s.Put(d, bytes.NewReader(content))
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent put failed: %v", err)
+		}
+	}
+	if leak := parts(t, s); len(leak) != 0 {
+		t.Fatalf("part leaked: %v", leak)
+	}
+	if n := countBlobFiles(t, s); n != 1 {
+		t.Fatalf("blob count %d want 1", n)
+	}
+	if err := s.Verify(d); err != nil {
+		t.Fatalf("blob corrupt after concurrent writes: %v", err)
+	}
+}
+
+// --- Stale part cleanup ---
+
+func TestOpenCleansStaleParts(t *testing.T) {
+	root := t.TempDir()
+	s, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(s.incomingDir(), "deadbeefdeadbeefdeadbeefdeadbeef.part")
+	fresh := filepath.Join(s.incomingDir(), "0000000000000000.part")
+	for _, p := range []string{stale, fresh} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-25 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("stale part survived: %v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Fatalf("fresh part removed: %v", err)
+	}
+}
+
+// --- Verify (mutation tests: corruption must be caught) ---
+
+func TestVerifyClean(t *testing.T) {
+	s := newTestStore(t)
+	d := digestOf([]byte("intact"))
+	if err := s.Put(d, bytes.NewReader([]byte("intact"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Verify(d); err != nil {
+		t.Fatalf("clean blob flagged: %v", err)
+	}
+}
+
+func TestVerifyDetectsMutation(t *testing.T) {
+	s := newTestStore(t)
+	content := []byte("original bytes")
+	d := digestOf(content)
+	if err := s.Put(d, bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+	// Tamper: flip bytes under the 0444 mode — an owner can always chmod.
+	p, _ := s.BlobPath(d)
+	if err := os.Chmod(p, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, append(content, "tampered"...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Verify(d); !errors.Is(err, ErrDigestMismatch) {
+		t.Fatalf("mutation not detected: %v", err)
+	}
+}
+
+func TestVerifyMissing(t *testing.T) {
+	s := newTestStore(t)
+	d := digestOf([]byte("never written"))
+	if err := s.Verify(d); !errors.Is(err, ErrBlobMissing) {
+		t.Fatalf("want ErrBlobMissing, got %v", err)
+	}
+}
+
+func TestVerifyAllFindsMutatedAndMissing(t *testing.T) {
+	s := newTestStore(t)
+	var digests []string
+	for i := 0; i < 3; i++ {
+		b := []byte(fmt.Sprintf("blob-%d", i))
+		d := digestOf(b)
+		if err := s.Put(d, bytes.NewReader(b)); err != nil {
+			t.Fatal(err)
+		}
+		digests = append(digests, d)
+	}
+	// Mutate blob 0, delete blob 1 (referenced by state so --all can notice
+	// the deletion), leave blob 2 clean.
+	mutated := digests[0]
+	deleted := digests[1]
+	if err := s.SetNamespace("ns/current-index", deleted); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := s.BlobPath(mutated)
+	os.Chmod(p, 0o644)
+	os.WriteFile(p, []byte("mutated"), 0o644)
+	os.Remove(filepath.Join(s.blobsDir(), deleted[:2], deleted[2:]))
+
+	mismatched, missing, err := s.VerifyAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mismatched) != 1 || mismatched[0] != mutated {
+		t.Fatalf("mismatched %v want [%s]", mismatched, mutated)
+	}
+	if len(missing) != 1 || missing[0] != deleted {
+		t.Fatalf("missing %v want [%s]", missing, deleted)
+	}
+	if err := s.Verify(digests[2]); err != nil {
+		t.Fatalf("clean blob flagged: %v", err)
+	}
+}
+
+// --- Read path ---
+
+func TestOpenReadsBlob(t *testing.T) {
+	s := newTestStore(t)
+	content := []byte("readable")
+	d := digestOf(content)
+	if err := s.Put(d, bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+	f, err := s.Open(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	buf := make([]byte, len(content))
+	if _, err := f.Read(buf); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf, content) {
+		t.Fatalf("read %q want %q", buf, content)
+	}
+}
+
+// --- State store ---
+
+func TestStateNamespacesRoundtrip(t *testing.T) {
+	s := newTestStore(t)
+	d := digestOf([]byte("index"))
+	if err := s.SetNamespace("ns/models", d); err != nil {
+		t.Fatal(err)
+	}
+	ns, err := s.Namespaces()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ns["ns/models"] != d {
+		t.Fatalf("namespace %v", ns)
+	}
+	if err := s.DeleteNamespace("ns/models"); err != nil {
+		t.Fatal(err)
+	}
+	ns, _ = s.Namespaces()
+	if _, ok := ns["ns/models"]; ok {
+		t.Fatal("namespace survived delete")
+	}
+	// Absent state file is an empty map, not an error.
+	if len(ns) != 0 {
+		t.Fatalf("want empty map, got %v", ns)
+	}
+}
+
+func TestStateTagAliasesRoundtrip(t *testing.T) {
+	s := newTestStore(t)
+	d := digestOf([]byte("blob"))
+	if err := s.SetTagAlias("stable", d); err != nil {
+		t.Fatal(err)
+	}
+	tags, err := s.TagAliases()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tags["stable"] != d {
+		t.Fatalf("tags %v", tags)
+	}
+	if err := s.DeleteTagAlias("stable"); err != nil {
+		t.Fatal(err)
+	}
+	tags, _ = s.TagAliases()
+	if len(tags) != 0 {
+		t.Fatalf("want empty, got %v", tags)
+	}
+}
+
+func TestStateCanonicalAndAtomic(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.SetNamespace("b", digestOf([]byte("1"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetNamespace("a", digestOf([]byte("2"))); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(s.stateDir(), namespacesFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"a":"` + digestOf([]byte("2")) + `","b":"` + digestOf([]byte("1")) + `"}`
+	if string(b) != want {
+		t.Fatalf("canonical form %s want %s", b, want)
+	}
+	// No temp files left behind.
+	entries, _ := os.ReadDir(s.stateDir())
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".tmp") {
+			t.Fatalf("temp file leaked: %s", e.Name())
+		}
+	}
+	// Reload path: new Store handle on same root sees the data.
+	s2, err := Open(s.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ns, _ := s2.Namespaces()
+	if len(ns) != 2 {
+		t.Fatalf("reload lost state: %v", ns)
+	}
+}
+
+// Random-content stress across distinct digests, ensuring shard dirs and
+// file names are derived correctly end to end.
+func TestPutRandomBlobsDistinctPaths(t *testing.T) {
+	s := newTestStore(t)
+	rng := rand.New(rand.NewSource(1))
+	for i := 0; i < 50; i++ {
+		b := make([]byte, rng.Intn(4096))
+		rng.Read(b)
+		d := digestOf(b)
+		if err := s.Put(d, bytes.NewReader(b)); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Verify(d); err != nil {
+			t.Fatalf("blob %d: %v", i, err)
+		}
+	}
+	if n := countBlobFiles(t, s); n != 50 {
+		t.Fatalf("blob count %d want 50", n)
+	}
+}
