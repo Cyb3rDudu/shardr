@@ -1,6 +1,6 @@
 # 005 — shardhive Interface, Resolution & CLI
 
-Status: **Draft v0**
+Status: **Draft v0** — vectors pending: resolve/ensure/open/blob, resolver envelope, version negotiation, error classes
 
 ## 1. Purpose
 

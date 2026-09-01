@@ -1,6 +1,6 @@
 # 004 — Swarm (BitTorrent v2) & Configuration
 
-Status: **Draft v0**
+Status: **Candidate v1 (surface)** — machine-checked by `docs/specs/vectors/004-torrent.jsonl`
 
 ## 1. Purpose
 
