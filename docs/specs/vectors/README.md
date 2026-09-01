@@ -173,7 +173,20 @@ during PR #8 review and are applied as spec commits in this PR:
   collide with the embedded manifest document in the torrent file tree.
   **Resolved by ruling R2** — the `manifest/` path prefix is reserved for
   the embedded manifest; file entries must not occupy it. Pinned by
-  `can-0117` (`E_VALIDATION_RESERVED_PATH`).
+  `can-0117` (`E_VALIDATION_RESERVED_PATH`). Tightened after auto-review
+  of main's R2 commit: the reservation is **path-segment based** — a name
+  equal to `manifest` or with first path segment `manifest` is rejected
+  (an exact `manifest` file would collide with the manifest directory
+  itself, making the BEP 52 tree unconstructible), and file names are
+  canonical `/`-separated paths with non-empty segments only; `.`, `..`
+  and empty segments are forbidden anywhere (so `./manifest/x` cannot
+  sneak past). Pinned by `can-0121` (exact `manifest`,
+  `E_VALIDATION_RESERVED_PATH`), `can-0122` (`./manifest/x.gguf`),
+  `can-0123` (`./imatrix.gguf`), `can-0124` (`a//b.gguf`).
+- **D10 follow-up (000 §4)**: the R1 grammar change (a quant is always
+  required) is now visible in the spec's own examples — `:stable` is
+  listed as invalid (tag without quant). Pinned by `ref-0117`,
+  `ref-0118`, `ref-0138`–`ref-0140` (empty quant, empty tag, two `+`).
 
 - **D1** (000 App. A): the quant prefix rule rejects the reserved term
   `raw` (no known prefix starts with `r`), contradicting 000 §4 which lists

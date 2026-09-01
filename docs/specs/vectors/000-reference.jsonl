@@ -57,3 +57,6 @@
 {"id": "ref-0135", "desc": "empty selector", "input": "shardr:///ns/name:", "expect": {"ok": false, "errorClass": "E_PARSE"}}
 {"id": "ref-0136", "desc": "empty digest after @", "input": "shardr:///ns/name:q8_0@", "expect": {"ok": false, "errorClass": "E_PARSE"}}
 {"id": "ref-0137", "desc": "tag with invalid char in tag+quant form", "input": "shardr:///ns/name:ba!d+q8_0", "expect": {"ok": false, "errorClass": "E_PARSE"}}
+{"id": "ref-0138", "desc": "empty quant after + (a quant is always required)", "input": "shardr:///ns/name:stable+", "expect": {"ok": false, "errorClass": "E_PARSE"}}
+{"id": "ref-0139", "desc": "empty tag in tag+quant form", "input": "shardr:///ns/name:+q8_0", "expect": {"ok": false, "errorClass": "E_PARSE"}}
+{"id": "ref-0140", "desc": "two + separators in selector", "input": "shardr:///ns/name:stable+q8_0+extra", "expect": {"ok": false, "errorClass": "E_PARSE"}}

@@ -73,6 +73,7 @@ APIs, manifests, or shardrbay entries, which use the canonical URI.
 | `shardr:///some/repo:raw` | valid, unquantized member |
 | `shardr:///ns/name:q8_0@sha256:ab…` | valid, pinned |
 | `shardr:///ns/name` | invalid — no selector |
+| `shardr:///ns/name:stable` | invalid — tag without quant (a quant is always required) |
 | `shardr:///ns/name:q4` | invalid — ambiguous prefix (lists `q4_0`, `q4_1`) |
 
 ## Appendix A — Quant syntax and vocabulary
