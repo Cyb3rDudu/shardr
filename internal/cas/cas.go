@@ -148,11 +148,6 @@ func (s *Store) Open(digest string) (*os.File, error) {
 	return os.Open(p)
 }
 
-// mustNamespaces/mustTags best-effort-load state maps for VerifyAll: a
-// corrupt state file must not mask blob verification.
-func mustNamespaces(s *Store) map[string]string { m, _ := s.Namespaces(); return m }
-func mustTags(s *Store) map[string]string       { m, _ := s.TagAliases(); return m }
-
 // Put streams r into the CAS, verifying it against expectedDigest per spec
 // 003 §3: write to incoming/<rand>.part while hashing, fsync, chmod 0444,
 // atomic rename. Digest mismatch → part deleted, ErrDigestMismatch, and the
@@ -248,13 +243,18 @@ func (s *Store) Verify(digest string) error {
 // VerifyAll re-hashes every blob in the store and additionally checks every
 // digest referenced by state/ (namespaces, tag aliases) for existence: a walk
 // alone cannot notice deletions — "missing" is only decidable against an
-// expectation, and state/ is the record of what should exist.
+// expectation, and state/ is the record of what should exist. Foreign files
+// under blobs/sha256/ (e.g. .DS_Store, AppleDouble junk) are skipped, not
+// errors — they are not blobs and must not mask verification of real ones.
 func (s *Store) VerifyAll() (mismatched, missing []string, err error) {
 	err = filepath.WalkDir(s.blobsDir(), func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
 		digest := filepath.Base(filepath.Dir(path)) + d.Name()
+		if validateDigest(digest) != nil {
+			return nil // not a blob by name: skip
+		}
 		if vErr := s.Verify(digest); vErr != nil {
 			if errors.Is(vErr, ErrDigestMismatch) {
 				mismatched = append(mismatched, digest)
@@ -268,7 +268,11 @@ func (s *Store) VerifyAll() (mismatched, missing []string, err error) {
 		return nil, nil, err
 	}
 	refs := map[string]bool{}
-	for _, m := range []map[string]string{mustNamespaces(s), mustTags(s)} {
+	// Best-effort state load: a corrupt state file must not mask blob
+	// verification.
+	ns, _ := s.Namespaces()
+	tags, _ := s.TagAliases()
+	for _, m := range []map[string]string{ns, tags} {
 		for _, digest := range m {
 			refs[digest] = true
 		}

@@ -97,6 +97,11 @@ func TestRunVerifyMismatchOutranksMissing(t *testing.T) {
 	s := withTestCAS(t)
 	d1 := put(t, s, []byte("mutate me"))
 	d2 := put(t, s, []byte("delete me"))
+	// Both lists must be non-empty to prove the ranking branch: d2 is
+	// referenced by state so its deletion shows up as missing.
+	if err := s.SetNamespace("ns/x", d2); err != nil {
+		t.Fatal(err)
+	}
 	p1, _ := s.BlobPath(d1)
 	os.Chmod(p1, 0o644)
 	os.WriteFile(p1, []byte("mutated"), 0o644)
@@ -110,6 +115,28 @@ func TestRunVerifyMismatchOutranksMissing(t *testing.T) {
 func bytesToDigest(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
+}
+
+// Table test for CLI dispatch; run() must preserve exit semantics exactly.
+func TestRunDispatch(t *testing.T) {
+	withTestCAS(t) // isolate SHARDR_CAS even for cases that never touch the store
+	tests := []struct {
+		name string
+		args []string
+		want int
+	}{
+		{"no args", nil, 2},
+		{"unknown command", []string{"frobnicate"}, 2},
+		{"cas alone", []string{"cas"}, 2},
+		{"cas verify without digest", []string{"cas", "verify"}, 2},
+		{"cas verify --all clean", []string{"cas", "verify", "--all"}, 0},
+		{"version", []string{"version"}, 0},
+	}
+	for _, tt := range tests {
+		if got := run(tt.args); got != tt.want {
+			t.Errorf("%s (args %v): exit %d want %d", tt.name, tt.args, got, tt.want)
+		}
+	}
 }
 
 // Sanity for layout assumption used by the deleted-blob test.
