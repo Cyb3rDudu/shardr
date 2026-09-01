@@ -1,0 +1,10 @@
+{
+	"torrent": {
+		"pieceLength": 1048576,
+		"pieceLayersDigest": "sha256:f21ec447e6e6d25009aa7a16ea60c281d089db2c284ddab425192f484e589710",
+		"infohash": "btmh:1220af65706663f6613022c28bee7db87a00630ee4b240b35b967b458f0eae2f7c5f"
+	},
+	"schemaVersion": 1,
+	"manifestDigest": "sha256:8a5d0b56f13aec2f4e0e5392b40da9b13626b702bca2360f152fe1751e644d9b",
+	"artifactType": "distribution"
+}

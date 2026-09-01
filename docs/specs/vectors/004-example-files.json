@@ -1,0 +1,34 @@
+{
+  "modelconfig.json": {
+    "json": {
+      "family": "qwen3",
+      "weightsFormat": "gguf",
+      "quantization": "q8_0",
+      "selfContained": true,
+      "contextLength": 262144,
+      "license": "apache-2.0",
+      "source": {
+        "hf": {
+          "repo": "unsloth/Qwen3.8-27B-GGUF",
+          "revision": "4ca7207fa5502f4a0f8b3d1e2c3d4e5f60718293"
+        }
+      },
+      "template": { "override": null },
+      "system": null,
+      "adapters": [],
+      "runtimes": { "llama": { "ctx_size": 262144 } }
+    }
+  },
+  "qwen3.8-27b-q8_00001.gguf": {
+    "sha256stream": "shardr-vector/004/weights-1",
+    "size": 3145733
+  },
+  "qwen3.8-27b-q8_00002.gguf": {
+    "sha256stream": "shardr-vector/004/weights-2",
+    "size": 983040
+  },
+  "imatrix.gguf": {
+    "repeat": "shardr-vector/004/imatrix.",
+    "size": 20480
+  }
+}
