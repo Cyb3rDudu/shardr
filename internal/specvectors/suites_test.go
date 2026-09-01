@@ -73,7 +73,7 @@ func vFloat(m map[string]any, key string) float64 {
 }
 
 // expectBlock returns the nested expect object.
-func expectBlock(t *testing.T, v map[string]any) map[string]any {
+func expectBlock(t testing.TB, v map[string]any) map[string]any {
 	t.Helper()
 	e, ok := v["expect"].(map[string]any)
 	if !ok {
@@ -83,7 +83,7 @@ func expectBlock(t *testing.T, v map[string]any) map[string]any {
 }
 
 // assertField compares an expected string field when present in expect.
-func assertField(t *testing.T, expect map[string]any, key, got string) {
+func assertField(t testing.TB, expect map[string]any, key, got string) {
 	t.Helper()
 	if want, ok := expect[key].(string); ok && want != got {
 		t.Errorf("%s: got %s=%q, want %q", key, key, got, want)
@@ -91,7 +91,7 @@ func assertField(t *testing.T, expect map[string]any, key, got string) {
 }
 
 // assertErrorClass verifies a must-fail expectation.
-func assertErrorClass(t *testing.T, expect map[string]any, errClass string, candidates []string) {
+func assertErrorClass(t testing.TB, expect map[string]any, errClass string, candidates []string) {
 	t.Helper()
 	if !vBool(expect, "ok") {
 		want := vString(expect, "errorClass")
@@ -121,54 +121,96 @@ func TestSuite000ReferenceVectors(t *testing.T) {
 	for _, v := range loadJSONL(t, "000-reference.jsonl") {
 		v := v
 		id := vString(v, "id")
-		t.Run(id, func(t *testing.T) {
-			input := vString(v, "input")
-			if vString(v, "form") == "cli-short" {
-				input = cliShortToCanonical(input)
-			}
-			expect := expectBlock(t, v)
+		t.Run(id, func(t *testing.T) { checkRefVector(t, v) })
+	}
+}
 
-			p, rerr := parseRef(input)
-			if rerr != nil {
-				// Parse-phase failure.
-				if vBool(expect, "ok") {
-					t.Fatalf("unexpected parse error: %v", rerr)
-				}
-				assertErrorClass(t, expect, rerr.Class, rerr.Candidates)
-				return
-			}
-			assertField(t, expect, "canonical", p.Canonical)
-			assertField(t, expect, "ns", p.NS)
-			assertField(t, expect, "name", p.Name)
-			assertField(t, expect, "sel", p.Sel)
-			assertField(t, expect, "quant", p.Quant)
-			assertField(t, expect, "tag", p.Tag)
-			assertField(t, expect, "digest", p.Digest)
+// TestHarnessRejectsFalseGreen pins review blocker 1 of PR #8: an
+// expect.ok=false vector WITHOUT context whose input parses successfully
+// must fail loudly — it may not silently fall through the resolution branch.
+func TestHarnessRejectsFalseGreen(t *testing.T) {
+	probe := map[string]any{
+		"id":    "harness-probe",
+		"input": "shardr:///ns/name:q8_0", // parses fine, no context
+		"expect": map[string]any{
+			"ok":         false,
+			"errorClass": "E_NO_MEMBER",
+		},
+	}
+	rec := &recordingTB{}
+	checkRefVector(rec, probe)
+	if !rec.failed {
+		t.Fatal("harness passed a must-fail vector without context (false green)")
+	}
+}
 
-			if raw, ok := v["context"]; ok {
-				var ctx resolveContext
-				b, _ := json.Marshal(raw)
-				if err := json.Unmarshal(b, &ctx); err != nil {
-					t.Fatal(err)
-				}
-				res, rerr := resolveRef(p, &ctx)
-				if rerr != nil {
-					if vBool(expect, "ok") {
-						t.Fatalf("unexpected resolution error: %v", rerr)
-					}
-					assertErrorClass(t, expect, rerr.Class, rerr.Candidates)
-					return
-				}
-				if !vBool(expect, "ok") {
-					t.Fatalf("expected error %s, but reference parsed and resolved", vString(expect, "errorClass"))
-				}
-				wantRes, hasRes := expect["resolved"].(map[string]any)
-				if hasRes {
-					assertField(t, wantRes, "quant", res.Quant)
-					assertField(t, wantRes, "manifest", res.Manifest)
-				}
+// recordingTB records failures instead of exiting the goroutine, so the
+// harness can be exercised with synthetic vectors in regression tests.
+type recordingTB struct {
+	testing.TB // satisfies the interface; only the methods below are used
+	failed     bool
+}
+
+func (r *recordingTB) Helper()               {}
+func (r *recordingTB) Errorf(string, ...any) { r.failed = true }
+func (r *recordingTB) Error(...any)          { r.failed = true }
+func (r *recordingTB) Fatalf(string, ...any) { r.failed = true }
+func (r *recordingTB) Fatal(...any)          { r.failed = true }
+func (r *recordingTB) Logf(string, ...any)   {}
+func (r *recordingTB) Log(...any)            {}
+
+func checkRefVector(t testing.TB, v map[string]any) {
+	input := vString(v, "input")
+	if vString(v, "form") == "cli-short" {
+		input = cliShortToCanonical(input)
+	}
+	expect := expectBlock(t, v)
+
+	p, rerr := parseRef(input)
+	if rerr != nil {
+		// Parse-phase failure.
+		if vBool(expect, "ok") {
+			t.Fatalf("unexpected parse error: %v", rerr)
+		}
+		assertErrorClass(t, expect, rerr.Class, rerr.Candidates)
+		return
+	}
+	assertField(t, expect, "canonical", p.Canonical)
+	assertField(t, expect, "ns", p.NS)
+	assertField(t, expect, "name", p.Name)
+	assertField(t, expect, "sel", p.Sel)
+	assertField(t, expect, "quant", p.Quant)
+	assertField(t, expect, "tag", p.Tag)
+	assertField(t, expect, "digest", p.Digest)
+
+	// Blocker 1: after a successful parse, a must-fail expectation has no
+	// business being green. Without a context the only place the expected
+	// error could still occur is resolution — so fail immediately.
+	if !vBool(expect, "ok") && v["context"] == nil {
+		t.Fatalf("expected error %s, but reference parsed successfully and no context is present to resolve against", vString(expect, "errorClass"))
+	}
+	if raw, ok := v["context"]; ok {
+		var ctx resolveContext
+		b, _ := json.Marshal(raw)
+		if err := json.Unmarshal(b, &ctx); err != nil {
+			t.Fatal(err)
+		}
+		res, rerr := resolveRef(p, &ctx)
+		if rerr != nil {
+			if vBool(expect, "ok") {
+				t.Fatalf("unexpected resolution error: %v", rerr)
 			}
-		})
+			assertErrorClass(t, expect, rerr.Class, rerr.Candidates)
+			return
+		}
+		if !vBool(expect, "ok") {
+			t.Fatalf("expected error %s, but reference parsed and resolved", vString(expect, "errorClass"))
+		}
+		wantRes, hasRes := expect["resolved"].(map[string]any)
+		if hasRes {
+			assertField(t, wantRes, "quant", res.Quant)
+			assertField(t, wantRes, "manifest", res.Manifest)
+		}
 	}
 }
 

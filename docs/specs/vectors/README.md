@@ -63,7 +63,8 @@ Processing order: length → scheme/empty authority → `@digest` suffix →
 ns/name (case-fold then validate) → selector (quant / tag+quant, tag ban) →
 no-selector rule. Resolution (only with `context`): exact match wins over
 prefix; unique prefix expands; ambiguity is loud; pin must match the
-resolved member.
+resolved member. The tag form always carries `+quant` — a bare tag is not
+a selector (ruling R1, spec 000 §2); pinned by `ref-0117`/`ref-0118`.
 
 ## Suite 001 — canonicalization
 
@@ -77,8 +78,11 @@ reversed key order at every level, pretty or compact) or `inline`
 newline, JCS serialization only.
 
 Validation error classes: `E_VALIDATION` plus the specific
-`E_VALIDATION_WEIGHTS_MIX`, `E_VALIDATION_FILE_ORDER`, `E_VALIDATION_PARTS`,
-`E_VALIDATION_QUANT_DUP`, `E_VALIDATION_INFOHASH`, `E_VALIDATION_KIND`
+`E_VALIDATION_WEIGHTS_MIX`, `E_VALIDATION_WEIGHTS_MISSING`,
+`E_VALIDATION_FILE_ORDER`, `E_VALIDATION_PARTS`,
+`E_VALIDATION_QUANT_DUP`, `E_VALIDATION_INFOHASH`,
+`E_VALIDATION_KIND`, `E_VALIDATION_RESERVED_PATH` (ruling R2),
+`E_VALIDATION_RUNTIME_DUP`, `E_VALIDATION_CARDINALITY`
 (see `canonical_impl_test.go` for the rule set; unknown fields are
 preserved, not rejected — forward compatibility, 001 §3.2).
 
@@ -157,7 +161,19 @@ decision changed (in which case: spec defect first, then vectors).
 ## Spec defects found by these vectors (specs NOT patched)
 
 Reported on issue #3; the vectors encode the stated resolution so the
-behavior stays pinned either way:
+behavior stays pinned either way. D10 and D11 were resolved by rulings
+during PR #8 review and are applied as spec commits in this PR:
+
+- **D10** (000 §2): `sel := quant | tag["+"quant]` read as written made a
+  bare tag a valid selector, contradicting §3.2 ("Tag+quant") and the
+  resolution model. **Resolved by ruling R1** — spec grammar is now
+  `sel := quant | tag "+" quant` (tag form always carries `+quant`).
+  Pinned by `ref-0117`, `ref-0118`.
+- **D11** (001 §3.1 / 004 §3): a file entry named `manifest/...` would
+  collide with the embedded manifest document in the torrent file tree.
+  **Resolved by ruling R2** — the `manifest/` path prefix is reserved for
+  the embedded manifest; file entries must not occupy it. Pinned by
+  `can-0117` (`E_VALIDATION_RESERVED_PATH`).
 
 - **D1** (000 App. A): the quant prefix rule rejects the reserved term
   `raw` (no known prefix starts with `r`), contradicting 000 §4 which lists
