@@ -114,7 +114,7 @@ func validateDigest(d string) error {
 	}
 	for _, c := range d {
 		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return fmt.Errorf("cas: invalid digest %q: uppercase hex not allowed", d)
+			return fmt.Errorf("cas: invalid digest %q: uppercase hex not allowed (digests are canonical lowercase sha256:<hex>)", d)
 		}
 	}
 	return nil

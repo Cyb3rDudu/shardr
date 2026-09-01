@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/Cyb3rDudu/shardr/internal/ref"
 )
@@ -44,27 +45,33 @@ func (s *Store) DeleteNamespace(name string) error {
 	return s.updateMap(namespacesFile, func(m map[string]string) { delete(m, name) })
 }
 
-// TagAliases returns the tag-alias → digest mapping.
+// TagAliases returns the scoped tag mapping. Keys are "ns/name:tag"
+// (R3, 000 §3.4: tags are scoped per repository).
 func (s *Store) TagAliases() (map[string]string, error) {
 	return s.loadMap(tagsFile)
 }
 
-// SetTagAlias points alias at digest. Alias must satisfy the tag shape and
-// ban rules (000 §2, §3.4); digest is normalized like SetNamespace.
-func (s *Store) SetTagAlias(alias, digest string) error {
-	if err := ref.ValidTag(alias); err != nil {
-		return fmt.Errorf("cas: invalid tag alias %q: %s", alias, err.Message)
+// SetTagAlias points the repository-scoped tag (nsName:tag) at digest.
+// nsName must be a well-formed "ns/name", tag must satisfy the tag shape
+// and ban rules (000 §2, §3.4); digest is normalized like SetNamespace.
+func (s *Store) SetTagAlias(nsName, tag, digest string) error {
+	if !ref.ValidNamespaceKey(nsName) {
+		return fmt.Errorf("cas: invalid namespace key %q: want ns/name per spec 000", nsName)
+	}
+	if err := ref.ValidTag(tag); err != nil {
+		return fmt.Errorf("cas: invalid tag alias %q: %s", tag, err.Message)
 	}
 	d, rerr := ref.NormalizeDigest(digest)
 	if rerr != nil {
-		return fmt.Errorf("cas: invalid digest for tag %q: %s", alias, rerr.Message)
+		return fmt.Errorf("cas: invalid digest for tag %q: %s", tag, rerr.Message)
 	}
-	return s.updateMap(tagsFile, func(m map[string]string) { m[alias] = d })
+	key := nsName + ":" + tag
+	return s.updateMap(tagsFile, func(m map[string]string) { m[key] = d })
 }
 
-// DeleteTagAlias removes a tag alias if present.
-func (s *Store) DeleteTagAlias(alias string) error {
-	return s.updateMap(tagsFile, func(m map[string]string) { delete(m, alias) })
+// DeleteTagAlias removes a repository-scoped tag alias if present.
+func (s *Store) DeleteTagAlias(nsName, tag string) error {
+	return s.updateMap(tagsFile, func(m map[string]string) { delete(m, nsName+":"+tag) })
 }
 
 func (s *Store) loadMap(name string) (map[string]string, error) {
@@ -82,11 +89,18 @@ func (s *Store) loadMap(name string) (map[string]string, error) {
 	return m, nil
 }
 
-// updateMap loads, mutates, and atomically saves. Load-modify-save races
-// between concurrent updates lose one write; shardhive is a single daemon
-// owning state/, so a process-level lock suffices for now.
-// ponytail: add file locking if state writers ever run in multiple processes.
+// stateMu serializes the load-mutate-save cycle in updateMap. The
+// ponytail note about a single daemon writer is no longer the whole truth
+// (the API serves concurrent ensures), so the chain is atomic in-process.
+// ponytail: file locking still needed only if multiple processes write.
+var stateMu sync.Mutex
+
+// updateMap loads, mutates, and atomically saves under stateMu, making the
+// load-mutate-save chain atomic against concurrent updates within this
+// process.
 func (s *Store) updateMap(name string, mutate func(map[string]string)) error {
+	stateMu.Lock()
+	defer stateMu.Unlock()
 	m, err := s.loadMap(name)
 	if err != nil {
 		return err

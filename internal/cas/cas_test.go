@@ -442,22 +442,32 @@ func TestStateNamespacesRoundtrip(t *testing.T) {
 func TestStateTagAliasesRoundtrip(t *testing.T) {
 	s := newTestStore(t)
 	d := digestOf([]byte("blob"))
-	if err := s.SetTagAlias("stable", d); err != nil {
+	// R3: tags are scoped per repository; the key is ns/name:tag.
+	if err := s.SetTagAlias("ns/models", "stable", d); err != nil {
 		t.Fatal(err)
+	}
+	if err := s.SetTagAlias("other/models", "stable", d); err != nil {
+		t.Fatal(err) // same tag name, different repo: independent
 	}
 	tags, err := s.TagAliases()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tags["stable"] != "sha256:"+d {
+	if tags["ns/models:stable"] != "sha256:"+d || tags["other/models:stable"] != "sha256:"+d {
 		t.Fatalf("tags %v", tags)
 	}
-	if err := s.DeleteTagAlias("stable"); err != nil {
+	if err := s.DeleteTagAlias("ns/models", "stable"); err != nil {
 		t.Fatal(err)
 	}
 	tags, _ = s.TagAliases()
-	if len(tags) != 0 {
-		t.Fatalf("want empty, got %v", tags)
+	if _, ok := tags["ns/models:stable"]; ok {
+		t.Fatal("tag survived delete")
+	}
+	if _, ok := tags["other/models:stable"]; !ok {
+		t.Fatal("delete leaked across repo scope")
+	}
+	if err := s.DeleteTagAlias("other/models", "stable"); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -538,15 +548,19 @@ func TestStateValidationRejectsGarbage(t *testing.T) {
 		if err := s.SetNamespace("ns/ok", bad); err == nil {
 			t.Fatalf("digest %q accepted", bad)
 		}
-		if err := s.SetTagAlias("ok-tag", bad); err == nil {
+		if err := s.SetTagAlias("ns/ok", "ok-tag", bad); err == nil {
 			t.Fatalf("tag digest %q accepted", bad)
 		}
 	}
 	for _, bad := range []string{
 		"", "q8_0", "sha256-abc", "SHA256:abc", ".lead", "sp ace",
 	} {
-		if err := s.SetTagAlias(bad, validDigest); err == nil {
+		if err := s.SetTagAlias("ns/ok", bad, validDigest); err == nil {
 			t.Fatalf("tag alias %q accepted", bad)
+		}
+		// R3: the namespace scope must validate too.
+		if err := s.SetTagAlias(bad, "ok-tag", validDigest); err == nil {
+			t.Fatalf("tag scope %q accepted", bad)
 		}
 	}
 	// Nothing may have been written into state/.
@@ -586,5 +600,28 @@ func TestVerifyAllReportsStateErrors(t *testing.T) {
 	// readable refs the missing list is empty, but StateErrors says why.
 	if len(res.Missing) != 0 {
 		t.Fatalf("missing %v", res.Missing)
+	}
+}
+
+// --- Straggler b: state load-mutate-save must be atomic in-process ---
+
+func TestStateConcurrentUpdatesNoLostWrite(t *testing.T) {
+	s := newTestStore(t)
+	const n = 8
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("ns/r%d", i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := s.SetNamespace(key, digestOf([]byte(key))); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	ns, _ := s.Namespaces()
+	if len(ns) != n {
+		t.Fatalf("lost updates: %d/%d namespaces survived", len(ns), n)
 	}
 }
