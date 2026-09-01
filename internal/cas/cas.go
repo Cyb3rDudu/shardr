@@ -206,6 +206,12 @@ func (s *Store) Put(expectedDigest string, r io.Reader) error {
 		os.Remove(part.Name())
 		return err
 	}
+	// Mode metadata was set (chmod before rename) and the file itself was
+	// fsynced pre-rename; syncing the parent directory makes the completed
+	// rename + entry durable across crashes (issue #4 hard follow-up).
+	if err := syncDir(filepath.Dir(target)); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -240,14 +246,25 @@ func (s *Store) Verify(digest string) error {
 	return nil
 }
 
+// VerifyResult is the outcome of a full-store verification. StateErrors
+// surfaces state-load failures (e.g. corrupt JSON): a broken state file
+// must not abort blob verification, but it also must not silently vanish —
+// corrupt state can mask missing references (issue #4 hard follow-up).
+type VerifyResult struct {
+	Mismatched  []string
+	Missing     []string
+	StateErrors []string
+}
+
 // VerifyAll re-hashes every blob in the store and additionally checks every
 // digest referenced by state/ (namespaces, tag aliases) for existence: a walk
 // alone cannot notice deletions — "missing" is only decidable against an
 // expectation, and state/ is the record of what should exist. Foreign files
 // under blobs/sha256/ (e.g. .DS_Store, AppleDouble junk) are skipped, not
 // errors — they are not blobs and must not mask verification of real ones.
-func (s *Store) VerifyAll() (mismatched, missing []string, err error) {
-	err = filepath.WalkDir(s.blobsDir(), func(path string, d fs.DirEntry, err error) error {
+func (s *Store) VerifyAll() (VerifyResult, error) {
+	var res VerifyResult
+	err := filepath.WalkDir(s.blobsDir(), func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
@@ -257,7 +274,7 @@ func (s *Store) VerifyAll() (mismatched, missing []string, err error) {
 		}
 		if vErr := s.Verify(digest); vErr != nil {
 			if errors.Is(vErr, ErrDigestMismatch) {
-				mismatched = append(mismatched, digest)
+				res.Mismatched = append(res.Mismatched, digest)
 			} else {
 				return vErr
 			}
@@ -265,23 +282,27 @@ func (s *Store) VerifyAll() (mismatched, missing []string, err error) {
 		return nil
 	})
 	if err != nil {
-		return nil, nil, err
+		return res, err
+	}
+	ns, nsErr := s.Namespaces()
+	tags, tagsErr := s.TagAliases()
+	if nsErr != nil {
+		res.StateErrors = append(res.StateErrors, "namespaces: "+nsErr.Error())
+	}
+	if tagsErr != nil {
+		res.StateErrors = append(res.StateErrors, "tags: "+tagsErr.Error())
 	}
 	refs := map[string]bool{}
-	// Best-effort state load: a corrupt state file must not mask blob
-	// verification.
-	ns, _ := s.Namespaces()
-	tags, _ := s.TagAliases()
 	for _, m := range []map[string]string{ns, tags} {
 		for _, digest := range m {
-			refs[digest] = true
+			refs[stateDigestHex(digest)] = true
 		}
 	}
 	for digest := range refs {
 		if !s.Has(digest) {
-			missing = append(missing, digest)
+			res.Missing = append(res.Missing, digest)
 		}
 	}
-	sort.Strings(missing)
-	return mismatched, missing, nil
+	sort.Strings(res.Missing)
+	return res, nil
 }

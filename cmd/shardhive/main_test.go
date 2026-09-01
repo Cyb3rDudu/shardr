@@ -112,6 +112,27 @@ func TestRunVerifyMismatchOutranksMissing(t *testing.T) {
 	}
 }
 
+func TestRunVerifyCanonicalDigestPrefix(t *testing.T) {
+	s := withTestCAS(t)
+	clean := put(t, s, []byte("canonical form"))
+	// Bare hex stays valid.
+	if got := runVerify(clean); got != 0 {
+		t.Errorf("bare hex: exit %d want 0", got)
+	}
+	// Canonical sha256:<hex> form is accepted and normalized.
+	if got := runVerify("sha256:" + clean); got != 0 {
+		t.Errorf("sha256: prefix: exit %d want 0", got)
+	}
+	// Canonical form of a missing digest still exits 2.
+	if got := runVerify("sha256:" + bytesToDigest([]byte("missing"))); got != 2 {
+		t.Errorf("sha256: prefix missing: exit %d want 2", got)
+	}
+	// Garbage stays a usage-level verify failure (exit 2, missing).
+	if got := runVerify("sha256:not-hex"); got != 2 {
+		t.Errorf("garbage digest: exit %d want 2", got)
+	}
+}
+
 func bytesToDigest(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
@@ -125,10 +146,10 @@ func TestRunDispatch(t *testing.T) {
 		args []string
 		want int
 	}{
-		{"no args", nil, 2},
-		{"unknown command", []string{"frobnicate"}, 2},
-		{"cas alone", []string{"cas"}, 2},
-		{"cas verify without digest", []string{"cas", "verify"}, 2},
+		{"no args", nil, exitUsage},
+		{"unknown command", []string{"frobnicate"}, exitUsage},
+		{"cas alone", []string{"cas"}, exitUsage},
+		{"cas verify without digest", []string{"cas", "verify"}, exitUsage},
 		{"cas verify --all clean", []string{"cas", "verify", "--all"}, 0},
 		{"version", []string{"version"}, 0},
 	}

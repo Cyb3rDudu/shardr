@@ -311,15 +311,18 @@ func TestVerifyAllFindsMutatedAndMissing(t *testing.T) {
 	os.WriteFile(p, []byte("mutated"), 0o644)
 	os.Remove(filepath.Join(s.blobsDir(), deleted[:2], deleted[2:]))
 
-	mismatched, missing, err := s.VerifyAll()
+	res, err := s.VerifyAll()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(mismatched) != 1 || mismatched[0] != mutated {
-		t.Fatalf("mismatched %v want [%s]", mismatched, mutated)
+	if len(res.Mismatched) != 1 || res.Mismatched[0] != mutated {
+		t.Fatalf("mismatched %v want [%s]", res.Mismatched, mutated)
 	}
-	if len(missing) != 1 || missing[0] != deleted {
-		t.Fatalf("missing %v want [%s]", missing, deleted)
+	if len(res.Missing) != 1 || res.Missing[0] != deleted {
+		t.Fatalf("missing %v want [%s]", res.Missing, deleted)
+	}
+	if len(res.StateErrors) != 0 {
+		t.Fatalf("unexpected state errors %v", res.StateErrors)
 	}
 	if err := s.Verify(digests[2]); err != nil {
 		t.Fatalf("clean blob flagged: %v", err)
@@ -373,12 +376,12 @@ func TestVerifyAllSkipsForeignFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	mismatched, missing, err := s.VerifyAll()
+	res, err := s.VerifyAll()
 	if err != nil {
 		t.Fatalf("foreign file aborted verification: %v", err)
 	}
-	if len(mismatched) != 0 || len(missing) != 0 {
-		t.Fatalf("mismatched=%v missing=%v, want both empty", mismatched, missing)
+	if len(res.Mismatched) != 0 || len(res.Missing) != 0 {
+		t.Fatalf("mismatched=%v missing=%v, want both empty", res.Mismatched, res.Missing)
 	}
 	if err := s.Verify(d); err != nil {
 		t.Fatalf("clean blob flagged: %v", err)
@@ -420,7 +423,7 @@ func TestStateNamespacesRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ns["ns/models"] != d {
+	if ns["ns/models"] != "sha256:"+d {
 		t.Fatalf("namespace %v", ns)
 	}
 	if err := s.DeleteNamespace("ns/models"); err != nil {
@@ -446,7 +449,7 @@ func TestStateTagAliasesRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tags["stable"] != d {
+	if tags["stable"] != "sha256:"+d {
 		t.Fatalf("tags %v", tags)
 	}
 	if err := s.DeleteTagAlias("stable"); err != nil {
@@ -460,17 +463,19 @@ func TestStateTagAliasesRoundtrip(t *testing.T) {
 
 func TestStateCanonicalAndAtomic(t *testing.T) {
 	s := newTestStore(t)
-	if err := s.SetNamespace("b", digestOf([]byte("1"))); err != nil {
+	// Both digest forms normalize to the canonical "sha256:" storage form.
+	bare := digestOf([]byte("1"))
+	if err := s.SetNamespace("ns/b", bare); err != nil { // bare hex accepted
 		t.Fatal(err)
 	}
-	if err := s.SetNamespace("a", digestOf([]byte("2"))); err != nil {
+	if err := s.SetNamespace("ns/a", "sha256:"+digestOf([]byte("2"))); err != nil { // prefixed accepted
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(filepath.Join(s.stateDir(), namespacesFile))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"a":"` + digestOf([]byte("2")) + `","b":"` + digestOf([]byte("1")) + `"}`
+	want := `{"ns/a":"sha256:` + digestOf([]byte("2")) + `","ns/b":"sha256:` + bare + `"}`
 	if string(b) != want {
 		t.Fatalf("canonical form %s want %s", b, want)
 	}
@@ -510,5 +515,76 @@ func TestPutRandomBlobsDistinctPaths(t *testing.T) {
 	}
 	if n := countBlobFiles(t, s); n != 50 {
 		t.Fatalf("blob count %d want 50", n)
+	}
+}
+
+// --- Issue #4 hard follow-up: state validation (no garbage in state/) ---
+
+func TestStateValidationRejectsGarbage(t *testing.T) {
+	s := newTestStore(t)
+	validDigest := digestOf([]byte("valid"))
+	for _, bad := range []string{
+		"", "name", "ns/name/extra", "/name", "ns/", "UP/name", "ns/UP",
+		"ns/na me", "-lead/name",
+	} {
+		if err := s.SetNamespace(bad, validDigest); err == nil {
+			t.Fatalf("namespace key %q accepted", bad)
+		}
+	}
+	for _, bad := range []string{
+		"", "xyz", "sha256:", "sha256:xyz", validDigest[:63], validDigest + "0",
+		"SHA256:" + validDigest,
+	} {
+		if err := s.SetNamespace("ns/ok", bad); err == nil {
+			t.Fatalf("digest %q accepted", bad)
+		}
+		if err := s.SetTagAlias("ok-tag", bad); err == nil {
+			t.Fatalf("tag digest %q accepted", bad)
+		}
+	}
+	for _, bad := range []string{
+		"", "q8_0", "sha256-abc", "SHA256:abc", ".lead", "sp ace",
+	} {
+		if err := s.SetTagAlias(bad, validDigest); err == nil {
+			t.Fatalf("tag alias %q accepted", bad)
+		}
+	}
+	// Nothing may have been written into state/.
+	ns, _ := s.Namespaces()
+	if len(ns) != 0 {
+		t.Fatalf("garbage leaked into state: %v", ns)
+	}
+	tags, _ := s.TagAliases()
+	if len(tags) != 0 {
+		t.Fatalf("garbage leaked into state: %v", tags)
+	}
+}
+
+// --- Issue #4 hard follow-up: VerifyAll surfaces state-load errors ---
+
+func TestVerifyAllReportsStateErrors(t *testing.T) {
+	s := newTestStore(t)
+	// A clean blob that must still verify despite corrupt state.
+	if err := s.Put(digestOf([]byte("clean")), strings.NewReader("clean")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.stateDir(), namespacesFile),
+		[]byte("{{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.VerifyAll()
+	if err != nil {
+		t.Fatalf("corrupt state aborted blob verification: %v", err)
+	}
+	if len(res.Mismatched) != 0 {
+		t.Fatalf("mismatched %v", res.Mismatched)
+	}
+	if len(res.StateErrors) != 1 || !strings.Contains(res.StateErrors[0], "namespaces") {
+		t.Fatalf("state errors %v, want one mentioning namespaces", res.StateErrors)
+	}
+	// Corrupt state must not silently mask missing references: with no
+	// readable refs the missing list is empty, but StateErrors says why.
+	if len(res.Missing) != 0 {
+		t.Fatalf("missing %v", res.Missing)
 	}
 }
