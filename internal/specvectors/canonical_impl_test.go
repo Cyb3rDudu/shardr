@@ -88,11 +88,14 @@ func validateManifest(doc map[string]any) *valError {
 		return valErrf("E_VALIDATION", "files must be a non-empty array")
 	}
 	var (
-		configs    int
-		weightsFmt string
-		parts      = map[string][]int64{}
-		names      = map[string]bool{}
-		prev       *manifestFile
+		configs      int
+		weightsFmt   string
+		tokenizers   int
+		chatTemplate int
+		runtimes     = map[string]int{}
+		parts        = map[string][]int64{}
+		names        = map[string]bool{}
+		prev         *manifestFile
 	)
 	for i, fi := range files {
 		f, verr := decodeFileEntry(fi)
@@ -108,6 +111,18 @@ func validateManifest(doc map[string]any) *valError {
 			configs++
 			if f.Name != "modelconfig.json" {
 				return valErrf("E_VALIDATION", "config entry must be named modelconfig.json")
+			}
+		case "tokenizer":
+			tokenizers++
+		case "chat-template":
+			chatTemplate++
+		case "runtime-config":
+			if f.Runtime == "" {
+				return valErrf("E_VALIDATION", "runtime-config entry %q missing runtime id", f.Name)
+			}
+			runtimes[f.Runtime]++
+			if runtimes[f.Runtime] > 1 {
+				return valErrf("E_VALIDATION_RUNTIME_DUP", "more than one runtime-config entry for runtime %q (001 §3.1: <= 1 per runtime id)", f.Runtime)
 			}
 		case "weights.gguf", "weights.safetensors":
 			fmt := strings.TrimPrefix(f.Kind, "weights.")
@@ -128,6 +143,15 @@ func validateManifest(doc map[string]any) *valError {
 	}
 	if configs != 1 {
 		return valErrf("E_VALIDATION", "exactly 1 config entry required, found %d", configs)
+	}
+	if weightsFmt == "" {
+		return valErrf("E_VALIDATION_WEIGHTS_MISSING", "artifact requires at least one weights entry (001 §3.1: weights 1..n)")
+	}
+	if tokenizers > 1 {
+		return valErrf("E_VALIDATION_CARDINALITY", "at most 1 tokenizer entry (001 §3.1), found %d", tokenizers)
+	}
+	if chatTemplate > 1 {
+		return valErrf("E_VALIDATION_CARDINALITY", "at most 1 chat-template entry (001 §3.1), found %d", chatTemplate)
 	}
 	for fmt, ps := range parts {
 		sort.Slice(ps, func(i, j int) bool { return ps[i] < ps[j] })
@@ -150,9 +174,7 @@ func decodeFileEntry(fi any) (manifestFile, *valError) {
 	f.Digest, _ = m["digest"].(string)
 	f.Name, _ = m["name"].(string)
 	f.Role, _ = m["role"].(string)
-	if s, ok := m["size"].(float64); ok {
-		f.Size = int64(s)
-	}
+	f.Runtime, _ = m["runtime"].(string)
 	if p, ok := m["part"].(float64); ok {
 		f.Part = new(int64)
 		*f.Part = int64(p)
@@ -166,8 +188,19 @@ func decodeFileEntry(fi any) (manifestFile, *valError) {
 	if !reDigest.MatchString(f.Digest) {
 		return f, valErrf("E_VALIDATION", "file %q: digest must match sha256:<64 lowercase hex>", f.Name)
 	}
-	if f.Size < 0 {
-		return f, valErrf("E_VALIDATION", "file %q: negative size", f.Name)
+	if _, ok := m["size"]; !ok {
+		return f, valErrf("E_VALIDATION", "file %q: missing size", f.Name)
+	}
+	if s, ok := m["size"].(float64); !ok {
+		return f, valErrf("E_VALIDATION", "file %q: size must be a number", f.Name)
+	} else {
+		f.Size = int64(s)
+	}
+	if f.Size <= 0 {
+		return f, valErrf("E_VALIDATION", "file %q: size must be > 0", f.Name)
+	}
+	if f.Name == "manifest" || strings.HasPrefix(f.Name, "manifest/") {
+		return f, valErrf("E_VALIDATION_RESERVED_PATH", "file %q: the manifest/ path prefix is reserved for the embedded manifest document (001 §3.1 rule 1, ruling R2)", f.Name)
 	}
 	if f.Name == "" || strings.HasPrefix(f.Name, "/") || strings.Contains(f.Name, "..") || strings.Contains(f.Name, "\\") || strings.Contains(f.Name, "//") || strings.HasSuffix(f.Name, "/") {
 		return f, valErrf("E_VALIDATION", "file %q: invalid artifact-relative name", f.Name)
@@ -196,6 +229,8 @@ func fileOrder(a, b *manifestFile) int {
 		return strings.Compare(a.Digest, b.Digest)
 	case a.Kind == "weights.aux":
 		return strings.Compare(a.Name, b.Name)
+	case a.Kind == "runtime-config": // by runtime id (001 §3.1 rule 4)
+		return strings.Compare(a.Runtime, b.Runtime)
 	case a.Kind == "code": // role, then name (001 §3.1 rule 4)
 		if c := strings.Compare(a.Role, b.Role); c != 0 {
 			return c

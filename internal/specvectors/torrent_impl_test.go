@@ -191,13 +191,14 @@ type manifestDoc struct {
 }
 
 type manifestFile struct {
-	Kind   string `json:"kind"`
-	Digest string `json:"digest"`
-	Size   int64  `json:"size"`
-	Name   string `json:"name"`
-	Part   *int64 `json:"part"`
-	Role   string `json:"role"`
-	BT     struct {
+	Kind    string `json:"kind"`
+	Digest  string `json:"digest"`
+	Size    int64  `json:"size"`
+	Name    string `json:"name"`
+	Part    *int64 `json:"part"`
+	Role    string `json:"role"`
+	Runtime string `json:"runtime"`
+	BT      struct {
 		MerkleRoot string `json:"merkleRoot"`
 	} `json:"bt"`
 }
