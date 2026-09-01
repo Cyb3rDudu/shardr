@@ -205,6 +205,11 @@ func decodeFileEntry(fi any) (manifestFile, *valError) {
 	if f.Name == "" || strings.HasPrefix(f.Name, "/") || strings.Contains(f.Name, "..") || strings.Contains(f.Name, "\\") || strings.Contains(f.Name, "//") || strings.HasSuffix(f.Name, "/") {
 		return f, valErrf("E_VALIDATION", "file %q: invalid artifact-relative name", f.Name)
 	}
+	for _, seg := range strings.Split(f.Name, "/") {
+		if seg == "." || seg == ".." {
+			return f, valErrf("E_VALIDATION", "file %q: invalid artifact-relative name (path segments must not be . or ..)", f.Name)
+		}
+	}
 	if !reDigest.MatchString(f.BT.MerkleRoot) {
 		return f, valErrf("E_VALIDATION", "file %q: bt.merkleRoot must match sha256:<64 lowercase hex>", f.Name)
 	}

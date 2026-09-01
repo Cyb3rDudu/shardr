@@ -77,13 +77,17 @@ torrent data here would create a fixed-point problem.
 Every file entry MUST carry `kind`, `digest`, `size`, `name`, and (for
 all torrented blobs) `bt.merkleRoot`. Rules:
 
-1. `name` = artifact-relative canonical filename, `/`-separated, no
-   leading `/`, no `..`, unique. The `manifest/` path prefix is
-   **reserved**: 004 §3 places the manifest blob at `manifest/sha256-<hex>`
-   in the torrent tree, so artifact file names MUST NOT start with
-   `manifest/` — validators reject such artifacts (one reserved prefix
-   instead of ambiguous torrent trees). Torrent file trees are built from
-   these names (004 §3) — original filenames make torrents directly usable
+1. `name` = artifact-relative canonical filename, `/`-separated into
+   non-empty segments; `.`, `..`, and empty segments are forbidden
+   anywhere (no leading `/`, no `a//b`, no `./x`), unique. The first
+   path segment `manifest` is **reserved**: 004 §3 places the manifest
+   blob at `manifest/sha256-<hex>` in the torrent tree, so artifact
+   file names MUST NOT be `manifest` and MUST NOT have `manifest` as
+   first path segment — names equal to `manifest` or starting with
+   `manifest/` are rejected (a file named `manifest` would collide
+   with the manifest directory; one reserved prefix instead of
+   ambiguous torrent trees). Torrent file trees are built from these
+   names (004 §3) — original filenames make torrents directly usable
    and seedable by third-party BitTorrent clients.
 2. One weights format per artifact (no gguf+safetensors mixing).
 3. Aux attachment: **quant-specific** companions join only the matching
