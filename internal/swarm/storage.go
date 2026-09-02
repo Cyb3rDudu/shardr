@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 
 	g "github.com/anacrolix/generics"
@@ -115,7 +116,11 @@ func (c *CASStorage) OpenTorrent(_ context.Context, info *metainfo.Info, infoHas
 		c.mu.Unlock()
 		return storage.TorrentImpl{}, fmt.Errorf("swarm: torrent %x is not registered with CAS digests; refusing to store unpinned bytes", infoHash)
 	}
-	t := newCASTorrent(c, key, info, files)
+	t, err := newCASTorrent(c, key, info, files)
+	if err != nil {
+		c.mu.Unlock()
+		return storage.TorrentImpl{}, err
+	}
 	c.open[key] = t
 	c.mu.Unlock()
 	return storage.TorrentImpl{
@@ -123,6 +128,29 @@ func (c *CASStorage) OpenTorrent(_ context.Context, info *metainfo.Info, infoHas
 		PieceWithHash: func(p metainfo.Piece, _ g.Option[[]byte]) storage.PieceImpl { return t.piece(p) },
 		Close:         t.close,
 	}, nil
+}
+
+// driverFor returns the live driver for a registered torrent (nil when
+// not open).
+func (c *CASStorage) driverFor(v2InfohashHex string) *casTorrent {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.open[normalizeKey(v2InfohashHex)]
+}
+
+func normalizeKey(v2InfohashHex string) string {
+	if len(v2InfohashHex) > 40 {
+		return v2InfohashHex[:40]
+	}
+	return v2InfohashHex
+}
+
+// openDriver runs the storage OpenTorrent path for a spec-supplied info
+// (tests, phase-2 pre-open).
+func (c *CASStorage) openDriver(info *metainfo.Info, shortKey string) (*casTorrent, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return newCASTorrent(c, shortKey, info, c.registry[shortKey])
 }
 
 // casTorrent is the per-torrent driver instance.
@@ -158,7 +186,7 @@ type fileState struct {
 	doneCond *sync.Cond // broadcasts seal/failure and per-piece completion
 }
 
-func newCASTorrent(parent *CASStorage, key string, info *metainfo.Info, files map[string]FileSpec) *casTorrent {
+func newCASTorrent(parent *CASStorage, key string, info *metainfo.Info, files map[string]FileSpec) (*casTorrent, error) {
 	t := &casTorrent{parent: parent, key: key, info: info}
 	t.doneCond = sync.NewCond(&t.mu)
 	fis := info.UpvertedFiles()
@@ -166,7 +194,15 @@ func newCASTorrent(parent *CASStorage, key string, info *metainfo.Info, files ma
 	pl := info.PieceLength
 	t.files = make(map[string]*fileState, len(fis))
 	for _, fi := range fis {
-		path := filepath.Join(fi.Path...) // POSIX join; torrent paths are /-separated
+		// Trust boundary: torrent metadata is untrusted input. Paths are
+		// map keys only (never filesystem paths), but non-canonical segments
+		// ("", ".", "..", absolute) are rejected loudly — a crafted info dict
+		// must not smuggle traversal-shaped keys past the spec's canonical
+		// name rules (001 §3.1 rule 1).
+		if !canonicalTorrentPath(fi.Path) {
+			return nil, fmt.Errorf("swarm: torrent file tree contains non-canonical path %q (empty/./.. segments rejected, 001 §3.1)", slashJoin(fi.Path))
+		}
+		path := slashJoin(fi.Path)
 		if fi.Length == 0 {
 			continue // occupies no pieces (shardr manifests have no empty files; see 001 §3.1)
 		}
@@ -193,7 +229,7 @@ func newCASTorrent(parent *CASStorage, key string, info *metainfo.Info, files ma
 		st.spec.Size = fi.Length
 		t.files[path] = st
 	}
-	return t
+	return t, nil
 }
 
 // piece returns the PieceImpl for a global piece index.
@@ -438,3 +474,21 @@ func (c *CASStorage) newPart(digest string) (*os.File, error) {
 	}
 	return os.CreateTemp(dir, digest[:16]+"-*.part")
 }
+
+// canonicalTorrentPath enforces canonical /-separated segments on a
+// torrent file-tree path (001 §3.1 rule 1 analogue for untrusted metadata).
+func canonicalTorrentPath(segs []string) bool {
+	if len(segs) == 0 {
+		return false
+	}
+	for _, s := range segs {
+		if s == "" || s == "." || s == ".." || strings.ContainsAny(s, "\\") {
+			return false
+		}
+	}
+	return true
+}
+
+// slashJoin renders a torrent file path; identical semantics to the test
+// helper (single source of truth lives here, tests reuse it).
+func slashJoin(segs []string) string { return strings.Join(segs, "/") }

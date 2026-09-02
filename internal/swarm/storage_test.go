@@ -134,17 +134,6 @@ func pieceFileIndex(info *metainfo.Info, i int) int {
 	return 0
 }
 
-func slashJoin(p []string) string {
-	s := ""
-	for i, seg := range p {
-		if i > 0 {
-			s += "/"
-		}
-		s += seg
-	}
-	return s
-}
-
 // The happy path: writing all pieces of a file and marking them complete
 // seals the blob into the CAS with the pinned digest.
 func TestStorageSealsFileIntoCAS(t *testing.T) {

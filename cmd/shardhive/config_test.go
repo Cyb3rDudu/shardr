@@ -1,0 +1,96 @@
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/Cyb3rDudu/shardr/internal/swarm"
+)
+
+// writeConfig writes a config file into a temp HOME/XDG and points
+// SHARDR_CONFIG at it.
+func writeConfig(t *testing.T, content string) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SHARDR_CONFIG", path)
+}
+
+func TestLoadSwarmConfigDefaults(t *testing.T) {
+	writeConfig(t, "")
+	cfg, err := loadSwarmConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := swarm.DefaultConfig()
+	if cfg != want {
+		t.Fatalf("empty file must yield defaults: %+v", cfg)
+	}
+}
+
+func TestLoadSwarmConfigFull(t *testing.T) {
+	writeConfig(t, `# shardr config
+[references]
+default_selector = "q8_0"   # other component's section — not ours
+
+[swarm]
+enabled = true
+seed = false
+upload_limit = 1048576
+dht = false
+webseed_addr = "127.0.0.1:7777"
+
+[models."unsloth/qwen3.8-27b-gguf:ud-q4_k_m"]
+`)
+	cfg, err := loadSwarmConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Enabled || cfg.Seed || cfg.DHT {
+		t.Fatalf("bools: %+v", cfg)
+	}
+	if cfg.UploadLimit != 1048576 {
+		t.Fatalf("upload_limit: %d", cfg.UploadLimit)
+	}
+	if cfg.WebseedAddr != "127.0.0.1:7777" {
+		t.Fatalf("webseed_addr: %q", cfg.WebseedAddr)
+	}
+}
+
+// A typo in [swarm] must fail loudly — a quietly ignored key could
+// disable seeding without the operator ever noticing.
+func TestLoadSwarmConfigUnknownKeyIsLoud(t *testing.T) {
+	writeConfig(t, "[swarm]\nseeding = false\n")
+	if _, err := loadSwarmConfig(); err == nil || !strings.Contains(err.Error(), "seeding") {
+		t.Fatalf("unknown key must be loud: %v", err)
+	}
+}
+
+func TestLoadSwarmConfigBadValue(t *testing.T) {
+	writeConfig(t, "[swarm]\nseed = maybe\n")
+	if _, err := loadSwarmConfig(); err == nil {
+		t.Fatal("bad bool must be loud")
+	}
+}
+
+// The seed knobs map onto the engine config (DoD: [swarm] seed=false /
+// upload_limit respektiert — the mapping test; behavior is covered by the
+// swarm package tests).
+func TestSeedKnobsMapToEngineConfig(t *testing.T) {
+	writeConfig(t, "[swarm]\nseed = false\nupload_limit = 512\n")
+	cfg, err := loadSwarmConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Seed {
+		t.Fatal("seed=false must reach the engine config")
+	}
+	if cfg.UploadLimit != 512 {
+		t.Fatalf("upload_limit must reach the engine config: %d", cfg.UploadLimit)
+	}
+}

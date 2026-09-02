@@ -3,6 +3,7 @@ package swarm
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -48,6 +49,13 @@ func ParseInfohash(s string) (string, error) {
 	}
 	return strings.ToLower(hexPart), nil
 }
+
+// Sentinel errors mapped by the API layer to 005 §3 error classes.
+var (
+	// ErrBinding: the 001 §6 binding failed — derived identity disagrees
+	// with the record or the joined torrent. Loud abort, never a warning.
+	ErrBinding = errors.New("swarm: identity binding failed")
+)
 
 // Recon is a reconstructed torrent identity from a manifest alone.
 type Recon struct {
@@ -98,13 +106,13 @@ func Reconstruct(m *artifact.Manifest, manifestBytes []byte) (*Recon, error) {
 // loud abort, never a warning.
 func (r *Recon) CheckRecord(rec *artifact.DistributionRecord) error {
 	if rec.ManifestDigest != r.ManifestDigest {
-		return fmt.Errorf("swarm: binding: record pins manifest %s but this manifest is %s", rec.ManifestDigest, r.ManifestDigest)
+		return fmt.Errorf("%w: record pins manifest %s but this manifest is %s", ErrBinding, rec.ManifestDigest, r.ManifestDigest)
 	}
 	if rec.Torrent.Infohash != r.InfohashBtmh {
-		return fmt.Errorf("swarm: binding: infohash mismatch — derived %s from manifest, record says %s (digest world and torrent world disagree; refusing to announce)", r.InfohashBtmh, rec.Torrent.Infohash)
+		return fmt.Errorf("%w: infohash mismatch — derived %s from manifest, record says %s (digest world and torrent world disagree; refusing to announce)", ErrBinding, r.InfohashBtmh, rec.Torrent.Infohash)
 	}
 	if rec.Torrent.PieceLength != r.PieceLength {
-		return fmt.Errorf("swarm: binding: piece length mismatch — derived %d (ladder), record says %d", r.PieceLength, rec.Torrent.PieceLength)
+		return fmt.Errorf("%w: piece length mismatch — derived %d (ladder), record says %d", ErrBinding, r.PieceLength, rec.Torrent.PieceLength)
 	}
 	return nil
 }

@@ -310,7 +310,6 @@ func TestEnsureLocalPresence(t *testing.T) {
 	h := newHarness(t)
 	manifestContent := `{"artifactType":"model-manifest"}`
 	seedRepo(t, h, "ns/models", manifestContent)
-	manifestHex := testDigestOf([]byte(manifestContent))
 
 	// Missing manifest → failed with E_SOURCE_UNAVAILABLE naming reserved sources.
 	code, body := h.postJSON("/v1/ensure", map[string]string{"ref": "shardr:///ns/models:q8_0"})
@@ -346,17 +345,69 @@ func TestEnsureLocalPresence(t *testing.T) {
 		t.Fatalf("job %+v", job)
 	}
 
-	// Present manifest → done (idempotent local hit).
-	if err := h.store.Put(manifestHex, strings.NewReader(manifestContent)); err != nil {
+	// Real artifact via local import: all blobs present → ensure is done
+	// (idempotent local hit).
+	fixtures := "../../internal/importer/testdata/gold"
+	sources, err := importer.LocalSources([]string{fixtures})
+	if err != nil {
 		t.Fatal(err)
 	}
-	code, body = h.postJSON("/v1/ensure", map[string]string{"ref": "shardr:///ns/models:q8_0"})
+	lres, err := importer.Import(context.Background(), h.store, sources, importer.ImportOptions{As: "gold/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, body = h.postJSON("/v1/ensure", map[string]string{"ref": "shardr:///gold/repo:" + lres.Members[0].Quant})
 	if code != http.StatusCreated {
-		t.Fatalf("present: status %d body %s", code, body)
+		t.Fatalf("present artifact: status %d body %s", code, body)
 	}
 	json.Unmarshal(body, &job)
-	if job.State != "done" || job.Manifest != "sha256:"+manifestHex {
-		t.Fatalf("job %+v", job)
+	if job.State != "done" || job.Kind != "ensure" {
+		t.Fatalf("complete artifact must ensure done: %+v", job)
+	}
+
+	// One file blob removed → ensure fails loudly: files missing, swarm
+	// disabled in this build/config ([swarm] enabled names the knob).
+	mres, mbody := h.get("/v1/resolve?ref=" + url.QueryEscape("shardr:///gold/repo:"+lres.Members[0].Quant))
+	if mres != http.StatusOK {
+		t.Fatalf("resolve: %d %s", mres, mbody)
+	}
+	var rr resolveResult
+	json.Unmarshal(mbody, &rr)
+	// rr.Files requires the manifest-parse path; use the missing list via
+	// ensure directly instead: delete one blob named in the job's manifest.
+	var mf struct {
+		Files []struct {
+			Digest string `json:"digest"`
+		} `json:"files"`
+	}
+	fh, err := h.store.Open(strings.TrimPrefix(lres.Members[0].Manifest, "sha256:"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mb, _ := io.ReadAll(fh)
+	fh.Close()
+	json.Unmarshal(mb, &mf)
+	if len(mf.Files) == 0 {
+		t.Fatal("imported manifest has no files")
+	}
+	victim := strings.TrimPrefix(mf.Files[0].Digest, "sha256:")
+	vp, err := h.store.BlobPath(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(vp); err != nil {
+		t.Fatal(err)
+	}
+	code, body = h.postJSON("/v1/ensure", map[string]string{"ref": "shardr:///gold/repo:" + lres.Members[0].Quant})
+	if code != http.StatusCreated {
+		t.Fatalf("missing blob: status %d body %s", code, body)
+	}
+	json.Unmarshal(body, &job)
+	if job.State != "failed" || job.Error == nil || job.Error.Code != ErrSourceUnavail {
+		t.Fatalf("missing blob with swarm off: %+v", job)
+	}
+	if !strings.Contains(job.Error.Message, "[swarm] enabled") {
+		t.Fatalf("error must name the swarm knob: %s", job.Error.Message)
 	}
 
 	// Unknown job id → 404.
@@ -517,18 +568,31 @@ func TestVersionNegotiation(t *testing.T) {
 
 // --- Reserved imports: only BT stays reserved (local/hf are real now) ---
 
-func TestImportsReserved(t *testing.T) {
+func TestImportBTPinMandatory(t *testing.T) {
 	h := newHarness(t)
-	code, body := h.postJSON("/v1/import/bt", map[string]any{})
-	if code != http.StatusNotImplemented {
-		t.Fatalf("/v1/import/bt: status %d body %s", code, body)
+	// No pin: 400 — a magnet alone is never trusted (005 §5).
+	code, body := h.postJSON("/v1/import/bt", map[string]any{"magnet": "magnet:?xt=urn:btmh:1220" + strings.Repeat("ab", 32)})
+	if code != http.StatusBadRequest {
+		t.Fatalf("no pin: status %d body %s", code, body)
 	}
 	var e struct {
 		Error APIError `json:"error"`
 	}
 	json.Unmarshal(body, &e)
-	if e.Error.Code != ErrNotImplemented {
-		t.Fatalf("/v1/import/bt: code %s", e.Error.Code)
+	if e.Error.Code != ErrBadRequest || !strings.Contains(e.Error.Message, "manifestDigest") {
+		t.Fatalf("no pin: %+v", e.Error)
+	}
+	// With pin but swarm disabled: 501 naming the config knob.
+	code, body = h.postJSON("/v1/import/bt", map[string]any{
+		"magnet":         "magnet:?xt=urn:btmh:1220" + strings.Repeat("ab", 32),
+		"manifestDigest": "sha256:" + strings.Repeat("cd", 32),
+	})
+	if code != http.StatusNotImplemented {
+		t.Fatalf("swarm off: status %d body %s", code, body)
+	}
+	json.Unmarshal(body, &e)
+	if e.Error.Code != ErrNotImplemented || !strings.Contains(e.Error.Message, "[swarm] enabled") {
+		t.Fatalf("swarm off: %+v", e.Error)
 	}
 }
 

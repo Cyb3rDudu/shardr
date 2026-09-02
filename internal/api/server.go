@@ -33,6 +33,7 @@ import (
 	"github.com/Cyb3rDudu/shardr/internal/cas"
 	"github.com/Cyb3rDudu/shardr/internal/importer"
 	"github.com/Cyb3rDudu/shardr/internal/ref"
+	"github.com/Cyb3rDudu/shardr/internal/swarm"
 )
 
 // APIVersion is the single supported major version (005 §7).
@@ -65,6 +66,10 @@ func DefaultSocketPath() (string, error) {
 // Server is the shardhive daemon API on a Unix socket.
 type Server struct {
 	store *cas.Store
+	// Swarm is the BitTorrent v2 client (004); nil disables swarm fill and
+	// /import/bt with loud E_SOURCE_UNAVAILABLE / E_NOT_IMPLEMENTED errors
+	// naming the config knob ([swarm] enabled).
+	Swarm *swarm.Client
 	// HF is the Hugging Face client; nil disables /import/hf with a loud
 	// error. Tests inject a stub via this field before Listen.
 	HF      *importer.HFClient
@@ -103,6 +108,8 @@ type ImportResult struct {
 	Quants      []string `json:"quants"`
 	Warnings    []string `json:"warnings,omitempty"`
 	Skipped     int      `json:"skipped"`
+	// Infohash is set for import-bt jobs (btmh:1220<hex>).
+	Infohash string `json:"infohash,omitempty"`
 }
 
 // publishJob atomically replaces a job's map entry with a fresh immutable
@@ -243,7 +250,7 @@ func (s *Server) router() http.Handler {
 	mux.HandleFunc("GET /v1/blob/{digest}", s.handleBlob)
 	mux.HandleFunc("POST /v1/import/local", s.handleImportLocal)
 	mux.HandleFunc("POST /v1/import/hf", s.handleImportHF)
-	mux.HandleFunc("POST /v1/import/bt", s.handleImportReserved)
+	mux.HandleFunc("POST /v1/import/bt", s.handleImportBT)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
 	// Everything else: version negotiation (loud) or plain 404.
 	mux.HandleFunc("/", s.handleUnknown)
@@ -519,10 +526,10 @@ func (s *Server) handleOpen(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
-// handleEnsure: start a fill job. Slice semantics (005 §3, E1.B): local
-// presence only — resolved manifest present → done; anything missing →
-// failed with E_SOURCE_UNAVAILABLE naming the reserved sources. Importers
-// and the swarm client are later slices.
+// handleEnsure: start a fill job (005 §3). Resolution is local-only
+// (resolve stays pure); the manifest must be present. Manifest present +
+// files missing → swarm fill (004 §5) as an async job; swarm disabled or
+// no record link → failed E_SOURCE_UNAVAILABLE naming exactly why.
 func (s *Server) handleEnsure(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Ref string `json:"ref"`
@@ -543,7 +550,7 @@ func (s *Server) handleEnsure(w http.ResponseWriter, r *http.Request) {
 	// Compute the terminal state FIRST, publish afterwards: jobs are
 	// immutable once visible, so concurrent /jobs readers can never see a
 	// half-mutated Job (data race on the map entry).
-	job := &Job{ID: newJobID(), Ref: p.Canonical, State: "waiting"}
+	job := &Job{ID: newJobID(), Ref: p.Canonical, State: "waiting", Kind: "ensure"}
 	res, he := s.resolveLocal(p)
 	switch {
 	case he != nil:
@@ -551,21 +558,178 @@ func (s *Server) handleEnsure(w http.ResponseWriter, r *http.Request) {
 		job.Error = he.err
 	default:
 		job.Manifest = res.ManifestDigest
-		if s.store.Has(strings.TrimPrefix(res.ManifestDigest, ref.DigestSchemePrefix)) {
-			job.State = "done"
-		} else {
+		manifestHex := strings.TrimPrefix(res.ManifestDigest, ref.DigestSchemePrefix)
+		if !s.store.Has(manifestHex) {
 			job.State = "failed"
 			job.Error = &APIError{
 				Code: ErrSourceUnavail,
-				Message: "manifest " + res.ManifestDigest + " is not local; import/swarm sources are not implemented " +
-					"in this build (reserved: POST /v1/import/local, POST /v1/import/hf, POST /v1/import/bt, swarm 004)",
+				Message: "manifest " + res.ManifestDigest + " is not local; network resolver fetch is not implemented " +
+					"in this build (POST /v1/import/local, /import/hf, /import/bt can bring manifests in)",
 			}
+			break
 		}
+		m, mbytes, herr := s.loadManifest(manifestHex)
+		if herr != nil {
+			job.State = "failed"
+			job.Error = herr.err
+			break
+		}
+		missing := swarm.MissingFiles(s.store, m)
+		job.FilesTotal = len(m.Files)
+		job.FilesDone = len(m.Files) - len(missing)
+		if len(missing) == 0 {
+			job.State = "done"
+			break
+		}
+		if s.Swarm == nil {
+			job.State = "failed"
+			job.Error = &APIError{
+				Code:    ErrSourceUnavail,
+				Message: fmt.Sprintf("%d of %d blobs missing and the swarm client is disabled — set [swarm] enabled = true in ~/.config/shardr/config.toml (004 §7)", len(missing), len(m.Files)),
+			}
+			break
+		}
+		s.startFillJob(w, job, m, mbytes)
+		return // async: job published + answered by startFillJob
 	}
 	s.mu.Lock()
 	s.jobs[job.ID] = job
 	s.mu.Unlock()
 	writeJSON(w, http.StatusCreated, job)
+}
+
+// loadManifest reads and validates a manifest blob from the CAS.
+func (s *Server) loadManifest(hexDigest string) (*artifact.Manifest, []byte, *httpError) {
+	f, err := s.store.Open(hexDigest)
+	if err != nil {
+		return nil, nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInternal, Message: "manifest blob unreadable: " + err.Error()}}
+	}
+	defer f.Close()
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return nil, nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInternal, Message: "manifest blob read: " + err.Error()}}
+	}
+	var m artifact.Manifest
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInternal, Message: "manifest blob " + hexDigest + " is not valid JSON (CAS corruption — never silently rebuilt): " + err.Error()}}
+	}
+	if err := artifact.ValidateManifest(&m); err != nil {
+		return nil, nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInternal, Message: "manifest blob " + hexDigest + " fails validation (CAS corruption): " + err.Error()}}
+	}
+	return &m, b, nil
+}
+
+// startFillJob publishes the waiting job, answers 201, and runs the
+// swarm fill asynchronously (terminal-then-publish per transition;
+// progress from the fill engine's callback).
+func (s *Server) startFillJob(w http.ResponseWriter, job *Job, m *artifact.Manifest, manifestBytes []byte) {
+	next := *job
+	next.State = "fetching"
+	s.mu.Lock()
+	s.jobs[job.ID] = &next
+	s.mu.Unlock()
+	writeJSON(w, http.StatusCreated, &next)
+	go func() {
+		base := next
+		err := s.Swarm.Fill(context.Background(), m, manifestBytes, swarm.Hints{},
+			func(done, total int) {
+				prog := base
+				prog.State = "fetching"
+				prog.FilesDone, prog.FilesTotal = done, total
+				s.publishJob(&prog)
+			})
+		term := base
+		if err != nil {
+			term.State = "failed"
+			term.Error = mapSwarmError(err)
+			s.publishJob(&term)
+			return
+		}
+		term.State = "done"
+		term.FilesDone = term.FilesTotal
+		s.publishJob(&term)
+	}()
+}
+
+// mapSwarmError maps swarm failures to the 005 §3 inventory.
+func mapSwarmError(err error) *APIError {
+	switch {
+	case errors.Is(err, swarm.ErrBinding):
+		return &APIError{Code: "E_NOT_IMPORTABLE", Message: err.Error()}
+	case errors.Is(err, swarm.ErrLayersUnavailable):
+		return &APIError{Code: ErrSourceUnavail, Message: err.Error()}
+	case errors.Is(err, cas.ErrDigestMismatch):
+		return &APIError{Code: "E_NOT_IMPORTABLE", Message: "verify-write rejected the fetched bytes: " + err.Error()}
+	default:
+		return &APIError{Code: ErrSourceUnavail, Message: err.Error()}
+	}
+}
+
+// handleImportBT: POST {magnet|infohash, manifestDigest, trackers?,
+// webseeds?, peers?} — the pinned BT import (001 §8.7, 005 §5). The pin
+// is mandatory: a magnet alone is never trusted.
+func (s *Server) handleImportBT(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Magnet         string   `json:"magnet"`
+		Infohash       string   `json:"infohash"`
+		ManifestDigest string   `json:"manifestDigest"`
+		Trackers       []string `json:"trackers"`
+		Webseeds       []string `json:"webseeds"`
+		Peers          []string `json:"peers"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, ErrBadRequest, "body must be JSON {magnet|infohash, manifestDigest}: "+err.Error())
+		return
+	}
+	if body.ManifestDigest == "" {
+		writeErr(w, http.StatusBadRequest, ErrBadRequest, "missing required field: manifestDigest — the pin is mandatory; a magnet alone is never trusted (005 §5)")
+		return
+	}
+	if body.Magnet == "" && body.Infohash == "" {
+		writeErr(w, http.StatusBadRequest, ErrBadRequest, "missing required field: magnet or infohash")
+		return
+	}
+	if body.Magnet != "" && body.Infohash != "" {
+		writeErr(w, http.StatusBadRequest, ErrBadRequest, "magnet and infohash are mutually exclusive")
+		return
+	}
+	loc := body.Magnet
+	if loc == "" {
+		loc = body.Infohash
+	}
+	if s.Swarm == nil {
+		writeErr(w, http.StatusNotImplemented, ErrNotImplemented,
+			"swarm client disabled — set [swarm] enabled = true in ~/.config/shardr/config.toml (004 §7)")
+		return
+	}
+	job := &Job{ID: newJobID(), Ref: loc, Kind: "import-bt", State: "waiting", Manifest: body.ManifestDigest}
+	s.mu.Lock()
+	s.jobs[job.ID] = job
+	s.mu.Unlock()
+	writeJSON(w, http.StatusCreated, job)
+	go func() {
+		next := *job
+		next.State = "fetching"
+		s.publishJob(&next)
+		res, err := s.Swarm.ImportBT(context.Background(), loc, body.ManifestDigest, swarm.Hints{
+			Trackers: body.Trackers,
+			Webseeds: body.Webseeds,
+			Peers:    body.Peers,
+		})
+		term := next
+		if err != nil {
+			term.State = "failed"
+			term.Error = mapSwarmError(err)
+			s.publishJob(&term)
+			return
+		}
+		term.State = "done"
+		term.Result = &ImportResult{
+			Manifests: []string{res.ManifestDigest},
+			Infohash:  res.Infohash,
+		}
+		s.publishJob(&term)
+	}()
 }
 
 // handleJob returns a job by id. The stored pointer is immutable after
