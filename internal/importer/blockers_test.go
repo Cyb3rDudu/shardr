@@ -115,6 +115,39 @@ func TestMissingIndexBlobIsLoud(t *testing.T) {
 	}
 }
 
+// --- B7: corrupt current-index members are loud, never carried over ---
+
+func TestCorruptIndexMembersLoud(t *testing.T) {
+	good := "sha256:" + strings.Repeat("a", 64)
+	for _, tc := range []struct{ name, members string }{
+		{"duplicate quant", `[{"manifest":"` + good + `","quant":"q8_0","weightsFormat":"gguf"},{"manifest":"sha256:` + strings.Repeat("b", 64) + `","quant":"q8_0","weightsFormat":"gguf"}]`},
+		{"invalid manifest digest", `[{"manifest":"sha256:abcd","quant":"q8_0","weightsFormat":"gguf"}]`},
+		{"invalid quant syntax", `[{"manifest":"` + good + `","quant":"not-a-quant","weightsFormat":"gguf"}]`},
+	} {
+		store := mustStore(t)
+		idx := `{"schemaVersion":1,"artifactType":"model-index","members":` + tc.members + `}`
+		if err := store.Put(testDigestOf(idx), strings.NewReader(idx)); err != nil {
+			t.Fatal(err)
+		}
+		d := "sha256:" + testDigestOf(idx)
+		if err := store.SetNamespace("x/y", d); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Import(context.Background(), store, []Source{
+			{Name: "model-q4_0.gguf", Open: bytesSource("w")},
+		}, ImportOptions{As: "x/y"})
+		if err == nil || !strings.Contains(err.Error(), "fails validation") {
+			t.Fatalf("%s: want loud index-validation error, got %v", tc.name, err)
+		}
+		ns, _ := store.Namespaces()
+		if ns["x/y"] != d {
+			t.Fatalf("%s: state must stay untouched, got %v", tc.name, ns["x/y"])
+		}
+		// Import failed before any merge: no new index was published — the
+		// corrupt members cannot have landed in a new current index.
+	}
+}
+
 // --- B5: multiple PEFT pairs survive as separate adapters ---
 
 func TestMultipleAdaptersSurvive(t *testing.T) {
