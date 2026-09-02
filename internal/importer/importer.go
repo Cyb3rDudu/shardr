@@ -8,6 +8,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/Cyb3rDudu/shardr/internal/artifact"
 	"github.com/Cyb3rDudu/shardr/internal/cas"
@@ -108,7 +109,7 @@ func Import(ctx context.Context, store *cas.Store, sources []Source, opts Import
 				if err != nil {
 					return nil, fmt.Errorf("adapter member %s: %w", n, err)
 				}
-				members[path_base(n)] = b
+				members[path_base(n)] = b // the §3.1 adapter tar is the pair (base names)
 			}
 			blobs[e.name] = buildDeterministicTar(members)
 		default:
@@ -151,6 +152,10 @@ func Import(ctx context.Context, store *cas.Store, sources []Source, opts Import
 		}
 	}
 
+	// B3: derived quants must be unique across groups (checked in the loop
+	// below where the chain has full input).
+	quantTaken := map[string]string{}
+
 	res := &ImportResult{Warnings: c.warnings, Skipped: c.skipped}
 	for _, g := range groupOrder {
 		weights := groups[g]
@@ -165,6 +170,10 @@ func Import(ctx context.Context, store *cas.Store, sources []Source, opts Import
 		}
 		warn := func(msg string) { res.Warnings = append(res.Warnings, msg) }
 		quant := DeriveQuant(path_base(weights[0].name), c.upstreamConfig, safetensorsHeader, warn)
+		if other, dup := quantTaken[quant]; dup {
+			return nil, fmt.Errorf("importer: quant conflict: groups %q and %q both derive quant %q; index members are unique per quant (001 §5)", other, g, quant)
+		}
+		quantTaken[quant] = g
 
 		family := deriveFamily(c.upstreamConfig, weights[0].name)
 		ctxLen := int64(0)
@@ -212,9 +221,12 @@ func Import(ctx context.Context, store *cas.Store, sources []Source, opts Import
 			annotations["io.shardr.hf.repo"] = opts.HFRepo
 			annotations["io.shardr.hf.revision"] = opts.HFRevision
 		}
-		if c.licenseSPDX != "" {
-			annotations["io.shardr.license"] = c.licenseSPDX
+		if c.licenseName != "" {
+			// §4: SPDX where possible, else raw upstream name only.
 			annotations["io.shardr.license.name"] = c.licenseName
+			if c.licenseSPDX != "" {
+				annotations["io.shardr.license"] = c.licenseSPDX
+			}
 		}
 
 		sealed, err := artifact.Seal(files, annotations, func(name string) ([]byte, error) {
@@ -260,7 +272,10 @@ func Import(ctx context.Context, store *cas.Store, sources []Source, opts Import
 		})
 	}
 
-	// ---- Index merge + atomic state update ----
+	// ---- Index merge + atomic state update (B6: under the namespace lock) ----
+	mu := lockNamespace(opts.As)
+	mu.Lock()
+	defer mu.Unlock()
 	members, err := existingMembers(store, opts.As)
 	if err != nil {
 		return nil, err
@@ -317,6 +332,18 @@ func putCanonical(store *cas.Store, digest string, b []byte) error {
 	return store.Put(artifact.DigestHex(digest), strings.NewReader(string(b)))
 }
 
+// namespaceLocks serializes the index read-merge-write span per namespace:
+// concurrent import jobs for the same as must not lose members (the CAS
+// state mutex only covers individual file writes, not the RMW chain).
+// ponytail: in-process only; cross-process locking when multiple daemons
+// share a CAS root.
+var namespaceLocks sync.Map // nsKey → *sync.Mutex
+
+func lockNamespace(nsKey string) *sync.Mutex {
+	m, _ := namespaceLocks.LoadOrStore(nsKey, &sync.Mutex{})
+	return m.(*sync.Mutex)
+}
+
 // existingMembers loads the namespace's current index from state+CAS, if any.
 func existingMembers(store *cas.Store, nsKey string) ([]artifact.IndexMember, error) {
 	ns, err := store.Namespaces()
@@ -329,7 +356,9 @@ func existingMembers(store *cas.Store, nsKey string) ([]artifact.IndexMember, er
 	}
 	hex := artifact.DigestHex(d)
 	if !store.Has(hex) {
-		return nil, nil // index blob absent: start fresh (loud in verify --all)
+		// B4: consistent with the API's E_NO_INDEX — a namespace pointing
+		// at a missing index blob is corruption, never silently rebuilt.
+		return nil, fmt.Errorf("importer: current index %s for %q is missing from the CAS; refusing to rebuild silently (run `shardhive cas verify --all` and repair state)", d, nsKey)
 	}
 	f, err := store.Open(hex)
 	if err != nil {

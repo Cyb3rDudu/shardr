@@ -21,13 +21,15 @@ var updateGold = flag.Bool("update", false, "rewrite golden import digests (only
 // them. Updating this file is a deliberate, reviewable act: run
 // `go test ./internal/importer -update` and justify the delta in the PR.
 type golden struct {
-	Manifest      string `json:"manifest"`
-	Index         string `json:"index"`
-	Distribution  string `json:"distribution"`
-	PieceLayers   string `json:"pieceLayers"`
-	ManifestBytes string `json:"manifestDoc"`
-	IndexBytes    string `json:"indexDoc"`
-	RecordBytes   string `json:"recordDoc"`
+	Manifest       string   `json:"manifest"`
+	Index          string   `json:"index"`
+	Distribution   string   `json:"distribution"`
+	PieceLayers    string   `json:"pieceLayers"`
+	Quants         []string `json:"quants"`
+	ManifestBytes  string   `json:"manifestDoc"`
+	IndexBytes     string   `json:"indexDoc"`
+	RecordBytes    string   `json:"recordDoc"`
+	ModelConfigDoc string   `json:"modelConfigDoc"`
 }
 
 const goldNS = "gold/repo"
@@ -52,13 +54,28 @@ func importGoldFixtures(t *testing.T, root string) (*ImportResult, *golden, *cas
 	}
 	a := res.Artifacts[0]
 	g := &golden{
-		Manifest:      a.Manifest,
-		Index:         res.IndexDigest,
-		Distribution:  a.Record,
-		PieceLayers:   a.PieceLayers,
-		ManifestBytes: readCAS(t, store, a.Manifest),
-		IndexBytes:    readCAS(t, store, res.IndexDigest),
-		RecordBytes:   readCAS(t, store, a.Record),
+		Manifest:       a.Manifest,
+		Index:          res.IndexDigest,
+		Distribution:   a.Record,
+		PieceLayers:    a.PieceLayers,
+		Quants:         res.QuantsOf(),
+		ManifestBytes:  readCAS(t, store, a.Manifest),
+		IndexBytes:     readCAS(t, store, res.IndexDigest),
+		RecordBytes:    readCAS(t, store, a.Record),
+		ModelConfigDoc: readCASNamed(t, store, a.Manifest, "modelconfig.json"),
+	}
+	// The golden must PROVE the config-fed fields, not just pin opaque
+	// digests: quant from quantization_config, contextLength/ctx_size from
+	// max_positional_embeddings, family from model_type (PR #16 amendment).
+	for _, want := range []string{
+		`"family":"toy"`, `"quantization":"fp8"`, `"contextLength":4096`, `"ctx_size":4096`,
+	} {
+		if !strings.Contains(g.ModelConfigDoc, want) {
+			t.Fatalf("golden modelconfig missing %s — config.json is not flowing (blocker 1)", want)
+		}
+	}
+	if len(g.Quants) != 1 || g.Quants[0] != "fp8" {
+		t.Fatalf("golden quant must derive from quant_method, got %v", g.Quants)
 	}
 	return res, g, store
 }
@@ -78,6 +95,35 @@ func readCAS(t *testing.T, store *cas.Store, digest string) string {
 }
 
 func trimDigest(d string) string { return d[len("sha256:"):] }
+
+// QuantsOf returns the artifact quants in order.
+func (r *ImportResult) QuantsOf() []string {
+	out := make([]string, 0, len(r.Artifacts))
+	for _, a := range r.Artifacts {
+		out = append(out, a.Quant)
+	}
+	return out
+}
+
+func readCASNamed(t *testing.T, store *cas.Store, manifestDigest, name string) string {
+	t.Helper()
+	var m struct {
+		Files []struct {
+			Name   string `json:"name"`
+			Digest string `json:"digest"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal([]byte(readCAS(t, store, manifestDigest)), &m); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range m.Files {
+		if f.Name == name {
+			return readCAS(t, store, f.Digest)
+		}
+	}
+	t.Fatalf("file %s not in manifest", name)
+	return ""
+}
 
 func TestGoldenImport(t *testing.T) {
 	_, g, store := importGoldFixtures(t, t.TempDir())
@@ -100,7 +146,10 @@ func TestGoldenImport(t *testing.T) {
 	if err := json.Unmarshal(b, &want); err != nil {
 		t.Fatal(err)
 	}
-	if *g != want {
+	if g.Manifest != want.Manifest || g.Index != want.Index || g.Distribution != want.Distribution ||
+		g.PieceLayers != want.PieceLayers || g.ManifestBytes != want.ManifestBytes ||
+		g.IndexBytes != want.IndexBytes || g.RecordBytes != want.RecordBytes ||
+		g.ModelConfigDoc != want.ModelConfigDoc || strings.Join(g.Quants, ",") != strings.Join(want.Quants, ",") {
 		t.Fatalf("import diverged from golden:\n got %+v\nwant %+v", *g, want)
 	}
 	// The golden digests must actually be present and hash-true.
