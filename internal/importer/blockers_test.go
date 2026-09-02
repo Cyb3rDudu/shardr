@@ -5,8 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -192,6 +195,95 @@ func TestUnreadableRootConfigFailsImport(t *testing.T) {
 	ns, _ := store.Namespaces()
 	if len(ns) != 0 {
 		t.Fatalf("failed import must not mutate state: %v", ns)
+	}
+}
+
+// --- B9: the import root is a hard boundary ---
+
+func TestImportRootBoundary(t *testing.T) {
+	foreign := []byte("SECRET foreign bytes — outside the import root")
+	outside := filepath.Join(t.TempDir(), "target.bin")
+	if err := os.WriteFile(outside, foreign, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	mkRoot := func(t *testing.T) string {
+		t.Helper()
+		root := t.TempDir()
+		if err := os.WriteFile(filepath.Join(root, "model.gguf"), []byte("weights"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return root
+	}
+
+	cases := []struct {
+		name  string
+		paths func(t *testing.T) []string
+	}{
+		{"symlink out of the root", func(t *testing.T) []string {
+			root := mkRoot(t)
+			if err := os.Symlink(outside, filepath.Join(root, "evil.gguf")); err != nil {
+				t.Fatal(err)
+			}
+			return []string{root}
+		}},
+		{"symlinked directory inside the root", func(t *testing.T) []string {
+			root := mkRoot(t)
+			sub := filepath.Join(root, "real")
+			if err := os.Mkdir(sub, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(sub, "model-2.gguf"), []byte("w2"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(sub, filepath.Join(root, "alias")); err != nil {
+				t.Fatal(err)
+			}
+			return []string{root}
+		}},
+		{"root path itself is a symlink", func(t *testing.T) []string {
+			root := mkRoot(t)
+			link := filepath.Join(t.TempDir(), "rootlink")
+			if err := os.Symlink(root, link); err != nil {
+				t.Fatal(err)
+			}
+			return []string{link}
+		}},
+		{"file path arg is a symlink", func(t *testing.T) []string {
+			link := filepath.Join(t.TempDir(), "model.gguf")
+			if err := os.Symlink(outside, link); err != nil {
+				t.Fatal(err)
+			}
+			return []string{link}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := mustStore(t)
+			sources, err := LocalSources(tc.paths(t))
+			if err == nil {
+				// Fail-open shape (pre-fix): the import would read through the
+				// symlink. Run it so the CAS probe below is a real check.
+				_, _ = Import(context.Background(), store, sources, ImportOptions{As: "x/y"})
+			}
+			if !errors.Is(err, ErrSourceNotRegular) {
+				t.Fatalf("want ErrSourceNotRegular, got %v", err)
+			}
+			// Two CAS checks: the outer file's bytes must be in no CAS root.
+			hexD := testDigestOf(string(foreign))
+			if store.Has(hexD) {
+				t.Fatal("foreign blob landed in the CAS")
+			}
+			if p, perr := store.BlobPath(hexD); perr == nil {
+				if _, serr := os.Lstat(p); serr == nil {
+					t.Fatalf("foreign blob path exists: %s", p)
+				}
+			}
+			ns, _ := store.Namespaces()
+			if len(ns) != 0 {
+				t.Fatalf("failed expansion must not mutate state: %v", ns)
+			}
+		})
 	}
 }
 

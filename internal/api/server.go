@@ -650,6 +650,8 @@ func mapImportError(err error) *APIError {
 	switch {
 	case errors.Is(err, importer.ErrNotImportable):
 		return &APIError{Code: "E_NOT_IMPORTABLE", Message: err.Error()}
+	case errors.Is(err, importer.ErrSourceNotRegular):
+		return &APIError{Code: "E_SOURCE_NOT_REGULAR", Message: err.Error()}
 	case errors.Is(err, importer.ErrRateLimited):
 		return &APIError{Code: "E_RATE_LIMITED", Message: err.Error()}
 	case errors.Is(err, importer.ErrForbidden):
@@ -688,6 +690,10 @@ func (s *Server) handleImportLocal(w http.ResponseWriter, r *http.Request) {
 	}
 	sources, err := importer.LocalSources(body.Paths)
 	if err != nil {
+		if errors.Is(err, importer.ErrSourceNotRegular) {
+			writeErr(w, http.StatusBadRequest, "E_SOURCE_NOT_REGULAR", err.Error())
+			return
+		}
 		writeErr(w, http.StatusBadRequest, ErrBadRequest, "paths: "+err.Error())
 		return
 	}
