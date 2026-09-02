@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"io/fs"
 	"strings"
 	"sync"
 	"testing"
@@ -145,6 +146,52 @@ func TestCorruptIndexMembersLoud(t *testing.T) {
 		}
 		// Import failed before any merge: no new index was published — the
 		// corrupt members cannot have landed in a new current index.
+	}
+}
+
+// --- B8: only the import-root config.json is the upstream config ---
+
+func TestNestedConfigIsNotUpstreamConfig(t *testing.T) {
+	store := mustStore(t)
+	root := `{"model_type":"toyfam","quantization_config":{"quant_method":"fp8"}}`
+	nested := `{"quantization_config":{"quant_method":"q4_0"}}`
+	res, err := Import(context.Background(), store, []Source{
+		{Name: "model.gguf", Open: bytesSource("w")}, // no filename quant token
+		{Name: "config.json", Open: bytesSource(root)},
+		{Name: "foo/config.json", Open: bytesSource(nested)},
+	}, ImportOptions{As: "x/y"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Artifacts) != 1 || res.Artifacts[0].Quant != "fp8" {
+		t.Fatalf("quant must come from the ROOT config.json only, got %+v", res.Artifacts)
+	}
+	if res.Skipped != 1 {
+		t.Fatalf("nested config.json must be skipped+counted (default deny), got skipped=%d", res.Skipped)
+	}
+	manifest := readCAS(t, store, res.Artifacts[0].Manifest)
+	if strings.Contains(manifest, "foo/config.json") {
+		t.Fatalf("nested config must not become a manifest entry: %s", manifest)
+	}
+	if !strings.Contains(manifest, `"io.shardr.import.skipped":"1"`) {
+		t.Fatalf("skip count must reach the annotations: %s", manifest)
+	}
+}
+
+func TestUnreadableRootConfigFailsImport(t *testing.T) {
+	store := mustStore(t)
+	_, err := Import(context.Background(), store, []Source{
+		{Name: "model.gguf", Open: bytesSource("w")},
+		{Name: "config.json", Open: func() (readCloser, error) {
+			return nil, fs.ErrPermission
+		}},
+	}, ImportOptions{As: "x/y"})
+	if err == nil || !strings.Contains(err.Error(), "config.json") {
+		t.Fatalf("unreadable root config.json must fail the import loudly, got %v", err)
+	}
+	ns, _ := store.Namespaces()
+	if len(ns) != 0 {
+		t.Fatalf("failed import must not mutate state: %v", ns)
 	}
 }
 

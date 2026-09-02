@@ -169,9 +169,21 @@ func classify(sources []Source) (*classification, error) {
 			continue
 		}
 		if path.Base(name) == "config.json" {
-			if b, err := readAll(src); err == nil {
-				c.upstreamConfig = b
+			// Identity rule: ONLY the import-root config.json is the upstream
+			// config (001 §8.4) — a nested foo/config.json must never overwrite
+			// or shape it (a wrong/stale config would silently produce a
+			// different manifest). Nested configs are default-deny skips; a
+			// read error on the root config fails the import instead of
+			// silently falling through the quant chain to filename/dtype/raw.
+			if name != "config.json" {
+				c.skipped++
+				continue
 			}
+			b, err := readAll(src)
+			if err != nil {
+				return nil, fmt.Errorf("read config.json: %w", err)
+			}
+			c.upstreamConfig = b
 			continue
 		}
 		switch {
