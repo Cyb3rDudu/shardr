@@ -86,8 +86,9 @@ MUST NOT extend or alter the vocabulary — the tag/quant boundary must be
 machine-independent (the same string is the same thing on every node).
 
 - lowercase, charset `[a-z0-9_-]`, ≤ 24 chars;
-- contains ≥ 1 digit **or** is the reserved term `raw` (unquantized /
-  unclassifiable import fallback);
+- contains ≥ 1 digit **or** is an explicit digitless vocabulary atom:
+  `raw` (unquantized / unclassifiable import fallback), `gptq`, `awq`,
+  `eetq` (post-training lineages without a numeric token);
 - starts with a known prefix: `q`, `iq`, `tq`, `ud-`, `gptq`, `awq`, `eetq`,
   `bf`, `f`, `fp`, `mx` (post-training quantization lineages count as quants
   like any other).

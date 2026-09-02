@@ -118,6 +118,13 @@ JSON, canonical, ≤ 256 KiB:
 `runtimes` holds **advisory defaults** only (002 §2). Unknown fields are
 preserved on round-trip (forward compatibility).
 
+**Derivation rules (import-derived configs):** `family` is the upstream
+`config.json` `model_type`, lowercased; when no config is present, it is
+derived deterministically from the primary weights file stem with quant
+and split suffixes stripped (`qwen3.8-27b-ud-q4_k_m-00001.gguf` →
+`qwen3.8-27b`). Both branches are pure functions of the input, so import
+convergence holds.
+
 ## 4. Annotations
 
 | Annotation | Requirement | Content |
@@ -229,7 +236,10 @@ Three sources — **local**, **HF**, **BT** — one rule set:
 5. GGUF imports set `selfContained: true` and emit no tokenizer/template
    entries — the runtime reads both from the GGUF itself. Advisory
    `runtime-config` is derived machine-neutral: `ctx_size` ←
-   `context_length`, `jinja` ← template present.
+   `context_length`. `jinja: true` means **a usable chat template is
+   available to the target runtime** — a chat-template entry counts, and a
+   GGUF-embedded `chat_template` counts even when no separate entry
+   exists.
 6. **Local import** requires an explicit namespace (`--as ns/name`;
    never optional) and derives quants from filenames with the same
    chain.
