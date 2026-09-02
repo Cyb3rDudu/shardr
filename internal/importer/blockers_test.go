@@ -242,9 +242,9 @@ func TestNonSPDXLicenseAnnotated(t *testing.T) {
 func TestPathPrefixCollisionRejected(t *testing.T) {
 	m := &artifact.Manifest{SchemaVersion: 1, ArtifactType: "model",
 		Files: []artifact.File{
-			{Kind: "config", Name: "modelconfig.json", Digest: "sha256:" + strings.Repeat("a", 64), BT: artifact.BT{MerkleRoot: "sha256:" + strings.Repeat("a", 64)}},
-			{Kind: "weights.gguf", Name: "model.gguf", Digest: "sha256:" + strings.Repeat("b", 64), BT: artifact.BT{MerkleRoot: "sha256:" + strings.Repeat("b", 64)}},
-			{Kind: "weights.gguf", Name: "model.gguf/inner.gguf", Digest: "sha256:" + strings.Repeat("c", 64), BT: artifact.BT{MerkleRoot: "sha256:" + strings.Repeat("c", 64)}},
+			{Kind: "config", Name: "modelconfig.json", Size: 10, Digest: "sha256:" + strings.Repeat("a", 64), BT: artifact.BT{MerkleRoot: "sha256:" + strings.Repeat("a", 64)}},
+			{Kind: "weights.gguf", Name: "model.gguf", Size: 100, Digest: "sha256:" + strings.Repeat("b", 64), BT: artifact.BT{MerkleRoot: "sha256:" + strings.Repeat("b", 64)}},
+			{Kind: "weights.gguf", Name: "model.gguf/inner.gguf", Size: 100, Digest: "sha256:" + strings.Repeat("c", 64), BT: artifact.BT{MerkleRoot: "sha256:" + strings.Repeat("c", 64)}},
 		}}
 	if err := artifact.ValidateManifest(m); err == nil || !strings.Contains(err.Error(), "collides") {
 		t.Fatalf("want path-prefix collision error, got %v", err)
