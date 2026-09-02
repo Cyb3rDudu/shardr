@@ -75,7 +75,9 @@ torrent data here would create a fixed-point problem.
 | `code` | 0..n | `codeRole` ∈ {`modeling`, `configuration`, `tokenizer`, `processor`, `other`} — data only, execution gated (002) |
 
 Every file entry MUST carry `kind`, `digest`, `size`, `name`, and (for
-all torrented blobs) `bt.merkleRoot`. Rules:
+all torrented blobs) `bt.merkleRoot`. `size` MUST be > 0 — a manifest
+entry always carries content; zero-byte entries are invalid and imports
+reject them (spec truth over availability). Rules:
 
 1. `name` = artifact-relative canonical filename, `/`-separated into
    non-empty segments; `.`, `..`, and empty segments are forbidden
@@ -139,7 +141,8 @@ preserved on round-trip (forward compatibility).
 ```
 
 - Member `quant` values are unique; members point at model manifests,
-  never at other indexes.
+  never at other indexes. An index with **zero
+  members is invalid** — validators reject `members: []`.
 - Every repo has a **current index** (the latest import), updated
   atomically in shardhive state; quant-only selectors resolve against it
   (005 §6).
