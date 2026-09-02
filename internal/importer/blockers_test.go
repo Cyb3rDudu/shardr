@@ -46,14 +46,15 @@ func TestConfigFeedsPipeline(t *testing.T) {
 			t.Fatalf("modelconfig missing %s: %s", want, doc)
 		}
 	}
-	// config.json is consumed, not skipped.
+	// config.json is consumed, not skipped — with no other files the skip
+	// count is exactly 0. Anything else would mean config handling regressed
+	// into skip-counting or silent drops.
 	manifest := string(readCAS(t, store, res.Artifacts[0].Manifest))
-	if strings.Contains(manifest, `"io.shardr.import.skipped":"1"`) == false {
-		// skipped counts README-like default-denies only; with no other
-		// files it must be 0 — config.json is chain input, not a skip.
-		if !strings.Contains(manifest, `"io.shardr.import.skipped":"0"`) {
-			t.Fatalf("config.json must not be counted as skipped: %s", manifest)
-		}
+	if !strings.Contains(manifest, `"io.shardr.import.skipped":"0"`) {
+		t.Fatalf("config.json must not be counted as skipped: %s", manifest)
+	}
+	if res.Skipped != 0 {
+		t.Fatalf("skipped must be exactly 0, got %d", res.Skipped)
 	}
 }
 
@@ -284,6 +285,33 @@ func TestImportRootBoundary(t *testing.T) {
 				t.Fatalf("failed expansion must not mutate state: %v", ns)
 			}
 		})
+	}
+}
+
+// --- B10: progress counters stay consistent on multi-artifact imports ---
+
+func TestProgressCountersConsistent(t *testing.T) {
+	store := mustStore(t)
+	var lastDone, lastTotal, calls int
+	res, err := Import(context.Background(), store, []Source{
+		{Name: "alpha-q8_0.gguf", Open: bytesSource("a")},
+		{Name: "beta-q4_0.gguf", Open: bytesSource("b")},
+	}, ImportOptions{As: "x/y", Progress: func(done, total int) {
+		calls++
+		lastDone, lastTotal = done, total
+		if done > total {
+			t.Errorf("progress overshoot: done=%d total=%d", done, total)
+		}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Artifacts) != 2 {
+		t.Fatalf("want two artifacts (two quant families), got %d", len(res.Artifacts))
+	}
+	// 2 entries + 2 artifacts + 1 index = 5 bumps; final callback is done==total.
+	if calls != 5 || lastDone != 5 || lastTotal != 5 {
+		t.Fatalf("progress: calls=%d last=%d/%d, want 5 calls ending 5/5", calls, lastDone, lastTotal)
 	}
 }
 
