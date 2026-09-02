@@ -88,12 +88,14 @@ machine-independent (the same string is the same thing on every node).
 - lowercase, charset `[a-z0-9_-]`, ≤ 24 chars;
 - contains ≥ 1 digit **or** is the reserved term `raw` (unquantized /
   unclassifiable import fallback);
-- starts with a known prefix: `q`, `iq`, `tq`, `ud-`, `bf`, `f`, `fp`,
-  `mx`.
+- starts with a known prefix: `q`, `iq`, `tq`, `ud-`, `gptq`, `awq`, `eetq`,
+  `bf`, `f`, `fp`, `mx` (post-training quantization lineages count as quants
+  like any other).
 
 Vocabulary (non-exhaustive; governs the tag ban — imports derive member
 quants from data, whatever it is; new quant families extend this list
 via a spec revision, which is a protocol version bump): `q2_k q3_k_m
 q4_0 q4_1 q5_0 q5_1 q6_k q8_0 iq1_s iq1_m iq2_s iq2_xxs iq3_s iq3_xxs
-iq4_xs tq1_0 tq2_0 mxfp4 bf16 f16 f32 fp8 fp16 raw` plus lineage/suffix
+iq4_xs tq1_0 tq2_0 mxfp4 bf16 f16 f32 fp8 fp16 gptq gptq4 awq awq4 eetq
+raw` plus lineage/suffix
 families (`ud-*`, `_s _m _l _xl _xxs _k_s _k_m _k_l _k_xl`).

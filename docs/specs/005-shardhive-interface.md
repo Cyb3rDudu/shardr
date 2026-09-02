@@ -40,12 +40,33 @@ outside the owner can reach the API at all. HTTP-over-loopback is an
 REQUIRES a bearer token plus `Origin`/DNS-rebinding hardening. JSON
 in/out; errors are `{"error": {"code", "message", "candidates"?}}`.
 
+**Socket path resolution (v1 rule):** `$SHARDR_SOCKET` if set, else
+`$XDG_RUNTIME_DIR/shardhive.sock`, else a per-uid fallback
+`${TMPDIR:-/tmp}/shardhive-<uid>/shardhive.sock` (mode 0700 dir; macOS has
+no `XDG_RUNTIME_DIR`, hence the explicit fallback).
+
+**Version reporting:** the `/vN` path prefix IS the client's version
+declaration — there is no separate negotiation header in v1.
+
+**Error classes (v1 inventory):** `E_PARSE` (malformed reference),
+`E_UNKNOWN_REF` (no local index and no resolver hit), `E_NO_INDEX`
+(namespace points at a missing index blob — corruption, never silently
+rebuilt), `E_INVALID_INDEX` (index fails validation), `E_SOURCE_NOT_REGULAR`
+(local import source is not a regular file — hard boundary),
+`E_SOURCE_UNAVAILABLE` (reserved source not implemented in this build),
+`E_NOT_IMPLEMENTED` (endpoint reserved for a later slice), `E_RANGE_INVALID`
+(blob range does not overlap), `E_UNSUPPORTED_VERSION`, `E_BAD_REQUEST`,
+`E_NOT_FOUND`, `E_INTERNAL` (daemon bug — never a user-input verdict).
+
+**@digest in `?ref=`:** allowed — a digest-bearing reference resolves the
+manifest directly and bypasses index lookup.
+
 | Endpoint | Method | Purpose |
 | --- | --- | --- |
 | `/resolve?ref=…` | GET | **pure**: reference → digest + plan. Always: manifest digest, distribution record, source hints. Additionally, iff the metadata documents are locally available or arrived digest-verified from the resolver envelope (§6): manifest document, model config, file list with CAS paths, missing-file list. Otherwise those fields are `pending` until `ensure` completes its metadata phase |
 | `/ensure` | POST `{ref}` | start fill (import/swarm) for missing content; returns job id |
 | `/open?ref=…` | GET | local-reader convenience: resolution result with **CAS paths** for present files (zero-copy handles); missing files listed, never auto-filled |
-| `/jobs/<id>` | GET | job status: state (waiting/fetching/seeding/failed), per-file progress, errors |
+| `/jobs/<id>` | GET | job status: state (`waiting`/`fetching`/`seeding`/`failed`/`done`), per-file progress, errors. Terminal states are `done` and `failed`; a terminal job is immutable and every later read returns a copy |
 | `/blob/<digest>` | GET | **range-capable** byte stream (206 support mandatory) for remote/foreign clients — read-through, never a mandated copy |
 | `/import/local` | POST `{paths[], as}` | ingest local files; namespace `as` is **required** (001 §8.6) |
 | `/import/hf` | POST `{repo, revision?}` | HF import (001 §8) |
