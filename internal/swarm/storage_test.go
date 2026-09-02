@@ -294,3 +294,48 @@ func (r *byteSliceReader) Read(p []byte) (int, error) {
 	r.i += n
 	return n, nil
 }
+
+// Crafted info dicts with traversal-shaped paths are rejected at the
+// storage trust boundary — no span table entries for non-canonical paths.
+func TestStorageRejectsTraversalPaths(t *testing.T) {
+	content := deterministicBytes(1<<20, 7)
+	files := map[string][]byte{"a.gguf": content}
+	mi, specs, _ := buildTestTorrent(t, files)
+	root := artifact.MerkleRoot(content)
+	store, _ := cas.Open(t.TempDir())
+	st := NewCASStorage(store, nil)
+	if err := st.Register(infohashHex(t, mi), specs); err != nil {
+		t.Fatal(err)
+	}
+	// Rebuild the info dict with a traversal-named file: same shape, path
+	// ../escape.gguf (raw map — the typed FileTree API is awkward here).
+	info, err := mi.UnmarshalInfo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	evilInfo := map[string]any{
+		"file tree": map[string]any{
+			"..": map[string]any{"": map[string]any{"length": int64(len(content)), "pieces root": string(root[:])}},
+		},
+		"meta version": int64(2),
+		"name":         info.Name,
+		"piece length": info.PieceLength,
+	}
+	ib := bencodeMap(evilInfo)
+	var parsed metainfo.Info
+	if err := bencode.Unmarshal(ib, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	var ih metainfo.Hash
+	if _, err := st.OpenTorrent(context.Background(), &parsed, ih); err == nil {
+		t.Fatal("traversal path must be rejected at OpenTorrent")
+	}
+}
+
+func bencodeMap(v any) []byte {
+	b, err := bencode.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}

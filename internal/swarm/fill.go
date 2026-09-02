@@ -110,9 +110,9 @@ func (c *Client) Fill(ctx context.Context, m *artifact.Manifest, manifestBytes [
 	if err != nil {
 		return err
 	}
-	t, _, err := c.tc.AddTorrentSpec(spec)
+	t, err := c.addFreshTorrent(spec, recon.InfohashHex)
 	if err != nil {
-		return fmt.Errorf("swarm: add fill torrent: %w", err)
+		return err
 	}
 	<-t.GotInfo()
 	setFillPriorities(t, m, recon)
@@ -121,25 +121,26 @@ func (c *Client) Fill(ctx context.Context, m *artifact.Manifest, manifestBytes [
 	if drv == nil {
 		return fmt.Errorf("swarm: fill: driver not open for %s", recon.InfohashHex)
 	}
-	want := len(recon.FileSpecs) - countPresent(c.store, recon)
+	// Target is TOTAL sealed files: present files count from the start, so
+	// a partially-present artifact cannot satisfy the wait early.
+	target := len(recon.FileSpecs)
 	pollCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if progress != nil {
 		go func() {
 			tick := time.NewTicker(250 * time.Millisecond)
 			defer tick.Stop()
-			base := len(recon.FileSpecs) - want
 			for {
 				select {
 				case <-pollCtx.Done():
 					return
 				case <-tick.C:
-					progress(base+drv.SealedCount(), len(recon.FileSpecs))
+					progress(drv.SealedCount(), target)
 				}
 			}
 		}()
 	}
-	if err := drv.WaitSealed(ctx, want); err != nil {
+	if err := drv.WaitSealed(ctx, target); err != nil {
 		t.Drop()
 		return err
 	}
@@ -154,13 +155,14 @@ func (c *Client) Fill(ctx context.Context, m *artifact.Manifest, manifestBytes [
 
 // setFillPriorities: config and manifest first (metadata phase), then
 // everything missing. Present files are already complete in the driver —
-// no bytes are re-fetched.
+// no bytes are re-fetched. anacrolix File.Path() includes the torrent
+// name prefix; suffix-match the torrent-relative keys.
 func setFillPriorities(t *torrent.Torrent, m *artifact.Manifest, recon *Recon) {
 	manifestKey := "manifest/sha256-" + recon.ManifestHex
 	for _, f := range t.Files() {
 		path := f.Path()
 		switch {
-		case path == manifestKey || strings.HasSuffix(path, "modelconfig.json"):
+		case strings.HasSuffix(path, manifestKey) || strings.HasSuffix(path, "modelconfig.json"):
 			f.SetPriority(torrent.PiecePriorityHigh)
 		default:
 			f.SetPriority(torrent.PiecePriorityNormal)
@@ -219,7 +221,7 @@ func (c *Client) ImportBT(ctx context.Context, magnetOrInfohash, manifestDigest 
 		AddTorrentOpts: torrent.AddTorrentOpts{ /* infohash only */ },
 		DisplayName:    "shardr-bt-import",
 		Trackers:       tiersOf(hints.Trackers),
-		Webseeds:       hints.Webseeds,
+		Webseeds:       normalizeWebseeds(hints.Webseeds),
 		PeerAddrs:      hints.Peers,
 	}
 	var ih infohashOf
@@ -234,16 +236,17 @@ func (c *Client) ImportBT(ctx context.Context, magnetOrInfohash, manifestDigest 
 	select {
 	case <-t1.GotInfo():
 	case <-ctx.Done():
-		t1.Drop()
+		dropTorrent(t1)
 		return nil, ctx.Err()
 	}
 	if errs := t1.AddPieceLayers(layers); len(errs) > 0 {
-		t1.Drop()
+		dropTorrent(t1)
 		return nil, fmt.Errorf("swarm: import: piece layers rejected against the info dict's merkle roots: %v (evil or mismatched layers source)", errs)
 	}
-	// Manifest file only: the pin gates it.
+	// Manifest file only: the pin gates it. File.Path() carries the
+	// torrent-name prefix — suffix-match.
 	for _, f := range t1.Files() {
-		if f.Path() == manifestKey {
+		if strings.HasSuffix(f.Path(), manifestKey) {
 			f.SetPriority(torrent.PiecePriorityNow)
 		} else {
 			f.SetPriority(torrent.PiecePriorityNone)
@@ -251,14 +254,14 @@ func (c *Client) ImportBT(ctx context.Context, magnetOrInfohash, manifestDigest 
 	}
 	drv1 := c.casSt.driverFor(ihHex)
 	if drv1 == nil {
-		t1.Drop()
+		dropTorrent(t1)
 		return nil, fmt.Errorf("swarm: import: phase-1 driver missing")
 	}
 	if err := drv1.WaitSealed(ctx, 1); err != nil {
-		t1.Drop()
+		dropTorrent(t1)
 		return nil, fmt.Errorf("swarm: import: manifest acquisition failed: %w (the pin was never satisfied)", err)
 	}
-	t1.Drop() // phase 1 done: manifest sealed under the pin digest
+	dropTorrent(t1) // phase 1 done: manifest sealed under the pin digest
 
 	// ---- Phase 2: identity from the manifest, binding, full fetch ----
 	manifestBytes, err := readBlob(c.store, pinHex)
@@ -311,14 +314,14 @@ func (c *Client) ImportBT(ctx context.Context, magnetOrInfohash, manifestDigest 
 	setFillPriorities(t2, &m, recon)
 	drv2 := c.casSt.driverFor(ihHex)
 	if drv2 == nil {
-		t2.Drop()
+		dropTorrent(t2)
 		return nil, fmt.Errorf("swarm: import: phase-2 driver missing")
 	}
 	if err := drv2.WaitSealed(ctx, len(recon.FileSpecs)); err != nil {
-		t2.Drop()
+		dropTorrent(t2)
 		return nil, err
 	}
-	t2.Drop()
+	dropTorrent(t2)
 
 	if c.cfg.Seed {
 		if err := c.SeedArtifact(ctx, &m, manifestBytes, rec, recBytes); err != nil {
@@ -428,6 +431,35 @@ func pinHex(manifestDigest string) (string, error) {
 		return "", fmt.Errorf("swarm: import: bad manifestDigest %q: %w", manifestDigest, err)
 	}
 	return strings.ToLower(s), nil
+}
+
+// addFreshTorrent drops any live torrent with the same infohash (its
+// storage driver may hold stale sealed state — e.g. a blob deleted after
+// seal) and adds a fresh one whose driver reflects current CAS presence.
+func (c *Client) addFreshTorrent(spec *torrent.TorrentSpec, ihHex string) (*torrent.Torrent, error) {
+	short := ihHex[:40]
+	for _, t := range c.tc.Torrents() {
+		if t.Info() != nil && fmt.Sprintf("%x", t.InfoHash()) == short {
+			dropTorrent(t)
+		}
+	}
+	t, _, err := c.tc.AddTorrentSpec(spec)
+	if err != nil {
+		return nil, fmt.Errorf("swarm: add torrent: %w", err)
+	}
+	return t, nil
+}
+
+// dropTorrent waits for the drop to finish — anacrolix drops are async,
+// and a re-add of the same infohash racing the drop returns the stale
+// torrent with its old storage state.
+func dropTorrent(t *torrent.Torrent) {
+	t.Drop()
+	select {
+	case <-t.Closed():
+	case <-time.After(10 * time.Second):
+		// Never blocks the flow forever; the re-add dedupe guards correctness.
+	}
 }
 
 func tiersOf(trackers []string) [][]string {

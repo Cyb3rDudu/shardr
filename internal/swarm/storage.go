@@ -50,8 +50,8 @@ type VerifyCache struct{ m sync.Map }
 
 func (v *VerifyCache) MarkVerified(digest string) { v.m.Store(digest, true) }
 func (v *VerifyCache) WasVerified(digest string) bool {
-	ok, _ := v.m.Load(digest)
-	return ok.(bool)
+	_, ok := v.m.Load(digest)
+	return ok
 }
 
 // CASStorage implements storage.ClientImpl over the CAS. Torrents are
@@ -94,9 +94,9 @@ func (c *CASStorage) Register(v2InfohashHex string, files map[string]FileSpec) e
 		if len(spec.Digest) != 64 {
 			return fmt.Errorf("swarm: register: file %q digest must be bare 64-hex", path)
 		}
-		if spec.Size <= 0 {
-			return fmt.Errorf("swarm: register: file %q size must be > 0", path)
-		}
+		// Size is informational; the info dict is authoritative at
+		// OpenTorrent (phase-1 imports register the manifest before its
+		// size is known).
 	}
 	c.mu.Lock()
 	c.registry[v2InfohashHex[:40]] = files
@@ -178,12 +178,11 @@ type fileState struct {
 	spec     FileSpec
 	partPath string
 
-	sealed   bool // promoted into the CAS
-	failed   error
-	part     *os.File
-	numDone  int // pieces completed (unsealed only)
-	pieces   []bool
-	doneCond *sync.Cond // broadcasts seal/failure and per-piece completion
+	sealed  bool // promoted into the CAS
+	failed  error
+	part    *os.File
+	numDone int // pieces completed (unsealed only)
+	pieces  []bool
 }
 
 func newCASTorrent(parent *CASStorage, key string, info *metainfo.Info, files map[string]FileSpec) (*casTorrent, error) {
@@ -262,7 +261,7 @@ func (t *casTorrent) close() error {
 				os.Remove(st.part.Name())
 			}
 		}
-		st.doneCond.Broadcast()
+		t.doneCond.Broadcast()
 	}
 	t.parent.mu.Lock()
 	delete(t.parent.open, t.key)
@@ -307,8 +306,11 @@ func (t *casTorrent) WaitSealed(ctx context.Context, n int) error {
 		if failed != nil {
 			return fmt.Errorf("swarm: verify-write failed: %w", failed)
 		}
-		if done >= n || t.closed {
+		if done >= n {
 			return nil
+		}
+		if t.closed {
+			return fmt.Errorf("swarm: driver closed before %d files sealed (got %d)", n, done)
 		}
 		// Context cancellation must wake the cond — a watchdog broadcast.
 		stop := make(chan struct{})
