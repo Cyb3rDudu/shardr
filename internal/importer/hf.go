@@ -168,6 +168,8 @@ func escapeSegments(s string) (string, error) {
 	}
 	return strings.Join(segs, "/"), nil
 }
+
+// validHFRepoID: namespace/name with a permissive but bounded charset.
 func validHFRepoID(repo string) bool {
 	if len(repo) < 3 || len(repo) > 200 || strings.Contains(repo, "..") {
 		return false

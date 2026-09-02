@@ -647,11 +647,16 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request) {
 
 // mapImportError maps importer sentinel outcomes to wire error classes.
 func mapImportError(err error) *APIError {
+	var verr *artifact.ValidationError
 	switch {
 	case errors.Is(err, importer.ErrNotImportable):
 		return &APIError{Code: "E_NOT_IMPORTABLE", Message: err.Error()}
 	case errors.Is(err, importer.ErrSourceNotRegular):
 		return &APIError{Code: "E_SOURCE_NOT_REGULAR", Message: err.Error()}
+	case errors.As(err, &verr):
+		// A 001 rule violation surfacing in a job (e.g. corrupt current
+		// index) maps to the same class the resolve path reports it under.
+		return &APIError{Code: ErrInvalidIndex, Message: err.Error()}
 	case errors.Is(err, importer.ErrRateLimited):
 		return &APIError{Code: "E_RATE_LIMITED", Message: err.Error()}
 	case errors.Is(err, importer.ErrForbidden):

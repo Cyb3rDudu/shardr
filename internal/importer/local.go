@@ -36,7 +36,30 @@ func LocalSources(paths []string) ([]Source, error) {
 		seen[name] = abs
 		p := abs
 		out = append(out, Source{Name: name, Open: func() (io.ReadCloser, error) {
-			return os.Open(p)
+			f, err := os.Open(p)
+			if err != nil {
+				return nil, err
+			}
+			// Read-time boundary re-check (TOCTOU): the expansion-time lstat
+			// must still hold for the bytes actually read — whatever the path
+			// points at NOW (fstat on the open fd vs. lstat on the path, same
+			// dev+inode) must be the same regular file. A file swapped for a
+			// symlink (or another file) in between must not leak followed bytes.
+			// ponytail: os.Open on a swapped-in FIFO would block (DoS, no
+			// leak); O_NOFOLLOW would need platform build tags.
+			fi, err := f.Stat()
+			if err == nil {
+				var li os.FileInfo
+				li, err = os.Lstat(p)
+				if err == nil && fi.Mode().IsRegular() && li.Mode().IsRegular() && os.SameFile(fi, li) {
+					return f, nil
+				}
+			}
+			f.Close()
+			if err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("%w: %s", ErrSourceNotRegular, p)
 		}})
 		return nil
 	}

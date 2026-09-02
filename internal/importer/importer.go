@@ -290,6 +290,11 @@ func Import(ctx context.Context, store *cas.Store, sources []Source, opts Import
 	if err != nil {
 		return nil, err
 	}
+	// Symmetric guard: the newly merged members must pass the same rule
+	// set the loaded ones did — nothing unvalidated is ever published.
+	if verr := artifact.ValidateIndexMembers(members); verr != nil {
+		return nil, fmt.Errorf("importer: merged index for %q fails validation: %w", opts.As, verr)
+	}
 	if err := putCanonical(store, idxDigest, idxBytes); err != nil {
 		return nil, err
 	}

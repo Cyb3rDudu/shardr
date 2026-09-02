@@ -204,14 +204,17 @@ func ValidateManifest(m *Manifest) *ValidationError {
 			}
 		}
 	}
-	// Split parts must be contiguous 1..n.
+	// Split parts must be contiguous 1..n (element-wise: duplicates like
+	// [1,2,2,4] must not slip through an ends-only check).
 	for format, ps := range parts {
 		if len(ps) == 0 {
 			continue
 		}
 		sort.Slice(ps, func(i, j int) bool { return ps[i] < ps[j] })
-		if ps[0] != 1 || ps[len(ps)-1] != int64(len(ps)) {
-			return &ValidationError{ClassValidationParts, fmt.Sprintf("%s parts must be contiguous 1..n, got %v", format, ps)}
+		for i, p := range ps {
+			if p != int64(i+1) {
+				return &ValidationError{ClassValidationParts, fmt.Sprintf("%s parts must be contiguous 1..n, got %v", format, ps)}
+			}
 		}
 	}
 	return nil

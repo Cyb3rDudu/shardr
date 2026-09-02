@@ -86,56 +86,13 @@ func Digest(b []byte) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-// ---------------------------------------------------------------------------
-// Seal: deterministic artifact construction (001 §3, §6, 004 §3)
-// The canonical validation lives in validate.go — the same rule set the
-// spec vectors run against (internal/specvectors).
-// ---------------------------------------------------------------------------
-
 // SortFiles orders entries into the canonical deterministic order
-// (001 §3.1 rule 4): config, weights (by part, then digest), weights.aux
-// (by name), tokenizer, chat-template, adapters (by digest), runtime-config
-// (by runtime id), code (by role, then name).
+// (001 §3.1 rule 4). It sorts by fileOrder — the SAME comparator
+// ValidateManifest enforces — so a built manifest can never violate its
+// own canonical-order rule.
 func SortFiles(files []File) {
-	kindRank := map[string]int{
-		"config": 0, "weights.gguf": 1, "weights.safetensors": 1,
-		"weights.aux": 2, "tokenizer": 3, "chat-template": 4,
-		"adapter": 5, "runtime-config": 6, "code": 7,
-	}
 	sort.SliceStable(files, func(i, j int) bool {
-		a, b := files[i], files[j]
-		ra, rb := kindRank[a.Kind], kindRank[b.Kind]
-		if ra != rb {
-			return ra < rb
-		}
-		switch a.Kind {
-		case "weights.gguf", "weights.safetensors":
-			// Split parts 1..n; a partless single file behaves as part 0
-			// and sorts first.
-			pa, pb := int64(0), int64(0)
-			if a.Part != nil {
-				pa = *a.Part
-			}
-			if b.Part != nil {
-				pb = *b.Part
-			}
-			if pa != pb {
-				return pa < pb
-			}
-			return a.Digest < b.Digest
-		case "weights.aux":
-			return a.Name < b.Name
-		case "adapter":
-			return a.Digest < b.Digest
-		case "runtime-config":
-			return a.Runtime < b.Runtime
-		case "code":
-			if a.CodeRole != b.CodeRole {
-				return a.CodeRole < b.CodeRole
-			}
-			return a.Name < b.Name
-		}
-		return false
+		return fileOrder(&files[i], &files[j]) < 0
 	})
 }
 
