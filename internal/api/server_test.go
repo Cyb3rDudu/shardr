@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -17,8 +18,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Cyb3rDudu/shardr/internal/cas"
+	"github.com/Cyb3rDudu/shardr/internal/importer"
 	"github.com/Cyb3rDudu/shardr/internal/ref"
 )
 
@@ -512,22 +515,20 @@ func TestVersionNegotiation(t *testing.T) {
 	}
 }
 
-// --- Reserved imports ---
+// --- Reserved imports: only BT stays reserved (local/hf are real now) ---
 
 func TestImportsReserved(t *testing.T) {
 	h := newHarness(t)
-	for _, ep := range []string{"/v1/import/local", "/v1/import/hf", "/v1/import/bt"} {
-		code, body := h.postJSON(ep, map[string]any{})
-		if code != http.StatusNotImplemented {
-			t.Fatalf("%s: status %d body %s", ep, code, body)
-		}
-		var e struct {
-			Error APIError `json:"error"`
-		}
-		json.Unmarshal(body, &e)
-		if e.Error.Code != ErrNotImplemented {
-			t.Fatalf("%s: code %s", ep, e.Error.Code)
-		}
+	code, body := h.postJSON("/v1/import/bt", map[string]any{})
+	if code != http.StatusNotImplemented {
+		t.Fatalf("/v1/import/bt: status %d body %s", code, body)
+	}
+	var e struct {
+		Error APIError `json:"error"`
+	}
+	json.Unmarshal(body, &e)
+	if e.Error.Code != ErrNotImplemented {
+		t.Fatalf("/v1/import/bt: code %s", e.Error.Code)
 	}
 }
 
@@ -940,5 +941,239 @@ func TestModelsSkeletonWithQuants(t *testing.T) {
 	}
 	if got := byName["ghost"]; got != nil {
 		t.Fatalf("ghost must have no quants: %v", got)
+	}
+}
+
+// --- Real imports (001 §8): local + HF over the wire, jobs to terminal ---
+
+// waitJob polls a job until terminal (done|failed) or deadline.
+func waitJob(t *testing.T, h *harness, id string) Job {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		code, body := h.get("/v1/jobs/" + id)
+		if code != http.StatusOK {
+			t.Fatalf("job poll: %d %s", code, body)
+		}
+		var j Job
+		if err := json.Unmarshal(body, &j); err != nil {
+			t.Fatal(err)
+		}
+		if j.State == "done" || j.State == "failed" {
+			return j
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("job %s did not reach terminal state", id)
+	return Job{}
+}
+
+func TestImportLocalOverSocket(t *testing.T) {
+	h := newHarness(t)
+	fixtures := "../../internal/importer/testdata/gold"
+	code, body := h.postJSON("/v1/import/local", map[string]any{
+		"paths": []string{fixtures},
+		"as":    "gold/repo",
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("import local: %d %s", code, body)
+	}
+	var job Job
+	json.Unmarshal(body, &job)
+	if job.Kind != "import-local" || job.State == "failed" {
+		t.Fatalf("job: %+v", job)
+	}
+	term := waitJob(t, h, job.ID)
+	if term.State != "done" {
+		t.Fatalf("terminal: %+v (error %+v)", term, term.Error)
+	}
+	if term.Result == nil || len(term.Result.Manifests) != 1 || term.Result.IndexDigest == "" {
+		t.Fatalf("result: %+v", term.Result)
+	}
+	if term.Result.Quants[0] != "q8_0" {
+		t.Fatalf("quants: %v", term.Result.Quants)
+	}
+	// The namespace resolves through /v1/resolve now.
+	code, body = h.get("/v1/resolve?ref=" + url.QueryEscape("shardr:///gold/repo:q8_0"))
+	if code != http.StatusOK {
+		t.Fatalf("resolve after import: %d %s", code, body)
+	}
+	var res resolveResult
+	json.Unmarshal(body, &res)
+	if res.ManifestDigest != term.Result.Manifests[0] {
+		t.Fatalf("resolve manifest %s, import produced %s", res.ManifestDigest, term.Result.Manifests[0])
+	}
+	// Blob range serving on the imported artifact bytes.
+	code, _ = h.get("/v1/blob/" + strings.TrimPrefix(res.ManifestDigest, "sha256:"))
+	if code != http.StatusOK {
+		t.Fatalf("manifest blob: %d", code)
+	}
+}
+
+func TestImportLocalValidation(t *testing.T) {
+	h := newHarness(t)
+	// as is required (001 §8.6).
+	code, body := h.postJSON("/v1/import/local", map[string]any{"paths": []string{"."}})
+	if code != http.StatusBadRequest {
+		t.Fatalf("missing as: %d %s", code, body)
+	}
+	// Malformed ns/name.
+	code, body = h.postJSON("/v1/import/local", map[string]any{"paths": []string{"."}, "as": "not-a-key"})
+	if code != http.StatusBadRequest {
+		t.Fatalf("bad as: %d %s", code, body)
+	}
+	// Empty paths.
+	code, body = h.postJSON("/v1/import/local", map[string]any{"paths": []string{}, "as": "a/b"})
+	if code != http.StatusBadRequest {
+		t.Fatalf("empty paths: %d %s", code, body)
+	}
+}
+
+func TestImportLocalNotImportable(t *testing.T) {
+	h := newHarness(t)
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "README.md"), []byte("no weights here"), 0o644)
+	code, body := h.postJSON("/v1/import/local", map[string]any{
+		"paths": []string{dir}, "as": "x/empty",
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("import: %d %s", code, body)
+	}
+	var job Job
+	json.Unmarshal(body, &job)
+	term := waitJob(t, h, job.ID)
+	if term.State != "failed" || term.Error == nil || term.Error.Code != "E_NOT_IMPORTABLE" {
+		t.Fatalf("terminal: %+v", term)
+	}
+}
+
+// hfStub serves the HF API + resolve endpoints for one fixture repo.
+type hfStub struct{ files map[string]string }
+
+func (s hfStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/api/models/") {
+		var siblings []map[string]string
+		for name := range s.files {
+			siblings = append(siblings, map[string]string{"rfilename": name})
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"sha":      "4ca7207fa5502f4a0f8b3d1e2c3d4e5f60718293",
+			"siblings": siblings,
+		})
+		return
+	}
+	// /{repo}/resolve/{rev}/{file}
+	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/"), "/resolve/", 2)
+	if len(parts) == 2 {
+		if _, file, ok := strings.Cut(parts[1], "/"); ok {
+			if b, found := s.files[file]; found {
+				io.WriteString(w, b)
+				return
+			}
+		}
+	}
+	http.NotFound(w, r)
+}
+
+func TestImportHFOverSocket(t *testing.T) {
+	h := newHarness(t)
+	// Same bytes as the local golden fixtures → convergence across sources.
+	files := map[string]string{}
+	for name, content := range map[string]string{
+		"toy-q8_0-00001-of-00002.gguf": "GGUF fake header v3 — toy weights part 1, deterministic bytes for the golden fixture.\n",
+		"toy-q8_0-00002-of-00002.gguf": "GGUF fake header v3 — toy weights part 2, deterministic bytes for the golden fixture.\n",
+		"adapter_model.safetensors":    `{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]}`,
+		"adapter_config.json":          `{"base_model_name_or_path":"toy/base","peft_type":"LORA","r":8}`,
+		"tokenizer.json":               `{"version":"1.0","model":{"type":"BPE"},"vocab":{"a":0,"b":1}}`,
+		"tokenizer_config.json":        `{"model_max_length":4096,"tokenizer_class":"ToyTokenizer"}`,
+		"chat_template.json":           "{% set name = %>toy<%}\nYou are {{name}}.\n",
+		"README.md":                    "# Toy Model\nFixture repository for the golden import test.\n",
+		"LICENSE":                      "MIT License\n\nSPDX-License-Identifier: MIT\n",
+		"config.json":                  `{"model_type":"toy","max_positional_embeddings":4096,"architectures":["ToyForCausalLM"]}`,
+	} {
+		files[name] = content
+	}
+	stub := httptest.NewServer(hfStub{files: files})
+	defer stub.Close()
+	h.server.HF = &importer.HFClient{BaseURL: stub.URL, HTTP: stub.Client()}
+
+	code, body := h.postJSON("/v1/import/hf", map[string]string{"repo": "Toy/Model"})
+	if code != http.StatusCreated {
+		t.Fatalf("import hf: %d %s", code, body)
+	}
+	var job Job
+	json.Unmarshal(body, &job)
+	term := waitJob(t, h, job.ID)
+	if term.State != "done" {
+		t.Fatalf("terminal: %+v (error %+v)", term, term.Error)
+	}
+	// HF repo id → lowercased ns/name namespace.
+	code, body = h.get("/v1/resolve?ref=" + url.QueryEscape("shardr:///toy/model:q8_0"))
+	if code != http.StatusOK {
+		t.Fatalf("resolve: %d %s", code, body)
+	}
+	var res resolveResult
+	json.Unmarshal(body, &res)
+	if res.ManifestDigest != term.Result.Manifests[0] {
+		t.Fatalf("hf manifest mismatch: %s vs %s", res.ManifestDigest, term.Result.Manifests[0])
+	}
+
+	// Convergence: same upstream bytes imported locally produce the SAME
+	// manifest digest (001 §7.5) — annotations carry the HF provenance, so
+	// the local run must use the identical option set to be comparable:
+	// same fixture set, as gold/repo.
+	sources, err := importer.LocalSources([]string{"../../internal/importer/testdata/gold"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lres, err := importer.Import(context.Background(), h.store, sources, importer.ImportOptions{
+		As: "gold/repo", HFRepo: "Toy/Model", HFRevision: "4ca7207fa5502f4a0f8b3d1e2c3d4e5f60718293",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lres.Artifacts[0].Manifest != term.Result.Manifests[0] {
+		t.Fatalf("HF and local imports diverged: %s vs %s",
+			term.Result.Manifests[0], lres.Artifacts[0].Manifest)
+	}
+}
+
+func TestImportHFErrorClasses(t *testing.T) {
+	h := newHarness(t)
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/models/") {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer stub.Close()
+	h.server.HF = &importer.HFClient{BaseURL: stub.URL, HTTP: stub.Client()}
+
+	code, body := h.postJSON("/v1/import/hf", map[string]string{"repo": "a/b"})
+	if code != http.StatusBadGateway {
+		t.Fatalf("429 must surface at import time: %d %s", code, body)
+	}
+	var e struct {
+		Error APIError `json:"error"`
+	}
+	json.Unmarshal(body, &e)
+	if e.Error.Code != "E_RATE_LIMITED" {
+		t.Fatalf("code %s want E_RATE_LIMITED", e.Error.Code)
+	}
+
+	// Forbidden class.
+	stub2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer stub2.Close()
+	h.server.HF = &importer.HFClient{BaseURL: stub2.URL, HTTP: stub2.Client()}
+	code, body = h.postJSON("/v1/import/hf", map[string]string{"repo": "a/b"})
+	if code != http.StatusBadGateway {
+		t.Fatalf("403: %d %s", code, body)
+	}
+	json.Unmarshal(body, &e)
+	if e.Error.Code != "E_SOURCE_FORBIDDEN" {
+		t.Fatalf("code %s want E_SOURCE_FORBIDDEN", e.Error.Code)
 	}
 }

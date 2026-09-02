@@ -10,11 +10,13 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
@@ -28,6 +30,7 @@ import (
 	"time"
 
 	"github.com/Cyb3rDudu/shardr/internal/cas"
+	"github.com/Cyb3rDudu/shardr/internal/importer"
 	"github.com/Cyb3rDudu/shardr/internal/ref"
 )
 
@@ -60,7 +63,10 @@ func DefaultSocketPath() (string, error) {
 
 // Server is the shardhive daemon API on a Unix socket.
 type Server struct {
-	store   *cas.Store
+	store *cas.Store
+	// HF is the Hugging Face client; nil disables /import/hf with a loud
+	// error. Tests inject a stub via this field before Listen.
+	HF      *importer.HFClient
 	socket  string
 	ln      net.Listener
 	httpSrv *http.Server
@@ -79,6 +85,32 @@ type Job struct {
 	State    string    `json:"state"` // waiting|fetching|done|failed
 	Manifest string    `json:"manifest,omitempty"`
 	Error    *APIError `json:"error,omitempty"`
+
+	// Import jobs (001 §8). Jobs are immutable once published: every state
+	// transition publishes a fresh instance via publishJob (atomic swap).
+	Kind       string        `json:"kind,omitempty"` // import-local|import-hf|ensure
+	As         string        `json:"as,omitempty"`
+	FilesDone  int           `json:"filesDone,omitempty"`
+	FilesTotal int           `json:"filesTotal,omitempty"`
+	Result     *ImportResult `json:"result,omitempty"`
+}
+
+// ImportResult is the terminal payload of an import job.
+type ImportResult struct {
+	Manifests   []string `json:"manifests"`
+	IndexDigest string   `json:"indexDigest"`
+	Quants      []string `json:"quants"`
+	Warnings    []string `json:"warnings,omitempty"`
+	Skipped     int      `json:"skipped"`
+}
+
+// publishJob atomically replaces a job's map entry with a fresh immutable
+// instance (terminal-then-publish per transition; concurrent /jobs readers
+// always see a consistent snapshot).
+func (s *Server) publishJob(job *Job) {
+	s.mu.Lock()
+	s.jobs[job.ID] = job
+	s.mu.Unlock()
 }
 
 // APIError is the wire error form (005 §3): {"code","message","candidates"?}.
@@ -129,6 +161,7 @@ func New(store *cas.Store, socket string) (*Server, error) {
 	}
 	return &Server{
 		store:  store,
+		HF:     importer.NewHFClient(),
 		socket: socket,
 		jobs:   map[string]*Job{},
 	}, nil
@@ -207,8 +240,8 @@ func (s *Server) router() http.Handler {
 	mux.HandleFunc("POST /v1/ensure", s.handleEnsure)
 	mux.HandleFunc("GET /v1/jobs/{id}", s.handleJob)
 	mux.HandleFunc("GET /v1/blob/{digest}", s.handleBlob)
-	mux.HandleFunc("POST /v1/import/local", s.handleImportReserved)
-	mux.HandleFunc("POST /v1/import/hf", s.handleImportReserved)
+	mux.HandleFunc("POST /v1/import/local", s.handleImportLocal)
+	mux.HandleFunc("POST /v1/import/hf", s.handleImportHF)
 	mux.HandleFunc("POST /v1/import/bt", s.handleImportReserved)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
 	// Everything else: version negotiation (loud) or plain 404.
@@ -629,6 +662,170 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request) {
 	// envelopeWriter guarantees error responses stay in the API error form.
 	w.Header().Set("Content-Type", "application/octet-stream")
 	http.ServeContent(&envelopeWriter{ResponseWriter: w}, r, "", time.Time{}, f)
+}
+
+// ---------------------------------------------------------------------------
+// Imports (001 §8) — local and HF are real; BT stays reserved (swarm is
+// the next slice). Jobs run asynchronously; every transition publishes a
+// fresh immutable Job instance.
+// ---------------------------------------------------------------------------
+
+// mapImportError maps importer sentinel outcomes to wire error classes.
+func mapImportError(err error) *APIError {
+	switch {
+	case errors.Is(err, importer.ErrNotImportable):
+		return &APIError{Code: "E_NOT_IMPORTABLE", Message: err.Error()}
+	case errors.Is(err, importer.ErrRateLimited):
+		return &APIError{Code: "E_RATE_LIMITED", Message: err.Error()}
+	case errors.Is(err, importer.ErrForbidden):
+		return &APIError{Code: "E_SOURCE_FORBIDDEN", Message: err.Error()}
+	case errors.Is(err, importer.ErrUnknownRepo):
+		return &APIError{Code: "E_UNKNOWN_REF", Message: err.Error()}
+	case errors.Is(err, importer.ErrHFUnreachable):
+		return &APIError{Code: ErrSourceUnavail, Message: err.Error()}
+	default:
+		return &APIError{Code: ErrInternal, Message: err.Error()}
+	}
+}
+
+// handleImportLocal: POST {paths[], as} — namespace is REQUIRED (001 §8.6).
+func (s *Server) handleImportLocal(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Paths []string `json:"paths"`
+		As    string   `json:"as"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, ErrBadRequest, "body must be JSON {\"paths\":[…],\"as\":\"ns/name\"}: "+err.Error())
+		return
+	}
+	if len(body.Paths) == 0 {
+		writeErr(w, http.StatusBadRequest, ErrBadRequest, "missing required field: paths (non-empty array)")
+		return
+	}
+	if body.As == "" {
+		writeErr(w, http.StatusBadRequest, ErrBadRequest, "missing required field: as (namespace, 001 §8.6 — never optional)")
+		return
+	}
+	if p, rerr := ref.Parse(ref.SchemePrefix + body.As + ":q8_0"); rerr != nil || p.NS+"/"+p.Name != body.As {
+		_ = p
+		writeErr(w, http.StatusBadRequest, ErrBadRequest, "field as must be a well-formed ns/name per spec 000")
+		return
+	}
+	sources, err := importer.LocalSources(body.Paths)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, ErrBadRequest, "paths: "+err.Error())
+		return
+	}
+
+	job := &Job{ID: newJobID(), Kind: "import-local", Ref: body.As, As: body.As, State: "waiting", FilesTotal: len(sources)}
+	s.publishJob(job)
+	go s.runImport(job, func(progress func(int, int)) (*importer.ImportResult, error) {
+		// Background context: the request dies with the 201 response;
+		// job cancellation support lands with job control.
+		return importer.Import(context.Background(), s.store, sources, importer.ImportOptions{
+			As: body.As, Progress: progress,
+		})
+	})
+	writeJSON(w, http.StatusCreated, job)
+}
+
+// handleImportHF: POST {repo, revision?} — same classification, same
+// convergence; revision is pinned to the resolved commit SHA (001 §8.8).
+func (s *Server) handleImportHF(w http.ResponseWriter, r *http.Request) {
+	if s.HF == nil {
+		writeErr(w, http.StatusServiceUnavailable, ErrSourceUnavail, "HF client disabled")
+		return
+	}
+	var body struct {
+		Repo     string `json:"repo"`
+		Revision string `json:"revision"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, ErrBadRequest, "body must be JSON {\"repo\":…,\"revision\":?}: "+err.Error())
+		return
+	}
+	if body.Repo == "" {
+		writeErr(w, http.StatusBadRequest, ErrBadRequest, "missing required field: repo")
+		return
+	}
+	info, err := s.HF.ListRepo(r.Context(), body.Repo, body.Revision)
+	if err != nil {
+		he := mapImportError(err)
+		writeErr(w, http.StatusBadGateway, he.Code, he.Message)
+		return
+	}
+	revision := info.CommitSHA
+	if revision == "" {
+		revision = body.Revision
+	}
+	if body.Revision == "" {
+		body.Revision = "main"
+	}
+	ns := strings.ToLower(body.Repo) // ns/name from the repo id (original case preserved in annotations)
+	var sources []importer.Source
+	for _, f := range info.Files {
+		path := f
+		sources = append(sources, importer.Source{Name: path, Open: func() (io.ReadCloser, error) {
+			// Background context: the request dies with the 201 response.
+			return s.HF.OpenFile(context.Background(), body.Repo, body.Revision, path)
+		}})
+	}
+
+	job := &Job{ID: newJobID(), Kind: "import-hf", Ref: body.Repo, As: ns, State: "waiting", FilesTotal: len(sources)}
+	s.publishJob(job)
+	go s.runImport(job, func(progress func(int, int)) (*importer.ImportResult, error) {
+		return importer.Import(context.Background(), s.store, sources, importer.ImportOptions{
+			As: ns, HFRepo: body.Repo, HFRevision: revision, Progress: progress,
+		})
+	})
+	writeJSON(w, http.StatusCreated, job)
+}
+
+// runImport executes an import with progress-driven job transitions and a
+// terminal publish. The context of the originating request is dead by the
+// time the goroutine runs — cancellation support lands with job control.
+func (s *Server) runImport(job *Job, run func(progress func(int, int)) (*importer.ImportResult, error)) {
+	next := *job
+	next.State = "fetching"
+	s.publishJob(&next)
+	res, err := run(func(done, total int) {
+		prog := *s.currentJob(job.ID)
+		prog.State = "fetching"
+		prog.FilesDone, prog.FilesTotal = done, total
+		s.publishJob(&prog)
+	})
+	term := *job
+	term.FilesDone = term.FilesTotal
+	if err != nil {
+		term.State = "failed"
+		term.Error = mapImportError(err)
+		s.publishJob(&term)
+		return
+	}
+	term.State = "done"
+	term.Result = &ImportResult{
+		IndexDigest: res.IndexDigest,
+		Warnings:    res.Warnings,
+		Skipped:     res.Skipped,
+	}
+	for _, m := range res.Members {
+		term.Result.Manifests = append(term.Result.Manifests, m.Manifest)
+		term.Result.Quants = append(term.Result.Quants, m.Quant)
+		if term.Manifest == "" {
+			term.Manifest = m.Manifest
+		}
+	}
+	s.publishJob(&term)
+}
+
+// currentJob returns the current published instance (or the given fallback).
+func (s *Server) currentJob(id string) *Job {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if j, ok := s.jobs[id]; ok {
+		return j
+	}
+	return &Job{ID: id}
 }
 
 // handleImportReserved: 001 §8 imports are the next slice — loud, explicit
