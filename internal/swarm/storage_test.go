@@ -11,6 +11,7 @@ import (
 	"github.com/anacrolix/torrent/bencode"
 	"github.com/anacrolix/torrent/metainfo"
 	"github.com/anacrolix/torrent/storage"
+	infohash_v2 "github.com/anacrolix/torrent/types/infohash-v2"
 
 	"github.com/Cyb3rDudu/shardr/internal/artifact"
 	"github.com/Cyb3rDudu/shardr/internal/cas"
@@ -326,7 +327,15 @@ func TestStorageRejectsTraversalPaths(t *testing.T) {
 	if err := bencode.Unmarshal(ib, &parsed); err != nil {
 		t.Fatal(err)
 	}
+	// Register under the EVIL torrent's own short hash so the only
+	// remaining rejection reason can be the traversal path itself.
+	v2 := infohash_v2.HashBytes(ib)
+	specs["../escape.gguf"] = FileSpec{Digest: artifact.DigestHex(artifact.Digest(content)), Size: int64(len(content))}
+	if err := st.Register(hex.EncodeToString(v2[:]), specs); err != nil {
+		t.Fatal(err)
+	}
 	var ih metainfo.Hash
+	copy(ih[:], v2[:20])
 	if _, err := st.OpenTorrent(context.Background(), &parsed, ih); err == nil {
 		t.Fatal("traversal path must be rejected at OpenTorrent")
 	}

@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"strings"
 	"testing"
@@ -101,12 +100,6 @@ func (n *e2eNode) peerAddrs() []string {
 		}
 	}
 	return out
-}
-
-// dumpSwarm prints peer/piece diagnostics on failure.
-func (n *e2eNode) dumpSwarm(label string) {
-	n.t.Helper()
-	n.t.Logf("[%s %s] dump", label, n.name)
 }
 
 // hasAllBlobs reports whether every file of the artifact is in the CAS.
@@ -303,6 +296,105 @@ func TestImportBTInfohashBindingAbortsBeforeAnnounce(t *testing.T) {
 	}
 }
 
+// The binding gate SPECIFICALLY: an evil torrent whose every file is
+// pin-valid (the real manifest file at manifestKey + the real content
+// files) but which carries an EXTRA file. All verify-writes would pass —
+// only the derived-infohash gate catches the identity lie and aborts.
+// Mutationssicherung partner of the import-binding-gate mutation.
+func TestImportBTExtraFileTorrentOnlyBindingCatches(t *testing.T) {
+	if testing.Short() {
+		t.Skip("E2E spins real swarm engines")
+	}
+	a := newNode(t, "A5", true)
+	res := a.importLocal()
+	manifestDigest := res.Members[0].Manifest
+	recon := a.seedArtifact(manifestDigest)
+
+	// Phase 1 would succeed (real manifest, pin-satisfiable). The gate
+	// fires at the phase-2 boundary: derived infohash != joined infohash.
+	evilIh, err := a.serveExtraFileVariant(manifestDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evilIh == recon.InfohashBtmh {
+		t.Fatal("test bug: extra-file variant must change the infohash")
+	}
+
+	b := newNode(t, "B5", true)
+	hints := Hints{Webseeds: []string{a.client.WebseedURL()}, Peers: a.peerAddrs()}
+	btCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err = b.client.ImportBT(btCtx, evilIh, manifestDigest, hints)
+	if err == nil {
+		t.Fatal("import of a torrent with extra files must fail at the binding gate")
+	}
+	if !strings.Contains(err.Error(), ErrBinding.Error()) {
+		t.Fatalf("must be the binding gate, got: %v", err)
+	}
+}
+
+// serveExtraFileVariant: same tree as the real artifact PLUS one extra
+// file — every real file is byte-identical, so only the infohash differs.
+func (n *e2eNode) serveExtraFileVariant(manifestDigest string) (string, error) {
+	mb, err := readBlob(n.client.store, artifact.DigestHex(manifestDigest))
+	if err != nil {
+		return "", err
+	}
+	var m artifact.Manifest
+	if err := unmarshalJSON(mb, &m); err != nil {
+		return "", err
+	}
+	files := map[string][]byte{}
+	for _, f := range m.Files {
+		if files[f.Name], err = readBlob(n.client.store, artifact.DigestHex(f.Digest)); err != nil {
+			return "", err
+		}
+	}
+	extra := []byte("extra file that must not be here")
+	files["extra.gguf"] = extra
+
+	afs := make([]artifact.File, 0, len(m.Files)+1)
+	afs = append(afs, m.Files...)
+	sum := sha256.Sum256(extra)
+	root := artifact.MerkleRoot(extra)
+	afs = append(afs, artifact.File{
+		Kind: "weights.gguf", Digest: "sha256:" + hex.EncodeToString(sum[:]),
+		Size: int64(len(extra)), Name: "extra.gguf",
+		BT: artifact.BT{MerkleRoot: "sha256:" + hex.EncodeToString(root[:])},
+	})
+	manifestSum := sha256.Sum256(mb)
+	_, res, err := artifact.BuildTorrent(afs, mb, hex.EncodeToString(manifestSum[:]), func(name string) ([]byte, error) {
+		return files[name], nil
+	})
+	if err != nil {
+		return "", err
+	}
+	layers := map[string]string{}
+	if err := bencodeLayersInto(res.PieceLayersBencode, layers); err != nil {
+		return "", err
+	}
+	specs := evilFileSpecs(afs, hex.EncodeToString(manifestSum[:]), mb)
+	ihRaw := strings.TrimPrefix(res.Infohash, "btmh:1220")
+	if err := n.client.casSt.Register(ihRaw, specs); err != nil {
+		return "", err
+	}
+	if err := n.client.scratchPutEvil(afs, files, mb); err != nil {
+		return "", err
+	}
+	infoB, _, err := artifact.BuildTorrentFromManifest(afs, mb, hex.EncodeToString(manifestSum[:]))
+	if err != nil {
+		return "", err
+	}
+	evSpec, err := specWithInfohash(res.Infohash, infoB, layers)
+	if err != nil {
+		return "", err
+	}
+	if _, _, err := n.client.tc.AddTorrentSpec(evSpec); err != nil {
+		return "", err
+	}
+	return res.Infohash, nil
+}
+
 // The DoD negative at the API level: /import/bt with a pin whose manifest
 // reconstructs a DIFFERENT infohash than the joined torrent must fail,
 // never produce blobs.
@@ -441,8 +533,6 @@ func flipHex(c byte) string {
 	return "0"
 }
 
-var _ = http.Get
-
 // dumpTorrent prints live state of one torrent in the engine (test-only).
 func (c *Client) dumpTorrent(shortKey string) {
 	for _, t := range c.tc.Torrents() {
@@ -469,5 +559,47 @@ func (c *Client) dumpTorrent(shortKey string) {
 		}
 		fmt.Fprintf(os.Stderr, "[dump %p] name=%s peers=%d conns=%d readUseful=%d pieces=%s\n",
 			c, info.BestName(), st.TotalPeers, st.ActivePeers, st.BytesReadUsefulData.Int64(), pieces)
+	}
+}
+
+// The 003 §4 seed-start re-hash: a corrupted blob on disk must abort
+// seeding loudly — disk corruption must never silently become swarm
+// corruption.
+func TestSeedStartRehashRejectsCorruptedBlob(t *testing.T) {
+	a := newNode(t, "A4", true)
+	res := a.importLocal()
+	manifestDigest := res.Members[0].Manifest
+	manifestBytes, _ := readBlob(a.client.store, artifact.DigestHex(manifestDigest))
+	var m artifact.Manifest
+	unmarshalJSON(manifestBytes, &m)
+	rec, recBytes, err := a.client.RecordForManifest(manifestDigest)
+	if err != nil || rec == nil {
+		t.Fatalf("record: %v %v", rec, err)
+	}
+	// Corrupt one file blob in place (flip bytes; keep size).
+	var victim string
+	for _, f := range m.Files {
+		victim = artifact.DigestHex(f.Digest)
+		break
+	}
+	bp, err := a.client.store.BlobPath(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(bp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[0] ^= 0xFF
+	if err := os.Chmod(bp, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bp, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.client.SeedArtifact(context.Background(), &m, manifestBytes, rec, recBytes); err == nil {
+		t.Fatal("seed-start must reject a corrupted blob (re-hash failed)")
+	} else if !strings.Contains(err.Error(), "re-hash failed") {
+		t.Fatalf("error must name the re-hash: %v", err)
 	}
 }
