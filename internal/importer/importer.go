@@ -75,7 +75,24 @@ func Import(ctx context.Context, store *cas.Store, sources []Source, opts Import
 		return nil, ErrNotImportable
 	}
 
-	total := len(c.entries) + 2 // entries + index + state
+	// ---- Group into artifacts (quant families) ----
+	groups := map[string][]entry{}
+	var groupOrder []string
+	for _, e := range c.entries {
+		if e.kind == "weights.gguf" || e.kind == "weights.safetensors" {
+			g := e.group
+			if _, ok := groups[g]; !ok {
+				groupOrder = append(groupOrder, g)
+			}
+			groups[g] = append(groups[g], e)
+		}
+	}
+	sort.Strings(groupOrder)
+
+	// Progress totals must be consistent at job end (multi-artifact
+	// included): one bump per entry ingest, one per sealed artifact, one
+	// for the index — done == total on the last callback.
+	total := len(c.entries) + len(groupOrder) + 1
 	done := 0
 	bump := func() {
 		done++
@@ -121,20 +138,6 @@ func Import(ctx context.Context, store *cas.Store, sources []Source, opts Import
 		}
 		bump()
 	}
-
-	// ---- Group into artifacts (quant families) ----
-	groups := map[string][]entry{}
-	var groupOrder []string
-	for _, e := range c.entries {
-		if e.kind == "weights.gguf" || e.kind == "weights.safetensors" {
-			g := e.group
-			if _, ok := groups[g]; !ok {
-				groupOrder = append(groupOrder, g)
-			}
-			groups[g] = append(groups[g], e)
-		}
-	}
-	sort.Strings(groupOrder)
 
 	// Shared, quant-agnostic companions join every artifact (§3.1.3):
 	// aux, adapters. tokenizer/chat-template are GGUF-excluded (§8.5).

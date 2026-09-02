@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -91,7 +92,11 @@ func (c *HFClient) ListRepo(ctx context.Context, repo, revision string) (*RepoIn
 	if !validHFRepoID(repo) {
 		return nil, fmt.Errorf("invalid repo id %q", repo)
 	}
-	resp, err := c.do(ctx, c.BaseURL+"/api/models/"+repo+"/revision/"+revision)
+	rev, rerr := escapeSegments(revision)
+	if rerr != nil {
+		return nil, fmt.Errorf("invalid revision %q: %s", revision, rerr)
+	}
+	resp, err := c.do(ctx, c.BaseURL+"/api/models/"+repo+"/revision/"+rev)
 	if err != nil {
 		return nil, err
 	}
@@ -126,14 +131,43 @@ func (c *HFClient) OpenFile(ctx context.Context, repo, revision, path string) (i
 	if revision == "" {
 		revision = "main"
 	}
-	resp, err := c.do(ctx, c.BaseURL+"/"+repo+"/resolve/"+revision+"/"+path)
+	if !validHFRepoID(repo) {
+		return nil, fmt.Errorf("invalid repo id %q", repo)
+	}
+	rev, rerr := escapeSegments(revision)
+	if rerr != nil {
+		return nil, fmt.Errorf("invalid revision %q: %s", revision, rerr)
+	}
+	file, ferr := escapeSegments(path)
+	if ferr != nil {
+		return nil, fmt.Errorf("invalid file path %q: %s", path, ferr)
+	}
+	resp, err := c.do(ctx, c.BaseURL+"/"+repo+"/resolve/"+rev+"/"+file)
 	if err != nil {
 		return nil, err
 	}
 	return resp.Body, nil
 }
 
-// validHFRepoID: namespace/name with a permissive but bounded charset.
+// escapeSegments makes a '/'-joined path safe for a URL path position:
+// every segment must be non-empty and not "."/".."/backslash, and is
+// percent-encoded per segment (url.PathEscape escapes "/" itself, which
+// would break multi-segment paths — hence the split). Revision and file
+// paths are NEVER raw-concatenated into request URLs: a hostile revision
+// or rfilename ("../../…", "?x=y", "#frag") must not reshape the request.
+func escapeSegments(s string) (string, error) {
+	if s == "" {
+		return "", fmt.Errorf("empty path")
+	}
+	segs := strings.Split(s, "/")
+	for i, seg := range segs {
+		if seg == "" || seg == "." || seg == ".." || strings.Contains(seg, "\\") {
+			return "", fmt.Errorf("invalid path segment %q", seg)
+		}
+		segs[i] = url.PathEscape(seg)
+	}
+	return strings.Join(segs, "/"), nil
+}
 func validHFRepoID(repo string) bool {
 	if len(repo) < 3 || len(repo) > 200 || strings.Contains(repo, "..") {
 		return false
