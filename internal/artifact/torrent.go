@@ -192,9 +192,14 @@ func DigestHex(d string) string { return strings.TrimPrefix(d, "sha256:") }
 // bytes are manifestBytes with digest hex digestHex (bare hex). resolve
 // returns the content bytes of a file entry by manifest name. It returns
 // the bencoded info dict plus the derived identity fields.
+//
+// Every computed per-file merkle root MUST equal the entry's pinned
+// bt.merkleRoot (001 §3.1): a manifest that lies about its own torrent
+// geometry is rejected here, not just downstream at the infohash gate.
 func BuildTorrent(files []File, manifestBytes []byte, digestHex string, resolve func(name string) ([]byte, error)) (infoBencode []byte, res TorrentResult, err error) {
 	tree := map[string]any{}
 	total := int64(len(manifestBytes))
+	roots := map[string][sha256.Size]byte{}
 	for _, f := range files {
 		data, err := resolve(f.Name)
 		if err != nil {
@@ -204,10 +209,15 @@ func BuildTorrent(files []File, manifestBytes []byte, digestHex string, resolve 
 			return nil, res, fmt.Errorf("file %q: content size %d != manifest size %d", f.Name, len(data), f.Size)
 		}
 		root := MerkleRoot(data)
+		if pinned := DigestHex(f.BT.MerkleRoot); pinned != hex.EncodeToString(root[:]) {
+			return nil, res, fmt.Errorf("file %q: computed merkle root sha256:%x != pinned bt.merkleRoot %s (manifest lies about its torrent geometry)", f.Name, root, f.BT.MerkleRoot)
+		}
+		roots[f.Name] = root
 		insertFileTree(tree, strings.Split(f.Name, "/"), f.Size, root)
 		total += f.Size
 	}
 	manifestRoot := MerkleRoot(manifestBytes)
+	roots["manifest/sha256-"+digestHex] = manifestRoot
 	tree["manifest"] = map[string]any{
 		"sha256-" + digestHex: map[string]any{
 			"": map[string]any{"length": int64(len(manifestBytes)), "pieces root": string(manifestRoot[:])},
@@ -230,7 +240,9 @@ func BuildTorrent(files []File, manifestBytes []byte, digestHex string, resolve 
 	res.Infohash = "btmh:1220" + hex.EncodeToString(sum[:])
 
 	// Piece layers (BEP 52): entries for files larger than pieceLength,
-	// keyed by raw merkle root, value = concatenated layer hashes.
+	// keyed by raw merkle root, value = concatenated layer hashes. Only the
+	// content path can compute them; BuildTorrentFromManifest leaves them
+	// empty and the caller supplies the layers blob from the CAS (004 §5).
 	layers := map[string]any{}
 	addLayer := func(size int64, root [sha256.Size]byte, data []byte) {
 		if size <= pieceLength {
@@ -247,12 +259,54 @@ func BuildTorrent(files []File, manifestBytes []byte, digestHex string, resolve 
 		if err != nil {
 			return nil, res, err
 		}
-		addLayer(f.Size, MerkleRoot(data), data)
+		addLayer(f.Size, roots[f.Name], data)
 	}
 	addLayer(int64(len(manifestBytes)), manifestRoot, manifestBytes)
 	res.PieceLayersBencode = bencode(layers)
 	layerSum := sha256.Sum256(res.PieceLayersBencode)
 	res.PieceLayersDigest = "sha256:" + hex.EncodeToString(layerSum[:])
+	return infoBencode, res, nil
+}
+
+// BuildTorrentFromManifest reconstructs the torrent identity from a
+// manifest ALONE (004 §3, 001 §7.4): file tree from the pinned
+// bt.merkleRoot entries, piece length from the ladder. No content bytes
+// are needed — this is how a node that holds the manifest but not the
+// blobs derives the infohash to join the swarm (and how the 001 §6
+// binding check is evaluated without local content). The piece-layers
+// blob is NOT derived (it needs content); the caller supplies it from
+// the CAS or a source hint, keyed by root exactly like the layers map.
+func BuildTorrentFromManifest(files []File, manifestBytes []byte, digestHex string) (infoBencode []byte, res TorrentResult, err error) {
+	tree := map[string]any{}
+	total := int64(len(manifestBytes))
+	manifestRoot := MerkleRoot(manifestBytes)
+	for _, f := range files {
+		pinned := DigestHex(f.BT.MerkleRoot)
+		var root [sha256.Size]byte
+		if _, err := hex.Decode(root[:], []byte(pinned)); err != nil {
+			return nil, res, fmt.Errorf("file %q: pinned bt.merkleRoot %q is not 64 hex chars", f.Name, f.BT.MerkleRoot)
+		}
+		insertFileTree(tree, strings.Split(f.Name, "/"), f.Size, root)
+		total += f.Size
+	}
+	tree["manifest"] = map[string]any{
+		"sha256-" + digestHex: map[string]any{
+			"": map[string]any{"length": int64(len(manifestBytes)), "pieces root": string(manifestRoot[:])},
+		},
+	}
+	pieceLength := LadderPieceLength(total)
+	res.TotalSize = total
+	res.PieceLength = pieceLength
+	res.Name = "shardr-sha256-" + digestHex[:12]
+	info := map[string]any{
+		"file tree":    tree,
+		"meta version": int64(2),
+		"name":         res.Name,
+		"piece length": pieceLength,
+	}
+	infoBencode = bencode(info)
+	sum := sha256.Sum256(infoBencode)
+	res.Infohash = "btmh:1220" + hex.EncodeToString(sum[:])
 	return infoBencode, res, nil
 }
 
