@@ -345,6 +345,10 @@ func lockNamespace(nsKey string) *sync.Mutex {
 }
 
 // existingMembers loads the namespace's current index from state+CAS, if any.
+// Member validation runs through the central index validator in
+// internal/artifact — the same rules the API's index reader and the spec
+// vectors enforce. A corrupt index is a loud import error; its members are
+// never silently carried into the new current index.
 func existingMembers(store *cas.Store, nsKey string) ([]artifact.IndexMember, error) {
 	ns, err := store.Namespaces()
 	if err != nil {
@@ -369,8 +373,8 @@ func existingMembers(store *cas.Store, nsKey string) ([]artifact.IndexMember, er
 	if err := jsonDecode(f, &idx); err != nil {
 		return nil, fmt.Errorf("current index %s: %w", d, err)
 	}
-	if idx.ArtifactType != "model-index" || idx.SchemaVersion != 1 {
-		return nil, fmt.Errorf("current index %s: not a model-index v1", d)
+	if verr := artifact.ValidateIndex(&idx); verr != nil {
+		return nil, fmt.Errorf("current index %s for %q fails validation; refusing to carry corrupt members into the new index (run `shardhive cas verify --all` and repair state): %w", d, nsKey, verr)
 	}
 	return idx.Members, nil
 }

@@ -29,6 +29,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Cyb3rDudu/shardr/internal/artifact"
 	"github.com/Cyb3rDudu/shardr/internal/cas"
 	"github.com/Cyb3rDudu/shardr/internal/importer"
 	"github.com/Cyb3rDudu/shardr/internal/ref"
@@ -430,19 +431,13 @@ func (s *Server) resolveLocal(p *ref.Ref) (*resolveResult, *httpError) {
 	return res, nil
 }
 
-// indexMemberDoc is the minimal 001 model-index reader this slice needs:
-// artifactType "model-index" with members[{quant, manifest}].
-type indexMemberDoc struct {
-	ArtifactType  string       `json:"artifactType"`
-	SchemaVersion int          `json:"schemaVersion"`
-	Members       []ref.Member `json:"members"`
-}
-
-// readIndexMembers loads the index blob and decodes + validates its
-// members per spec 001: schemaVersion 1, non-empty members, quant syntax
-// per 000 Appendix A, canonical sha256:<hex> manifests, unique quants.
-// A missing index blob is E_NO_INDEX (loud; ensure's metadata phase would
-// fetch it in a later slice), an invalid one is E_INVALID_INDEX.
+// readIndexMembers loads the index blob and validates it via the central
+// index validator in internal/artifact (the same rule set the importer's
+// index merge and the spec vectors use): schemaVersion 1, artifactType
+// model-index, non-empty members, quant syntax per 000 Appendix A,
+// canonical sha256:<hex> manifests, unique quants. A missing index blob is
+// E_NO_INDEX (loud; ensure's metadata phase would fetch it in a later
+// slice), an invalid one is E_INVALID_INDEX.
 //
 // Trust note (no re-hash before parsing): a blob in blobs/sha256/ entered
 // the store through the verifying write path (003 §3) or was re-hashed by
@@ -461,40 +456,20 @@ func (s *Server) readIndexMembers(indexDigest string) ([]ref.Member, *httpError)
 		return nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInternal, Message: err.Error()}}
 	}
 	defer f.Close()
-	var doc indexMemberDoc
-	if err := json.NewDecoder(f).Decode(&doc); err != nil {
+	var idx artifact.Index
+	if err := json.NewDecoder(f).Decode(&idx); err != nil {
 		return nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInvalidIndex,
 			Message: "index " + indexDigest + ": not a valid model-index: " + err.Error()}}
 	}
-	if doc.ArtifactType != "model-index" {
+	if verr := artifact.ValidateIndex(&idx); verr != nil {
 		return nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInvalidIndex,
-			Message: "index " + indexDigest + ": artifactType " + doc.ArtifactType + " != model-index"}}
+			Message: "index " + indexDigest + ": " + verr.Error()}}
 	}
-	if doc.SchemaVersion != 1 {
-		return nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInvalidIndex,
-			Message: fmt.Sprintf("index %s: schemaVersion %d != 1", indexDigest, doc.SchemaVersion)}}
+	members := make([]ref.Member, len(idx.Members))
+	for i, m := range idx.Members {
+		members[i] = ref.Member{Quant: m.Quant, Manifest: m.Manifest}
 	}
-	if len(doc.Members) == 0 {
-		return nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInvalidIndex,
-			Message: "index " + indexDigest + ": empty members"}}
-	}
-	seen := map[string]bool{}
-	for i, m := range doc.Members {
-		if !ref.QuantSyntax(m.Quant) {
-			return nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInvalidIndex,
-				Message: fmt.Sprintf("index %s: member %d: quant %q is not valid quant syntax (000 App. A)", indexDigest, i, m.Quant)}}
-		}
-		if !ref.IsDigest(m.Manifest) {
-			return nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInvalidIndex,
-				Message: fmt.Sprintf("index %s: member %d: manifest %q is not canonical sha256:<64hex>", indexDigest, i, m.Manifest)}}
-		}
-		if seen[m.Quant] {
-			return nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInvalidIndex,
-				Message: fmt.Sprintf("index %s: duplicate quant %q", indexDigest, m.Quant)}}
-		}
-		seen[m.Quant] = true
-	}
-	return doc.Members, nil
+	return members, nil
 }
 
 // handleResolve: pure name→digest+plan against local state (005 §3).
