@@ -264,27 +264,71 @@ func TestImportRootBoundary(t *testing.T) {
 			sources, err := LocalSources(tc.paths(t))
 			if err == nil {
 				// Fail-open shape (pre-fix): the import would read through the
-				// symlink. Run it so the CAS probe below is a real check.
+				// symlink. Run it, then probe the CAS below for leaked bytes —
+				// the probe runs BEFORE any failure aborts the test.
 				_, _ = Import(context.Background(), store, sources, ImportOptions{As: "x/y"})
+			}
+			// Two CAS checks first: the outer file's bytes must be in no CAS
+			// root, whatever LocalSources did.
+			hexD := testDigestOf(string(foreign))
+			leaked := store.Has(hexD)
+			if !leaked {
+				if bp, perr := store.BlobPath(hexD); perr == nil {
+					if _, serr := os.Lstat(bp); serr == nil {
+						leaked = true
+					}
+				}
+			}
+			if leaked {
+				t.Fatal("foreign blob landed in the CAS")
 			}
 			if !errors.Is(err, ErrSourceNotRegular) {
 				t.Fatalf("want ErrSourceNotRegular, got %v", err)
-			}
-			// Two CAS checks: the outer file's bytes must be in no CAS root.
-			hexD := testDigestOf(string(foreign))
-			if store.Has(hexD) {
-				t.Fatal("foreign blob landed in the CAS")
-			}
-			if p, perr := store.BlobPath(hexD); perr == nil {
-				if _, serr := os.Lstat(p); serr == nil {
-					t.Fatalf("foreign blob path exists: %s", p)
-				}
 			}
 			ns, _ := store.Namespaces()
 			if len(ns) != 0 {
 				t.Fatalf("failed expansion must not mutate state: %v", ns)
 			}
 		})
+	}
+}
+
+// The boundary must also hold at READ time: a file swapped for a symlink
+// (or another file) after LocalSources but before Import's ingest must not
+// leak followed bytes into the CAS.
+func TestImportRootBoundaryTOCTOU(t *testing.T) {
+	foreign := []byte("SECRET foreign bytes — swapped in after expansion")
+	outside := filepath.Join(t.TempDir(), "target.bin")
+	if err := os.WriteFile(outside, foreign, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	victim := filepath.Join(root, "model.gguf")
+	if err := os.WriteFile(victim, []byte("weights"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := mustStore(t)
+	sources, err := LocalSources([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Swap the admitted regular file for a symlink out of the root.
+	if err := os.Remove(victim); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, victim); err != nil {
+		t.Fatal(err)
+	}
+	_, err = Import(context.Background(), store, sources, ImportOptions{As: "x/y"})
+	if err == nil || !errors.Is(err, ErrSourceNotRegular) {
+		t.Fatalf("swapped source must fail the import, got %v", err)
+	}
+	if store.Has(testDigestOf(string(foreign))) {
+		t.Fatal("foreign blob landed in the CAS despite read-time re-check")
+	}
+	ns, _ := store.Namespaces()
+	if len(ns) != 0 {
+		t.Fatalf("state must be untouched: %v", ns)
 	}
 }
 

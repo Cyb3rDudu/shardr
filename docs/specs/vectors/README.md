@@ -83,7 +83,8 @@ Validation error classes: `E_VALIDATION` plus the specific
 `E_VALIDATION_QUANT_DUP`, `E_VALIDATION_INFOHASH`,
 `E_VALIDATION_KIND`, `E_VALIDATION_RESERVED_PATH` (ruling R2),
 `E_VALIDATION_RUNTIME_DUP`, `E_VALIDATION_CARDINALITY`
-(see `canonical_impl_test.go` for the rule set; unknown fields are
+(the rule set is the PRODUCTION validator in `internal/artifact/validate.go`
+— the vectors run it via `canonical_impl_test.go`; unknown fields are
 preserved, not rejected — forward compatibility, 001 §3.2).
 
 JCS provenance: the reference Go implementation from the RFC 8785 authors
