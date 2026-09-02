@@ -12,6 +12,7 @@ import (
 
 	"github.com/Cyb3rDudu/shardr/internal/api"
 	"github.com/Cyb3rDudu/shardr/internal/cas"
+	"github.com/Cyb3rDudu/shardr/internal/swarm"
 )
 
 // version is injected at build time via ldflags, e.g.
@@ -79,8 +80,36 @@ func run(args []string) int {
 func runServe(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	socket := fs.String("socket", "", "socket path (default: $SHARDR_SOCKET, $XDG_RUNTIME_DIR/shardhive.sock, or <tmp>/shardhive-<uid>/shardhive.sock)")
+	noSeedVerify := fs.Bool("seed-no-verify", false, "skip the seed-start re-hash (003 §4 escape hatch; documented unsafe; never default)")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
+	}
+	swarmCfg, err := loadSwarmConfig()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "shardhive:", err)
+		return 1
+	}
+	if *noSeedVerify {
+		if !swarmCfg.Enabled {
+			fmt.Fprintln(os.Stderr, "shardhive: --seed-no-verify without [swarm] enabled = true is meaningless")
+			return exitUsage
+		}
+		fmt.Fprintln(os.Stderr, "shardhive: WARNING: --seed-no-verify set — disk corruption can silently become swarm corruption (003 §4)")
+		swarmCfg.NoSeedVerify = true
+	}
+	var sw *swarm.Client
+	if swarmCfg.Enabled {
+		// The swarm client owns its CAS handle (same root as the store
+		// opened below; one copy per machine belongs to shardhive, and the
+		// driver only reads sealed blobs + writes through the verifying
+		// path — concurrent Handles are safe by the CAS's immutability
+		// contract).
+		sw, err = swarm.New(swarmCfg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "shardhive:", err)
+			return 1
+		}
+		defer sw.Close()
 	}
 	store, err := cas.Open("")
 	if err != nil {
@@ -92,6 +121,7 @@ func runServe(args []string) int {
 		fmt.Fprintln(os.Stderr, "shardhive:", err)
 		return 1
 	}
+	srv.Swarm = sw
 	if err := srv.Listen(); err != nil {
 		fmt.Fprintln(os.Stderr, "shardhive:", err)
 		return 1

@@ -17,8 +17,9 @@ import (
 // are stored in the canonical protocol form "sha256:<64hex>" (000 §2); keys
 // are validated on write (issue #4 hard follow-up: no garbage in state/).
 const (
-	namespacesFile = "namespaces.json" // ns/name → current index digest
-	tagsFile       = "tags.json"       // tag alias → digest
+	namespacesFile   = "namespaces.json"   // ns/name → current index digest
+	tagsFile         = "tags.json"         // tag alias → digest
+	distributionFile = "distribution.json" // manifest digest → distribution record digest (swarm binding link)
 )
 
 // Namespaces returns the namespace → current-index-digest mapping.
@@ -49,6 +50,45 @@ func (s *Store) DeleteNamespace(name string) error {
 // (R3, 000 §3.4: tags are scoped per repository).
 func (s *Store) TagAliases() (map[string]string, error) {
 	return s.loadMap(tagsFile)
+}
+
+// DistributionLinks returns the manifest-digest → distribution-record
+// digest mapping (the swarm binding link: given a local manifest, which
+// record blob pins its torrent identity — 001 §6). Keys and values are
+// canonical "sha256:<hex>".
+func (s *Store) DistributionLinks() (map[string]string, error) {
+	return s.loadMap(distributionFile)
+}
+
+// SetDistributionLink links a manifest digest to its distribution record
+// digest. Both must be canonical digests; pass empty record to unlink.
+func (s *Store) SetDistributionLink(manifestDigest, recordDigest string) error {
+	md, merr := ref.NormalizeDigest(manifestDigest)
+	if merr != nil {
+		return fmt.Errorf("cas: distribution link: manifest digest: %s", merr.Message)
+	}
+	if recordDigest == "" {
+		return s.updateMap(distributionFile, func(m map[string]string) { delete(m, md) })
+	}
+	rd, rerr := ref.NormalizeDigest(recordDigest)
+	if rerr != nil {
+		return fmt.Errorf("cas: distribution link: record digest: %s", rerr.Message)
+	}
+	return s.updateMap(distributionFile, func(m map[string]string) { m[md] = rd })
+}
+
+// RecordDigestForManifest resolves the linked distribution record digest
+// for a manifest ("" when unlinked).
+func (s *Store) RecordDigestForManifest(manifestDigest string) (string, error) {
+	md, merr := ref.NormalizeDigest(manifestDigest)
+	if merr != nil {
+		return "", fmt.Errorf("cas: distribution link: %s", merr.Message)
+	}
+	links, lerr := s.loadMap(distributionFile)
+	if lerr != nil {
+		return "", lerr
+	}
+	return links[md], nil
 }
 
 // SetTagAlias points the repository-scoped tag (nsName:tag) at digest.
