@@ -1029,6 +1029,35 @@ func TestImportLocalValidation(t *testing.T) {
 	}
 }
 
+// The import root is a hard boundary: a non-regular source (symlink,
+// fifo, device) fails closed with its own error class before any byte is
+// read — never a generic bad-request, never a silent follow.
+func TestImportLocalRejectsNonRegularSource(t *testing.T) {
+	h := newHarness(t)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "model.gguf"), []byte("w"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(t.TempDir(), "outside.bin"), filepath.Join(root, "evil.gguf")); err != nil {
+		t.Fatal(err)
+	}
+	code, body := h.postJSON("/v1/import/local", map[string]any{
+		"paths": []string{root},
+		"as":    "a/b",
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("symlinked source: %d %s", code, body)
+	}
+	var e struct {
+		Error APIError `json:"error"`
+	}
+	json.Unmarshal(body, &e)
+	if e.Error.Code != "E_SOURCE_NOT_REGULAR" {
+		t.Fatalf("code %s want E_SOURCE_NOT_REGULAR (%s)", e.Error.Code, body)
+	}
+	// A 400 error envelope — no job was created (jobs answer 201).
+}
+
 func TestImportLocalNotImportable(t *testing.T) {
 	h := newHarness(t)
 	dir := t.TempDir()
