@@ -1,1 +1,1 @@
-{"model_type":"toy","max_positional_embeddings":4096,"architectures":["ToyForCausalLM"]}
+{"model_type":"toy","max_positional_embeddings":4096,"architectures":["ToyForCausalLM"],"quantization_config":{"quant_method":"fp8"}}

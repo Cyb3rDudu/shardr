@@ -990,11 +990,11 @@ func TestImportLocalOverSocket(t *testing.T) {
 	if term.Result == nil || len(term.Result.Manifests) != 1 || term.Result.IndexDigest == "" {
 		t.Fatalf("result: %+v", term.Result)
 	}
-	if term.Result.Quants[0] != "q8_0" {
-		t.Fatalf("quants: %v", term.Result.Quants)
+	if term.Result.Quants[0] != "fp8" {
+		t.Fatalf("quants: %v (fixture quant must derive from config quant_method)", term.Result.Quants)
 	}
 	// The namespace resolves through /v1/resolve now.
-	code, body = h.get("/v1/resolve?ref=" + url.QueryEscape("shardr:///gold/repo:q8_0"))
+	code, body = h.get("/v1/resolve?ref=" + url.QueryEscape("shardr:///gold/repo:fp8"))
 	if code != http.StatusOK {
 		t.Fatalf("resolve after import: %d %s", code, body)
 	}
@@ -1080,16 +1080,16 @@ func TestImportHFOverSocket(t *testing.T) {
 	// Same bytes as the local golden fixtures → convergence across sources.
 	files := map[string]string{}
 	for name, content := range map[string]string{
-		"toy-q8_0-00001-of-00002.gguf": "GGUF fake header v3 — toy weights part 1, deterministic bytes for the golden fixture.\n",
-		"toy-q8_0-00002-of-00002.gguf": "GGUF fake header v3 — toy weights part 2, deterministic bytes for the golden fixture.\n",
-		"adapter_model.safetensors":    `{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]}`,
-		"adapter_config.json":          `{"base_model_name_or_path":"toy/base","peft_type":"LORA","r":8}`,
-		"tokenizer.json":               `{"version":"1.0","model":{"type":"BPE"},"vocab":{"a":0,"b":1}}`,
-		"tokenizer_config.json":        `{"model_max_length":4096,"tokenizer_class":"ToyTokenizer"}`,
-		"chat_template.json":           "{% set name = %>toy<%}\nYou are {{name}}.\n",
-		"README.md":                    "# Toy Model\nFixture repository for the golden import test.\n",
-		"LICENSE":                      "MIT License\n\nSPDX-License-Identifier: MIT\n",
-		"config.json":                  `{"model_type":"toy","max_positional_embeddings":4096,"architectures":["ToyForCausalLM"]}`,
+		"toy-00001-of-00002.gguf":   "GGUF fake header v3 — toy weights part 1, deterministic bytes for the golden fixture.\n",
+		"toy-00002-of-00002.gguf":   "GGUF fake header v3 — toy weights part 2, deterministic bytes for the golden fixture.\n",
+		"adapter_model.safetensors": `{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]}`,
+		"adapter_config.json":       `{"base_model_name_or_path":"toy/base","peft_type":"LORA","r":8}`,
+		"tokenizer.json":            `{"version":"1.0","model":{"type":"BPE"},"vocab":{"a":0,"b":1}}`,
+		"tokenizer_config.json":     `{"model_max_length":4096,"tokenizer_class":"ToyTokenizer"}`,
+		"chat_template.json":        "{% set name = %>toy<%}\nYou are {{name}}.\n",
+		"README.md":                 "# Toy Model\nFixture repository for the golden import test.\n",
+		"LICENSE":                   "Some Custom License Text v2, all rights weird — no SPDX line on purpose\n",
+		"config.json":               `{"model_type":"toy","max_positional_embeddings":4096,"architectures":["ToyForCausalLM"],"quantization_config":{"quant_method":"fp8"}}`,
 	} {
 		files[name] = content
 	}
@@ -1108,7 +1108,7 @@ func TestImportHFOverSocket(t *testing.T) {
 		t.Fatalf("terminal: %+v (error %+v)", term, term.Error)
 	}
 	// HF repo id → lowercased ns/name namespace.
-	code, body = h.get("/v1/resolve?ref=" + url.QueryEscape("shardr:///toy/model:q8_0"))
+	code, body = h.get("/v1/resolve?ref=" + url.QueryEscape("shardr:///toy/model:fp8"))
 	if code != http.StatusOK {
 		t.Fatalf("resolve: %d %s", code, body)
 	}
@@ -1135,6 +1135,61 @@ func TestImportHFOverSocket(t *testing.T) {
 	if lres.Artifacts[0].Manifest != term.Result.Manifests[0] {
 		t.Fatalf("HF and local imports diverged: %s vs %s",
 			term.Result.Manifests[0], lres.Artifacts[0].Manifest)
+	}
+}
+
+// TestImportHFPinsRevision proves byte fetches ride the resolved commit
+// SHA, never the mutable branch (PR #16 blocker 2): the stub serves files
+// ONLY under the SHA revision — a branch fetch would 404 the whole import.
+func TestImportHFPinsRevision(t *testing.T) {
+	files := map[string]string{
+		"toy-00001-of-00002.gguf": "sha-pinned bytes\n",
+		"config.json":             `{"model_type":"toy","quantization_config":{"quant_method":"fp8"}}`,
+	}
+	const sha = "4ca7207fa5502f4a0f8b3d1e2c3d4e5f60718293"
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/models/") {
+			var siblings []map[string]string
+			for name := range files {
+				siblings = append(siblings, map[string]string{"rfilename": name})
+			}
+			json.NewEncoder(w).Encode(map[string]any{"sha": sha, "siblings": siblings})
+			return
+		}
+		parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/"), "/resolve/", 2)
+		if len(parts) == 2 {
+			if rev, _, ok := strings.Cut(parts[1], "/"); ok && rev == sha {
+				if _, file, _ := strings.Cut(parts[1], "/"); files[file] != "" {
+					io.WriteString(w, files[file])
+					return
+				}
+			}
+		}
+		http.NotFound(w, r) // branch fetches die here
+	}))
+	defer stub.Close()
+	h := newHarness(t)
+	h.server.HF = &importer.HFClient{BaseURL: stub.URL, HTTP: stub.Client()}
+
+	code, body := h.postJSON("/v1/import/hf", map[string]string{"repo": "Toy/Model"})
+	if code != http.StatusCreated {
+		t.Fatalf("import hf: %d %s", code, body)
+	}
+	var job Job
+	json.Unmarshal(body, &job)
+	term := waitJob(t, h, job.ID)
+	if term.State != "done" {
+		t.Fatalf("import must succeed against the SHA pin; branch fetch would 404: %+v", term.Error)
+	}
+	// Provenance pins the SHA.
+	code, body = h.get("/v1/resolve?ref=" + url.QueryEscape("shardr:///toy/model:fp8"))
+	if code != http.StatusOK {
+		t.Fatalf("resolve: %d %s", code, body)
+	}
+	var res resolveResult
+	json.Unmarshal(body, &res)
+	if res.ManifestDigest == "" {
+		t.Fatal("no manifest resolved")
 	}
 }
 

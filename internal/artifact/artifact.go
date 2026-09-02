@@ -130,6 +130,13 @@ func ValidateManifest(m *Manifest) error {
 	weightsFormat := ""
 	parts := map[string][]int64{}
 	nConfig, nTokenizer, nChat := 0, 0, 0
+	// A name that is a path PREFIX of another name would corrupt the BEP 52
+	// file tree (file/dir collision at one path) — reject loudly instead of
+	// building a torrent no client accepts (or panicking in insertFileTree).
+	byName := map[string]File{}
+	for _, f := range m.Files {
+		byName[f.Name] = f
+	}
 	for _, f := range m.Files {
 		if err := ValidateFileName(f.Name); err != nil {
 			return err
@@ -178,6 +185,15 @@ func ValidateManifest(m *Manifest) error {
 	}
 	if nTokenizer > 1 || nChat > 1 {
 		return fmt.Errorf("tokenizer/chat-template are 0..1 (got %d/%d)", nTokenizer, nChat)
+	}
+	// Path-prefix collision: "a" and "a/b" cannot coexist in the tree.
+	for _, f := range m.Files {
+		segs := strings.Split(f.Name, "/")
+		for i := 1; i < len(segs); i++ {
+			if _, ok := byName[strings.Join(segs[:i], "/")]; ok {
+				return fmt.Errorf("name %q collides with directory path %q (BEP 52 file tree)", f.Name, strings.Join(segs[:i], "/"))
+			}
+		}
 	}
 	// Split parts must be contiguous 1..n.
 	for _, ps := range parts {

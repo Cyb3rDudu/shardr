@@ -754,12 +754,16 @@ func (s *Server) handleImportHF(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, he.Code, he.Message)
 		return
 	}
-	revision := info.CommitSHA
-	if revision == "" {
-		revision = body.Revision
-	}
-	if body.Revision == "" {
-		body.Revision = "main"
+	// B2: pin every byte fetch to the RESOLVED commit SHA, never the
+	// mutable branch — otherwise a branch move between listing and fetch
+	// publishes bytes from commit Y under the provenance of commit X
+	// (001 §8.8 pinning, §7.5 convergence).
+	pinned := info.CommitSHA
+	if pinned == "" {
+		pinned = body.Revision // API did not resolve a SHA; pin the named revision
+		if pinned == "" {
+			pinned = "main"
+		}
 	}
 	ns := strings.ToLower(body.Repo) // ns/name from the repo id (original case preserved in annotations)
 	var sources []importer.Source
@@ -767,7 +771,7 @@ func (s *Server) handleImportHF(w http.ResponseWriter, r *http.Request) {
 		path := f
 		sources = append(sources, importer.Source{Name: path, Open: func() (io.ReadCloser, error) {
 			// Background context: the request dies with the 201 response.
-			return s.HF.OpenFile(context.Background(), body.Repo, body.Revision, path)
+			return s.HF.OpenFile(context.Background(), body.Repo, pinned, path)
 		}})
 	}
 
@@ -775,7 +779,7 @@ func (s *Server) handleImportHF(w http.ResponseWriter, r *http.Request) {
 	s.publishJob(job)
 	go s.runImport(job, func(progress func(int, int)) (*importer.ImportResult, error) {
 		return importer.Import(context.Background(), s.store, sources, importer.ImportOptions{
-			As: ns, HFRepo: body.Repo, HFRevision: revision, Progress: progress,
+			As: ns, HFRepo: body.Repo, HFRevision: pinned, Progress: progress,
 		})
 	})
 	writeJSON(w, http.StatusCreated, job)

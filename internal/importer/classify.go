@@ -84,8 +84,9 @@ func skipRule(name string) (skip bool, license bool) {
 		strings.HasSuffix(lower, ".pyc"),
 		strings.HasPrefix(base, "README"):
 		return true, false
-	case lower == "config.json":
-		return true, false // upstream HF config: quant-chain input, not a manifest entry
+	// config.json deliberately NOT skipped: classify extracts it as the
+	// quant-chain + modelconfig input (001 §8.4). It never becomes a
+	// manifest entry itself — the built modelconfig.json does.
 	case strings.HasPrefix(lower, "license") || strings.HasPrefix(lower, "licence") || lower == "copying":
 		return true, true
 	default:
@@ -133,8 +134,25 @@ var codeFilePatterns = []string{"modeling_", "tokenization_", "configuration_"}
 // classification is a pure function of the (sorted) name set.
 func classify(sources []Source) (*classification, error) {
 	c := &classification{}
-	var tokenizerNames, adapterNames []string
-	adapterTarSources := map[string]Source{}
+	var tokenizerNames, chatFiles []string
+	// B5: one adapter entry per directory-scoped PEFT pair — the old global
+	// tar merged members by base name and silently dropped all but one.
+	type adapterPair struct {
+		dir     string
+		files   []string
+		sources map[string]Source
+	}
+	adapterPairs := map[string]*adapterPair{}
+	adapterAdd := func(name string, src Source) {
+		dir := dirOf(name)
+		ap := adapterPairs[dir]
+		if ap == nil {
+			ap = &adapterPair{dir: dir, sources: map[string]Source{}}
+			adapterPairs[dir] = ap
+		}
+		ap.files = append(ap.files, name)
+		ap.sources[name] = src
+	}
 	for _, src := range sources {
 		name := src.Name
 		base := path.Base(name)
@@ -157,6 +175,12 @@ func classify(sources []Source) (*classification, error) {
 			continue
 		}
 		switch {
+		case strings.Contains(lower, "imatrix") && !strings.HasSuffix(lower, ".gguf"):
+			// §8.3: imatrix is weights.aux; upstream names it e.g.
+			// Qwen3-8B.imatrix — recognized with or without .gguf.
+			c.entries = append(c.entries, entry{name: name, kind: "weights.aux", role: "imatrix", src: src})
+		case strings.HasPrefix(lower, "mmproj") && !strings.HasSuffix(lower, ".gguf"):
+			c.entries = append(c.entries, entry{name: name, kind: "weights.aux", role: "vision-projector", src: src})
 		case strings.HasSuffix(lower, ".gguf"):
 			kind, role := "weights.gguf", ""
 			if strings.HasPrefix(lower, "mmproj") {
@@ -175,9 +199,8 @@ func classify(sources []Source) (*classification, error) {
 			}
 		case strings.HasSuffix(lower, ".safetensors"):
 			if base == "adapter_model.safetensors" {
-				adapterNames = append(adapterNames, name)
-				adapterTarSources[name] = src
-				continue // becomes part of the PEFT adapter tar
+				adapterAdd(name, src)
+				continue // becomes part of the directory-scoped PEFT adapter tar
 			}
 			stamm, part := splitSafetensors(base)
 			c.entries = append(c.entries, entry{
@@ -187,10 +210,9 @@ func classify(sources []Source) (*classification, error) {
 		case base == "model.safetensors.index.json":
 			c.entries = append(c.entries, entry{name: name, kind: "weights.aux", role: "weights-index", src: src})
 		case base == "adapter_config.json":
-			adapterTarSources[name] = src
-			adapterNames = append(adapterNames, name)
+			adapterAdd(name, src)
 		case base == "chat_template.jinja" || base == "chat_template.json" || base == "chat_template":
-			c.entries = append(c.entries, entry{name: name, kind: "chat-template", src: src})
+			chatFiles = append(chatFiles, name)
 		case tokenizerSetMember(name):
 			tokenizerNames = append(tokenizerNames, name)
 		case strings.HasSuffix(lower, ".py"):
@@ -220,22 +242,73 @@ func classify(sources []Source) (*classification, error) {
 		sort.Strings(tokenizerNames)
 		c.entries = append(c.entries, entry{name: "tokenizer.tar", kind: "tokenizer", tokenizer: tokenizerNames})
 	}
-	if len(adapterNames) > 0 {
-		pair := false
-		for _, n := range adapterNames {
-			if path.Base(n) == "adapter_model.safetensors" {
-				pair = true
+	// chat-template is 0..1 (001 §3.1); dual-template repos are the common
+	// HF migration shape — keep the .jinja (richer), skip + warn the rest.
+	if len(chatFiles) > 1 {
+		sort.Strings(chatFiles)
+		kept := ""
+		for _, n := range chatFiles {
+			if path.Base(n) == "chat_template.jinja" {
+				kept = n
 			}
 		}
-		if !pair {
-			c.warnings = append(c.warnings, "adapter_config.json without adapter_model.safetensors: skipped")
-			c.skipped += len(adapterNames)
-		} else {
-			sort.Strings(adapterNames)
-			c.entries = append(c.entries, entry{name: "adapter.tar", kind: "adapter", adapterFiles: adapterNames, adapterSource: adapterTarSources})
+		if kept == "" {
+			kept = chatFiles[0]
 		}
+		for _, n := range chatFiles {
+			if n != kept {
+				c.skipped++
+				c.warnings = append(c.warnings, "multiple chat templates; kept "+kept+", skipped "+n)
+			}
+		}
+		chatFiles = []string{kept}
+	}
+	for _, n := range chatFiles {
+		c.entries = append(c.entries, entry{name: n, kind: "chat-template",
+			src: sourceByName(sources, n)})
+	}
+	// B5: one adapter tar per directory-scoped pair; tar members are the
+	// pair's two base names (the §3.1 adapter tar is the pair).
+	for _, dir := range sortedKeys(adapterPairs) {
+		ap := adapterPairs[dir]
+		sort.Strings(ap.files)
+		hasModel, hasConfig := false, false
+		for _, n := range ap.files {
+			switch path.Base(n) {
+			case "adapter_model.safetensors":
+				hasModel = true
+			case "adapter_config.json":
+				hasConfig = true
+			}
+		}
+		if !hasModel || !hasConfig {
+			c.skipped += len(ap.files)
+			c.warnings = append(c.warnings, "incomplete PEFT pair in \""+dir+"\": skipped")
+			continue
+		}
+		tarName := "adapter.tar"
+		if dir != "" {
+			tarName = dir + "/adapter.tar"
+		}
+		c.entries = append(c.entries, entry{name: tarName, kind: "adapter", adapterFiles: ap.files, adapterSource: ap.sources})
 	}
 	return c, nil
+}
+
+func dirOf(name string) string {
+	if i := strings.LastIndexByte(name, '/'); i >= 0 {
+		return name[:i]
+	}
+	return ""
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // splitGGUF strips the split suffix, extracts the quant token, and returns
