@@ -259,6 +259,12 @@ func Import(ctx context.Context, store *cas.Store, sources []Source, opts Import
 		if err := putCanonical(store, sealed.DistributionDigest, sealed.DistributionBytes); err != nil {
 			return nil, err
 		}
+		// Swarm binding link (001 §6): the record digest is what fill and
+		// seed flows resolve for this manifest — recorded at import time so
+		// every imported artifact is swarm-ready the moment it exists (004 §3).
+		if err := store.SetDistributionLink(sealed.ManifestDigest, sealed.DistributionDigest); err != nil {
+			return nil, err
+		}
 		bump()
 
 		res.Members = append(res.Members, artifact.IndexMember{

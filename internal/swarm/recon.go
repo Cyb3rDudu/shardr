@@ -24,6 +24,19 @@ import (
 // announced to anyone (Goal: digest world ↔ torrent world binding).
 // ---------------------------------------------------------------------------
 
+// normalizeWebseeds applies BEP 19 directory-torrent semantics: the base
+// URL must end with / (file paths get appended).
+func normalizeWebseeds(urls []string) []string {
+	out := make([]string, len(urls))
+	for i, u := range urls {
+		if !strings.HasSuffix(u, "/") {
+			u += "/"
+		}
+		out[i] = u
+	}
+	return out
+}
+
 // ParseInfohash accepts "btmh:1220<hex>", "sha256:<hex>", bare 64-hex, or
 // a full magnet URI (xt=urn:btmh:…) and returns the 64-hex v2 infohash.
 func ParseInfohash(s string) (string, error) {
@@ -166,6 +179,7 @@ func specFromRecon(r *Recon, layers map[string]string, trackers, webseeds, peerA
 	if len(trackers) > 0 {
 		tr = [][]string{trackers}
 	}
+	webseeds = normalizeWebseeds(webseeds)
 	return &torrent.TorrentSpec{
 		AddTorrentOpts: torrent.AddTorrentOpts{
 			InfoHashV2: v2,
