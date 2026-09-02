@@ -1,6 +1,9 @@
 package artifact
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"testing"
 )
@@ -26,4 +29,26 @@ func TestPartsDuplicateRejected(t *testing.T) {
 	if got := (&ValidationError{Class: ClassValidationParts, Msg: "x"}).Error(); got != "E_VALIDATION_PARTS: x" {
 		t.Fatalf("Error(): %q", got)
 	}
+}
+
+// BuildTorrent must reject a manifest whose pinned bt.merkleRoot does not
+// match the content's computed root — a manifest lying about its own
+// torrent geometry (defense in depth before the infohash gate).
+func TestBuildTorrentRejectsLyingMerkleRoot(t *testing.T) {
+	content := bytes.Repeat([]byte{7}, 1<<20)
+	sum := sha256.Sum256(content)
+	root := MerkleRoot(content)
+	lyingRoot := sha256.Sum256([]byte("not the real root"))
+	files := []File{{
+		Kind: "weights.gguf", Digest: "sha256:" + hex.EncodeToString(sum[:]),
+		Size: int64(len(content)), Name: "big.gguf",
+		BT: BT{MerkleRoot: "sha256:" + hex.EncodeToString(lyingRoot[:])},
+	}}
+	mb := []byte(`{}`)
+	msum := sha256.Sum256(mb)
+	_, _, err := BuildTorrent(files, mb, hex.EncodeToString(msum[:]), func(string) ([]byte, error) { return content, nil })
+	if err == nil || !strings.Contains(err.Error(), "pinned bt.merkleRoot") {
+		t.Fatalf("lying merkle root must be loud: %v", err)
+	}
+	_ = root
 }
