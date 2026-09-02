@@ -4,10 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"sort"
-	"strings"
 
 	jcs "github.com/cyberphone/json-canonicalization/go/src/webpki.org/jsoncanonicalizer"
 )
@@ -90,123 +87,10 @@ func Digest(b []byte) string {
 }
 
 // ---------------------------------------------------------------------------
-// Validation (001 §3.1 + R2 name reservation)
+// Seal: deterministic artifact construction (001 §3, §6, 004 §3)
+// The canonical validation lives in validate.go — the same rule set the
+// spec vectors run against (internal/specvectors).
 // ---------------------------------------------------------------------------
-
-// ValidateFileName enforces canonical artifact-relative names (001 §3.1
-// rule 1, R2): '/'-separated non-empty segments, no '.', '..', no empty
-// segments (covers leading '/', 'a//b', './x'), unique within the caller's
-// set — and the reserved 'manifest' namespace (004 §3 places the manifest
-// blob at manifest/sha256-<hex>): neither 'manifest' itself nor any
-// 'manifest/…' prefix is a legal file name.
-func ValidateFileName(name string) error {
-	if name == "" {
-		return errors.New("empty file name")
-	}
-	if name == "manifest" || strings.HasPrefix(name, "manifest/") {
-		return fmt.Errorf("name %q is reserved (manifest/ torrent tree prefix, 004 §3)", name)
-	}
-	segs := strings.Split(name, "/")
-	for _, s := range segs {
-		if s == "" {
-			return fmt.Errorf("name %q: empty path segment", name)
-		}
-		if s == "." || s == ".." {
-			return fmt.Errorf("name %q: forbidden segment %q", name, s)
-		}
-	}
-	return nil
-}
-
-// ValidateManifest checks the structural invariants of a built manifest:
-// unique valid names, exactly one config, one weights format, contiguous
-// split parts, digest and merkle-root presence on every entry. Returns a
-// loud error naming the violated rule.
-func ValidateManifest(m *Manifest) error {
-	if m.SchemaVersion != 1 || m.ArtifactType != "model" {
-		return fmt.Errorf("manifest: schemaVersion/artifactType must be 1/model")
-	}
-	seen := map[string]bool{}
-	weightsFormat := ""
-	parts := map[string][]int64{}
-	nConfig, nTokenizer, nChat := 0, 0, 0
-	// A name that is a path PREFIX of another name would corrupt the BEP 52
-	// file tree (file/dir collision at one path) — reject loudly instead of
-	// building a torrent no client accepts (or panicking in insertFileTree).
-	byName := map[string]File{}
-	for _, f := range m.Files {
-		byName[f.Name] = f
-	}
-	for _, f := range m.Files {
-		if err := ValidateFileName(f.Name); err != nil {
-			return err
-		}
-		if seen[f.Name] {
-			return fmt.Errorf("duplicate file name %q", f.Name)
-		}
-		seen[f.Name] = true
-		if f.Digest == "" || f.Size < 0 || f.BT.MerkleRoot == "" {
-			return fmt.Errorf("file %q: digest, size, and bt.merkleRoot are required", f.Name)
-		}
-		switch f.Kind {
-		case "config":
-			nConfig++
-		case "weights.gguf":
-			if weightsFormat != "" && weightsFormat != "gguf" {
-				return errors.New("one weights format per artifact (gguf+safetensors mixed)")
-			}
-			weightsFormat = "gguf"
-			if f.Part != nil {
-				parts["gguf"] = append(parts["gguf"], *f.Part)
-			}
-		case "weights.safetensors":
-			if weightsFormat != "" && weightsFormat != "safetensors" {
-				return errors.New("one weights format per artifact (gguf+safetensors mixed)")
-			}
-			weightsFormat = "safetensors"
-			if f.Part != nil {
-				parts["st"] = append(parts["st"], *f.Part)
-			}
-		case "tokenizer":
-			nTokenizer++
-		case "chat-template":
-			nChat++
-		case "weights.aux", "adapter", "runtime-config", "code":
-			// cardinality 0..n
-		default:
-			return fmt.Errorf("file %q: unknown kind %q", f.Name, f.Kind)
-		}
-	}
-	if nConfig != 1 {
-		return fmt.Errorf("manifest requires exactly one config, got %d", nConfig)
-	}
-	if weightsFormat == "" {
-		return errors.New("manifest requires at least one weights file (001 §8.1)")
-	}
-	if nTokenizer > 1 || nChat > 1 {
-		return fmt.Errorf("tokenizer/chat-template are 0..1 (got %d/%d)", nTokenizer, nChat)
-	}
-	// Path-prefix collision: "a" and "a/b" cannot coexist in the tree.
-	for _, f := range m.Files {
-		segs := strings.Split(f.Name, "/")
-		for i := 1; i < len(segs); i++ {
-			if _, ok := byName[strings.Join(segs[:i], "/")]; ok {
-				return fmt.Errorf("name %q collides with directory path %q (BEP 52 file tree)", f.Name, strings.Join(segs[:i], "/"))
-			}
-		}
-	}
-	// Split parts must be contiguous 1..n.
-	for _, ps := range parts {
-		if len(ps) == 0 {
-			continue
-		}
-		sort.Slice(ps, func(i, j int) bool { return ps[i] < ps[j] })
-		if ps[0] != 1 || ps[len(ps)-1] != int64(len(ps)) {
-			return fmt.Errorf("split parts must be contiguous 1..n, got %v", ps)
-		}
-	}
-	return nil
-}
 
 // SortFiles orders entries into the canonical deterministic order
 // (001 §3.1 rule 4): config, weights (by part, then digest), weights.aux

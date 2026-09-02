@@ -280,4 +280,9 @@ func contains(s, sub string) bool { return strings.Contains(s, sub) }
 
 // validateArtifactName is the importer-facing alias of the artifact rule
 // (001 §3.1 rule 1 + R2 reservation).
-func validateArtifactName(name string) error { return artifact.ValidateFileName(name) }
+func validateArtifactName(name string) error {
+	if verr := artifact.ValidateFileName(name); verr != nil {
+		return verr // avoid the typed-nil-in-interface trap
+	}
+	return nil
+}

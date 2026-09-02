@@ -240,12 +240,12 @@ func TestSuite001CanonicalizationVectors(t *testing.T) {
 			if err := json.Unmarshal(raw, &doc); err != nil {
 				t.Fatalf("input is not valid JSON: %v", err)
 			}
-			_, verr := validateArtifact(doc)
+			_, verr := validateArtifact(raw)
 			if !vBool(expect, "ok") {
 				if verr == nil {
 					t.Fatalf("expected validation error %s, document validated", vString(expect, "errorClass"))
 				}
-				assertErrorClass(t, expect, verr.class, nil)
+				assertErrorClass(t, expect, verr.Class, nil)
 				return
 			}
 			if verr != nil {
