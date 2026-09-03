@@ -79,7 +79,7 @@ func TestLoadSwarmConfigBadValue(t *testing.T) {
 }
 
 // The seed knobs map onto the engine config (DoD: [swarm] seed=false /
-// upload_limit respektiert — the mapping test; behavior is covered by the
+// upload_limit respected — the mapping test; behavior is covered by the
 // swarm package tests).
 func TestSeedKnobsMapToEngineConfig(t *testing.T) {
 	writeConfig(t, "[swarm]\nseed = false\nupload_limit = 512\n")

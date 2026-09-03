@@ -72,16 +72,15 @@ var (
 
 // Recon is a reconstructed torrent identity from a manifest alone.
 type Recon struct {
-	InfohashHex     string // 64 hex chars
-	InfohashBtmh    string // btmh:1220<hex>
-	InfoBencode     []byte
-	PieceLength     int64
-	TotalSize       int64
-	Name            string
-	ManifestDigest  string // sha256:<hex>
-	ManifestHex     string
-	FileSpecs       map[string]FileSpec // torrent path → CAS spec
-	ManifestTorrent bool
+	InfohashHex    string // 64 hex chars
+	InfohashBtmh   string // btmh:1220<hex>
+	InfoBencode    []byte
+	PieceLength    int64
+	TotalSize      int64
+	Name           string
+	ManifestDigest string // sha256:<hex>
+	ManifestHex    string
+	FileSpecs      map[string]FileSpec // torrent path → CAS spec
 }
 
 // Reconstruct derives the torrent identity from a manifest (001 §7.4:
@@ -141,33 +140,12 @@ func LayersFromBlob(blob []byte) (map[string]string, error) {
 	return layers, nil
 }
 
-// torrentSpecFromMetaInfo builds the TorrentSpec for a pure-v2 torrent.
-// NOTE: v1.61.0 released panics on pure-v2 specs (issue #1089) — this
-// build pins upstream master 4ad31c5 which fixed it; the helper exists so
-// the v2-only spec shape is constructed in exactly one place.
-func torrentSpecFromMetaInfo(mi *metainfo.MetaInfo) (*torrent.TorrentSpec, error) {
-	info, err := mi.UnmarshalInfo()
-	if err != nil {
-		return nil, fmt.Errorf("swarm: unmarshal info: %w", err)
-	}
-	if info.HasV1() {
-		return nil, fmt.Errorf("swarm: torrent carries v1 fields; shardr torrents are pure BTv2 (004 §3)")
-	}
-	var v2 g.Option[infohash_v2.T]
-	v2.Set(infohash_v2.HashBytes(mi.InfoBytes))
-	return &torrent.TorrentSpec{
-		AddTorrentOpts: torrent.AddTorrentOpts{
-			InfoHashV2: v2,
-			InfoBytes:  mi.InfoBytes,
-		},
-		PieceLayers: mi.PieceLayers,
-		DisplayName: info.BestName(),
-	}, nil
-}
-
-// specFromRecon builds a TorrentSpec from a reconstruction plus acquired
-// piece layers. peers are trusted direct-injection addresses (tests,
-// source-hint x.pe equivalents).
+// specFromRecon builds a TorrentSpec from a reconstruction. Piece
+// layers are embedded: anacrolix applies them BEFORE onSetInfo computes
+// pending state — hashless v2 multi-piece pieces would diverge pending vs
+// request-order and trip an assertion (see Completion's engine-verified
+// semantics for the other half of this contract). peers are trusted
+// direct-injection addresses (tests, source-hint x.pe equivalents).
 func specFromRecon(r *Recon, layers map[string]string, trackers, webseeds, peerAddrs []string) (*torrent.TorrentSpec, error) {
 	var v2 g.Option[infohash_v2.T]
 	var ih infohash_v2.T

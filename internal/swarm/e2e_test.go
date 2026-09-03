@@ -7,9 +7,15 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	g "github.com/anacrolix/generics"
+	"github.com/anacrolix/torrent"
+	"github.com/anacrolix/torrent/bencode"
+	infohash_v2 "github.com/anacrolix/torrent/types/infohash-v2"
 
 	"github.com/Cyb3rDudu/shardr/internal/artifact"
 	"github.com/Cyb3rDudu/shardr/internal/importer"
@@ -50,10 +56,50 @@ func newNode(t *testing.T, name string, seed bool) *e2eNode {
 	return &e2eNode{t: t, name: name, root: root, client: c}
 }
 
-// importLocal runs a real local import (001 §8.6) of the fixture repo.
+// importLocal runs a real local import (001 §8.6) of the fixture repo,
+// EXTENDED with one generated multi-piece weights shard: the gold toy
+// shards are copied into a temp dir renamed to a 3-part family (originals
+// untouched) and toy-00003 is generated at 2.5 MiB (> piece length, so
+// the torrent has real piece layers and the E2E victim is a genuine
+// multi-piece swarm download). A second weights family under its own
+// name is not importable in one member (001 §3.1: split parts merge per
+// format; separate families would collide on the derived quant).
 func (n *e2eNode) importLocal() *importer.ImportResult {
 	n.t.Helper()
-	sources, err := importer.LocalSources([]string{"../../internal/importer/testdata/gold"})
+	root := n.t.TempDir()
+	gold := "../../internal/importer/testdata/gold"
+	entries, err := os.ReadDir(gold)
+	if err != nil {
+		n.t.Fatalf("%s: read gold fixture: %v", n.name, err)
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(gold, e.Name()))
+		if err != nil {
+			n.t.Fatalf("%s: copy fixture %s: %v", n.name, e.Name(), err)
+		}
+		name := e.Name()
+		// Grow the toy family to 3 parts: the generated multi-piece shard.
+		switch name {
+		case "toy-00001-of-00002.gguf":
+			name = "toy-00001-of-00003.gguf"
+		case "toy-00002-of-00002.gguf":
+			name = "toy-00002-of-00003.gguf"
+		}
+		if err := os.WriteFile(filepath.Join(root, name), data, 0o644); err != nil {
+			n.t.Fatalf("%s: write fixture %s: %v", n.name, name, err)
+		}
+	}
+	big := make([]byte, 5*512*1024) // 2.5 MiB deterministic
+	for i := range big {
+		big[i] = byte(i*31 + 7)
+	}
+	if err := os.WriteFile(filepath.Join(root, "toy-00003-of-00003.gguf"), big, 0o644); err != nil {
+		n.t.Fatalf("%s: write big shard: %v", n.name, err)
+	}
+	sources, err := importer.LocalSources([]string{root})
 	if err != nil {
 		n.t.Fatalf("%s: local sources: %v", n.name, err)
 	}
@@ -198,13 +244,21 @@ func TestTwoInstanceE2E(t *testing.T) {
 		t.Fatal("piece-layers blob differs between A and B")
 	}
 
-	// --- Phase 2 (ensure path): B loses a weights blob, refills from A. ---
+	// --- Phase 2 (ensure path): B loses a multi-piece weights blob, refills from A. ---
 	var victim string
 	var victimDigest string
 	for path, spec := range recon.FileSpecs {
-		if strings.HasSuffix(path, ".gguf") || strings.HasSuffix(path, ".safetensors") {
+		if (strings.HasSuffix(path, ".gguf") || strings.HasSuffix(path, ".safetensors")) && spec.Size > 1<<20 {
 			victim, victimDigest = path, spec.Digest
 			break
+		}
+	}
+	if victim == "" { // fall back to any weights file
+		for path, spec := range recon.FileSpecs {
+			if strings.HasSuffix(path, ".gguf") || strings.HasSuffix(path, ".safetensors") {
+				victim, victimDigest = path, spec.Digest
+				break
+			}
 		}
 	}
 	if victim == "" {
@@ -253,15 +307,12 @@ func TestImportBTInfohashBindingAbortsBeforeAnnounce(t *testing.T) {
 	manifestDigest := res.Members[0].Manifest
 	recon := a.seedArtifact(manifestDigest)
 
-	b := newNode(t, "B2", true)
-	// Evil torrent identity: flip one hex char of the true infohash. The
-	// manifest pin is real, so phase 1 would fetch the manifest from the
-	// webseed (it's not in the fake torrent tree — but the layers fetch
-	// also needs the webseed). To isolate the GATE, call the gate pieces
-	// directly: reconstruct + CheckRecord against a lying record.
-	evil := "btmh:1220" + string([]byte(recon.InfohashHex)[:63]) + flipHex(recon.InfohashHex[63])
-	manifestBytes, _ := readBlob(b.client.store, artifact.DigestHex(manifestDigest))
-	_ = manifestBytes // B doesn't have it; use A's bytes for derivation
+	// evil infohash: flip one hex char of the true infohash. The manifest
+	// pin is real, so phase 1 would fetch the manifest from the webseed
+	// (it's not in the fake torrent tree — but the layers fetch also needs
+	// the webseed). To isolate the GATE, call the gate pieces directly:
+	// reconstruct + CheckRecord against a lying record.
+	evil := "btmh:1220" + recon.InfohashHex[:63] + flipHex(recon.InfohashHex[63])
 	mb, err := readBlob(a.client.store, artifact.DigestHex(manifestDigest))
 	if err != nil {
 		t.Fatal(err)
@@ -300,7 +351,7 @@ func TestImportBTInfohashBindingAbortsBeforeAnnounce(t *testing.T) {
 // pin-valid (the real manifest file at manifestKey + the real content
 // files) but which carries an EXTRA file. All verify-writes would pass —
 // only the derived-infohash gate catches the identity lie and aborts.
-// Mutationssicherung partner of the import-binding-gate mutation.
+// Mutation-testing partner of the import-binding-gate mutation.
 func TestImportBTExtraFileTorrentOnlyBindingCatches(t *testing.T) {
 	if testing.Short() {
 		t.Skip("E2E spins real swarm engines")
@@ -378,18 +429,14 @@ func (n *e2eNode) serveExtraFileVariant(manifestDigest string) (string, error) {
 	if err := n.client.casSt.Register(ihRaw, specs); err != nil {
 		return "", err
 	}
-	if err := n.client.scratchPutEvil(afs, files, mb); err != nil {
+	if err := n.client.scratchPutEvil(afs, files); err != nil {
 		return "", err
 	}
 	infoB, _, err := artifact.BuildTorrentFromManifest(afs, mb, hex.EncodeToString(manifestSum[:]))
 	if err != nil {
 		return "", err
 	}
-	evSpec, err := specWithInfohash(res.Infohash, infoB, layers)
-	if err != nil {
-		return "", err
-	}
-	if _, _, err := n.client.tc.AddTorrentSpec(evSpec); err != nil {
+	if err := n.addEvilTorrent(res, infoB, layers); err != nil {
 		return "", err
 	}
 	return res.Infohash, nil
@@ -498,20 +545,16 @@ func (n *e2eNode) serveEvilVariant(manifestDigest string) (string, error) {
 	// and add it to the engine so peers find *a* torrent — but under the
 	// evil infohash, so the pin can never bind.
 	ihRaw := strings.TrimPrefix(res.Infohash, "btmh:1220")
-	evSpec, err := specWithInfohash(res.Infohash, infoB, layers)
-	if err != nil {
-		return "", err
-	}
 	if err := n.client.casSt.Register(ihRaw, evilFileSpecs(afs, hex.EncodeToString(manifestSum[:]), mb)); err != nil {
 		return "", err
 	}
 	// Evil blobs need to live somewhere the driver can read: a scratch CAS
 	// would be cleaner, but the driver refuses unknown digests only per
 	// infohash — the evil registration is self-consistent.
-	if err := n.client.scratchPutEvil(afs, files, mb); err != nil {
+	if err := n.client.scratchPutEvil(afs, files); err != nil {
 		return "", err
 	}
-	if _, _, err := n.client.tc.AddTorrentSpec(evSpec); err != nil {
+	if err := n.addEvilTorrent(res, infoB, layers); err != nil {
 		return "", err
 	}
 	return res.Infohash, nil
@@ -533,6 +576,60 @@ func flipHex(c byte) string {
 	return "0"
 }
 
+// --- test-only helpers moved out of helpers.go (production files carry
+// production code only) ---
+
+// bencodeLayersInto decodes a layers blob into an existing map.
+func bencodeLayersInto(blob []byte, into map[string]string) error {
+	return bencode.Unmarshal(blob, &into)
+}
+
+// specWithInfohash builds a TorrentSpec carrying explicit infohash bytes
+// (layers applied post-GotInfo via AddPieceLayers — see specFromRecon).
+func specWithInfohash(btmh string, infoBencode []byte, layers map[string]string) (*torrent.TorrentSpec, error) {
+	var ih [32]byte
+	raw := strings.TrimPrefix(btmh, "btmh:1220")
+	if _, err := hex.Decode(ih[:], []byte(raw)); err != nil {
+		return nil, err
+	}
+	var o g.Option[infohash_v2.T]
+	o.Set(ih)
+	return &torrent.TorrentSpec{
+		AddTorrentOpts: torrent.AddTorrentOpts{InfoHashV2: o, InfoBytes: infoBencode},
+		// Layers embedded, same as production specFromRecon: an infohash-only
+		// or layerless add leaves multi-piece v2 pieces hashless at onSetInfo
+		// (pending vs request-order divergence — panics on anacrolix master).
+		PieceLayers: layers,
+	}, nil
+}
+
+// addEvilTorrent adds a test variant torrent (layers-in-spec, like
+// production).
+func (n *e2eNode) addEvilTorrent(res artifact.TorrentResult, infoB []byte, layers map[string]string) error {
+	evSpec, err := specWithInfohash(res.Infohash, infoB, layers)
+	if err != nil {
+		return err
+	}
+	t, _, err := n.client.tc.AddTorrentSpec(evSpec)
+	if err != nil {
+		return err
+	}
+	<-t.GotInfo()
+	return nil
+}
+
+// scratchPutEvil stores variant content under its TRUE digests (content
+// addressing is digest-honest even for adversarial torrents — the CAS is
+// a blob store, not a truth authority; the pin is).
+func (c *Client) scratchPutEvil(afs []artifact.File, files map[string][]byte) error {
+	for _, f := range afs {
+		if err := c.store.Put(artifact.DigestHex(f.Digest), strings.NewReader(string(files[f.Name]))); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // dumpTorrent prints live state of one torrent in the engine (test-only).
 func (c *Client) dumpTorrent(shortKey string) {
 	for _, t := range c.tc.Torrents() {
@@ -547,15 +644,20 @@ func (c *Client) dumpTorrent(shortKey string) {
 		st := t.Stats()
 		var pieces string
 		for _, run := range t.PieceStateRuns() {
-			if run.Complete {
-				pieces += "C"
-			} else if run.Partial {
-				pieces += "p"
-			} else if run.Priority == 0 {
-				pieces += "."
-			} else {
-				pieces += "W"
+			ch := "."
+			switch {
+			case run.Complete:
+				ch = "C"
+			case run.Hashing || run.QueuedForHash || run.Marking || run.Checking:
+				ch = "H"
+			case run.Partial:
+				ch = "p"
+			case run.Priority == 0:
+				ch = "."
+			default:
+				ch = "W"
 			}
+			pieces += fmt.Sprintf("%s%d", ch, run.Length)
 		}
 		fmt.Fprintf(os.Stderr, "[dump %p] name=%s peers=%d conns=%d readUseful=%d pieces=%s\n",
 			c, info.BestName(), st.TotalPeers, st.ActivePeers, st.BytesReadUsefulData.Int64(), pieces)

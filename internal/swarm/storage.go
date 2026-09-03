@@ -17,6 +17,7 @@ import (
 	"sync"
 
 	g "github.com/anacrolix/generics"
+	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
 	"github.com/anacrolix/torrent/storage"
 
@@ -145,14 +146,6 @@ func normalizeKey(v2InfohashHex string) string {
 	return v2InfohashHex
 }
 
-// openDriver runs the storage OpenTorrent path for a spec-supplied info
-// (tests, phase-2 pre-open).
-func (c *CASStorage) openDriver(info *metainfo.Info, shortKey string) (*casTorrent, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return newCASTorrent(c, shortKey, info, c.registry[shortKey])
-}
-
 // casTorrent is the per-torrent driver instance.
 type casTorrent struct {
 	parent *CASStorage
@@ -175,6 +168,8 @@ type fileSpan struct {
 
 // fileState is the download/seal state of one file.
 type fileState struct {
+	name string // torrent-relative path (never empty; used in errors)
+
 	spec     FileSpec
 	partPath string
 
@@ -215,9 +210,23 @@ func newCASTorrent(parent *CASStorage, key string, info *metainfo.Info, files ma
 		t.spans = append(t.spans, fileSpan{path: path, begin: begin, end: begin + n})
 
 		spec, ok := files[path]
-		st := &fileState{spec: spec, numDone: 0}
+		st := &fileState{name: path, spec: spec, numDone: 0}
 		if ok && parent.store != nil && parent.store.Has(spec.Digest) {
 			st.sealed = true // CAS hit: seed-side, no part needed
+			st.pieces = make([]bool, n)
+			if n == 1 {
+				// Single-piece files have no piece layer, so no pre-info
+				// setV2Hash completion pull: their first pull is at onSetInfo,
+				// after the piece request order exists. A CAS hit can be
+				// complete immediately — it also keeps sub-chunk files (the
+				// 1.4 KB manifest) out of the webseed planner, which panics
+				// on padding chunks of pending short pieces (anacrolix master).
+				st.pieces[0] = true
+				st.numDone = 1
+			} else {
+				// Multi-piece files are verified piece-by-piece by engine
+				// checks (see Completion).
+			}
 		} else if ok {
 			st.pieces = make([]bool, n)
 		} else {
@@ -283,6 +292,33 @@ func (t *casTorrent) SealedCount() int {
 	return n
 }
 
+// VerifyPresent drives anacrolix piece checks over every sealed
+// multi-piece file (single-piece CAS hits are complete on their first
+// pull at onSetInfo; multi-piece ones report incomplete until the engine
+// itself hashes the blob — see Completion). A piece that fails its check
+// means the sealed blob no longer matches the info dict's merkle root:
+// corruption, loud.
+func (t *casTorrent) VerifyPresent(ctx context.Context, tr *torrent.Torrent) error {
+	for _, s := range t.spans {
+		t.mu.Lock()
+		st := t.files[s.path]
+		sealed, multi := st != nil && st.sealed, s.end-s.begin > 1
+		t.mu.Unlock()
+		if !sealed || !multi {
+			continue
+		}
+		for i := s.begin; i < s.end; i++ {
+			if err := tr.Piece(i).VerifyDataContext(ctx); err != nil {
+				return fmt.Errorf("swarm: verify present piece %d of %q: %w", i, s.path, err)
+			}
+			if !tr.Piece(i).State().Complete {
+				return fmt.Errorf("swarm: sealed blob for %q fails its piece check at piece %d (blob corrupt or layers mismatch)", s.path, i)
+			}
+		}
+	}
+	return nil
+}
+
 // WaitSealed blocks until n files are sealed, the driver closes, or any
 // file fails its verify-write. Returns the failure if one occurred.
 func (t *casTorrent) WaitSealed(ctx context.Context, n int) error {
@@ -336,16 +372,10 @@ type casPiece struct {
 	local int
 }
 
-func (p *casPiece) bounds() (off int64, length int64) {
-	off = int64(p.local) * p.t.info.PieceLength
-	length = p.t.info.PieceLength
-	if rem := p.st.spec.Size - off; rem < length {
-		length = rem
-	}
-	return
-}
-
 func (p *casPiece) ReadAt(b []byte, off int64) (int, error) {
+	// anacrolix passes PIECE-relative offsets (writeChunk sends msg.Begin,
+	// the offset within the piece) — translate to the file offset.
+	off += int64(p.local) * p.t.info.PieceLength
 	p.t.mu.Lock()
 	sealed, part, blob := p.st.sealed, p.st.part, p.st.spec.Digest
 	p.t.mu.Unlock()
@@ -358,12 +388,15 @@ func (p *casPiece) ReadAt(b []byte, off int64) (int, error) {
 		return f.ReadAt(b, off)
 	}
 	if part == nil {
-		return 0, fmt.Errorf("swarm: read of unstarted piece (file %s not downloading)", p.st.spec.Digest)
+		return 0, fmt.Errorf("swarm: read of unstarted piece in file %q (not downloading)", p.st.name)
 	}
 	return part.ReadAt(b, off)
 }
 
 func (p *casPiece) WriteAt(b []byte, off int64) (int, error) {
+	// anacrolix passes PIECE-relative offsets — translate to the file
+	// offset (same contract as ReadAt above).
+	off += int64(p.local) * p.t.info.PieceLength
 	p.t.mu.Lock()
 	defer p.t.mu.Unlock()
 	if p.st.sealed {
@@ -395,10 +428,28 @@ func (p *casPiece) MarkComplete() error {
 	p.t.mu.Lock()
 	defer p.t.mu.Unlock()
 	if p.st.sealed {
-		return nil // idempotent (resume/seal races)
+		// Pre-sealed (CAS hit): an engine piece check hashed the blob and
+		// it matched. Record the verification so Completion flips only
+		// after the engine confirmed every piece (see Completion for why
+		// the CAS hit alone must not count as complete).
+		if !p.st.pieces[p.local] {
+			p.st.pieces[p.local] = true
+			p.st.numDone++
+			if p.st.numDone == len(p.st.pieces) {
+				p.t.parent.verified.MarkVerified(p.st.spec.Digest)
+			}
+			p.t.doneCond.Broadcast()
+		}
+		return nil
 	}
 	if p.st.failed != nil {
 		return p.st.failed
+	}
+	if p.st.pieces == nil {
+		// Defensive: pieces is nil only for unpinned files (digest ""),
+		// which Completion already reports unknown — completion must be
+		// tracked nowhere else.
+		return fmt.Errorf("swarm: piece completion for file %q tracked nowhere (unpinned state)", p.st.name)
 	}
 	if !p.st.pieces[p.local] {
 		p.st.pieces[p.local] = true
@@ -446,7 +497,15 @@ func (p *casPiece) MarkNotComplete() error {
 	p.t.mu.Lock()
 	defer p.t.mu.Unlock()
 	if p.st.sealed {
-		return nil // sealed files never un-seal
+		// Sealed never un-seals, but a failed engine piece check means the
+		// blob no longer matches the merkle root: retract the piece so it
+		// is not announced. The file stays sealed locally; the fill-side
+		// verify (003 §4) is the loud gate for operator visibility.
+		if p.st.pieces != nil && p.st.pieces[p.local] {
+			p.st.pieces[p.local] = false
+			p.st.numDone--
+		}
+		return nil
 	}
 	if p.st.pieces != nil && p.st.pieces[p.local] {
 		p.st.pieces[p.local] = false
@@ -464,7 +523,14 @@ func (p *casPiece) Completion() storage.Completion {
 	if p.st.failed != nil {
 		return storage.Completion{Ok: true, Complete: false, Err: p.st.failed}
 	}
-	return storage.Completion{Ok: true, Complete: p.st.sealed}
+	// Complete is per-piece truth: pieces[local] is set only by the engine
+	// itself (piece receipt for downloads, piece check for CAS hits) —
+	// never trust a CAS hit without the engine hashing it (003 §4), and
+	// never report a verified piece incomplete again (a concurrent
+	// completion re-pull would retract it and restart the download).
+	// Reporting Ok=true also keeps queueInitialPieceCheck away: verification
+	// of present files is driven explicitly via VerifyPresent.
+	return storage.Completion{Ok: true, Complete: p.st.pieces != nil && p.st.pieces[p.local]}
 }
 
 // newPart creates the incoming part for a downloading file (reuses the

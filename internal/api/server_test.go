@@ -367,14 +367,7 @@ func TestEnsureLocalPresence(t *testing.T) {
 
 	// One file blob removed → ensure fails loudly: files missing, swarm
 	// disabled in this build/config ([swarm] enabled names the knob).
-	mres, mbody := h.get("/v1/resolve?ref=" + url.QueryEscape("shardr:///gold/repo:"+lres.Members[0].Quant))
-	if mres != http.StatusOK {
-		t.Fatalf("resolve: %d %s", mres, mbody)
-	}
-	var rr resolveResult
-	json.Unmarshal(mbody, &rr)
-	// rr.Files requires the manifest-parse path; use the missing list via
-	// ensure directly instead: delete one blob named in the job's manifest.
+	// The victim comes from the job's manifest blob read below.
 	var mf struct {
 		Files []struct {
 			Digest string `json:"digest"`

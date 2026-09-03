@@ -106,7 +106,14 @@ func (c *Client) Fill(ctx context.Context, m *artifact.Manifest, manifestBytes [
 	}
 
 	c.casSt.Register(recon.InfohashHex, recon.FileSpecs)
-	spec, err := specFromRecon(recon, layers, hints.Trackers, hints.Webseeds, hints.Peers)
+	// No webseeds in the torrent spec (deliberate): anacrolix master's
+	// webseed download planner panics on the padding chunks of v2
+	// sub-chunk-aligned pieces (chunkIndexSpec: chunk offset ≥ short piece
+	// length — every shardr torrent has padding, e.g. the ~1.4 KB
+	// manifest). Our own HTTP fetches (manifest, layers) still use the
+	// webseed hints directly; bulk data flows over the peer protocol.
+	// Revisit when upstream fixes the planner.
+	spec, err := specFromRecon(recon, layers, hints.Trackers, nil, hints.Peers)
 	if err != nil {
 		return err
 	}
@@ -115,11 +122,17 @@ func (c *Client) Fill(ctx context.Context, m *artifact.Manifest, manifestBytes [
 		return err
 	}
 	<-t.GotInfo()
-	setFillPriorities(t, m, recon)
+	setFillPriorities(t, recon)
 
 	drv := c.casSt.driverFor(recon.InfohashHex)
 	if drv == nil {
 		return fmt.Errorf("swarm: fill: driver not open for %s", recon.InfohashHex)
+	}
+	// Present multi-piece files must pass engine piece checks before they
+	// count as complete in the swarm (and before peers rely on them).
+	if err := drv.VerifyPresent(ctx, t); err != nil {
+		dropTorrent(t)
+		return err
 	}
 	// Target is TOTAL sealed files: present files count from the start, so
 	// a partially-present artifact cannot satisfy the wait early.
@@ -141,10 +154,10 @@ func (c *Client) Fill(ctx context.Context, m *artifact.Manifest, manifestBytes [
 		}()
 	}
 	if err := drv.WaitSealed(ctx, target); err != nil {
-		t.Drop()
+		dropTorrent(t)
 		return err
 	}
-	t.Drop()
+	dropTorrent(t)
 
 	// Usage = replication (004 §5): a filled artifact seeds.
 	if c.cfg.Seed {
@@ -157,7 +170,7 @@ func (c *Client) Fill(ctx context.Context, m *artifact.Manifest, manifestBytes [
 // everything missing. Present files are already complete in the driver —
 // no bytes are re-fetched. anacrolix File.Path() includes the torrent
 // name prefix; suffix-match the torrent-relative keys.
-func setFillPriorities(t *torrent.Torrent, m *artifact.Manifest, recon *Recon) {
+func setFillPriorities(t *torrent.Torrent, recon *Recon) {
 	manifestKey := "manifest/sha256-" + recon.ManifestHex
 	for _, f := range t.Files() {
 		path := f.Path()
@@ -168,17 +181,6 @@ func setFillPriorities(t *torrent.Torrent, m *artifact.Manifest, recon *Recon) {
 			f.SetPriority(torrent.PiecePriorityNormal)
 		}
 	}
-	_ = m
-}
-
-func countPresent(store *cas.Store, r *Recon) int {
-	n := 0
-	for _, spec := range r.FileSpecs {
-		if store.Has(spec.Digest) {
-			n++
-		}
-	}
-	return n
 }
 
 // ---------------------------------------------------------------------------
@@ -207,67 +209,30 @@ func (c *Client) ImportBT(ctx context.Context, magnetOrInfohash, manifestDigest 
 	if err != nil {
 		return nil, err
 	}
-	manifestKey := "manifest/sha256-" + pinHex
 
-	// ---- Phase 1: join, get metadata + layers + manifest file ----
+	// ---- Phase 1: acquire the manifest via the webseed BEP 19 file path
+	// and pin-check it. No torrent is joined for this: the identity is
+	// untrusted until the pin is satisfied, and an infohash-only join has
+	// a metadata window where v2 multi-piece pieces are hashless
+	// (pending/request-order divergence — anacrolix master 4ad31c5). The
+	// pin is the gate; the torrent joins only in phase 2, with full info
+	// and layers, after the binding check.
 	layers, lerr := c.fetchLayersFromHints(ctx, pinHex, hints)
 	if lerr != nil {
 		return nil, lerr
 	}
-	c.casSt.Register(ihHex, map[string]FileSpec{
-		manifestKey: {Digest: pinHex, Size: -1}, // size fixed at OpenTorrent from the info dict
-	})
-	spec := &torrent.TorrentSpec{
-		AddTorrentOpts: torrent.AddTorrentOpts{ /* infohash only */ },
-		DisplayName:    "shardr-bt-import",
-		Trackers:       tiersOf(hints.Trackers),
-		Webseeds:       normalizeWebseeds(hints.Webseeds),
-		PeerAddrs:      hints.Peers,
-	}
-	var ih infohashOf
-	if err := ih.fromHex(ihHex); err != nil {
+	manifestBytes, err := c.fetchManifestFromHints(ctx, pinHex, hints)
+	if err != nil {
 		return nil, err
 	}
-	spec.InfoHashV2 = ih.opt()
-	t1, _, err := c.tc.AddTorrentSpec(spec)
-	if err != nil {
-		return nil, fmt.Errorf("swarm: import: join torrent: %w", err)
+	if got := artifact.Digest(manifestBytes); got != "sha256:"+pinHex {
+		return nil, fmt.Errorf("swarm: import: manifest pin mismatch — every source served bytes hashing to %s, pin is sha256:%s (evil or wrong artifact; refusing)", got, pinHex)
 	}
-	select {
-	case <-t1.GotInfo():
-	case <-ctx.Done():
-		dropTorrent(t1)
-		return nil, ctx.Err()
+	if err := c.store.Put(pinHex, strings.NewReader(string(manifestBytes))); err != nil {
+		return nil, fmt.Errorf("swarm: import: store pinned manifest: %w", err)
 	}
-	if errs := t1.AddPieceLayers(layers); len(errs) > 0 {
-		dropTorrent(t1)
-		return nil, fmt.Errorf("swarm: import: piece layers rejected against the info dict's merkle roots: %v (evil or mismatched layers source)", errs)
-	}
-	// Manifest file only: the pin gates it. File.Path() carries the
-	// torrent-name prefix — suffix-match.
-	for _, f := range t1.Files() {
-		if strings.HasSuffix(f.Path(), manifestKey) {
-			f.SetPriority(torrent.PiecePriorityNow)
-		} else {
-			f.SetPriority(torrent.PiecePriorityNone)
-		}
-	}
-	drv1 := c.casSt.driverFor(ihHex)
-	if drv1 == nil {
-		dropTorrent(t1)
-		return nil, fmt.Errorf("swarm: import: phase-1 driver missing")
-	}
-	if err := drv1.WaitSealed(ctx, 1); err != nil {
-		dropTorrent(t1)
-		return nil, fmt.Errorf("swarm: import: manifest acquisition failed: %w (the pin was never satisfied)", err)
-	}
-	dropTorrent(t1) // phase 1 done: manifest sealed under the pin digest
 
 	// ---- Phase 2: identity from the manifest, binding, full fetch ----
-	manifestBytes, err := readBlob(c.store, pinHex)
-	if err != nil {
-		return nil, err
-	}
 	var m artifact.Manifest
 	if err := unmarshalJSON(manifestBytes, &m); err != nil {
 		return nil, fmt.Errorf("swarm: import: parse pinned manifest: %w", err)
@@ -279,8 +244,10 @@ func (c *Client) ImportBT(ctx context.Context, magnetOrInfohash, manifestDigest 
 	if err != nil {
 		return nil, err
 	}
-	// 004 §3 binding gate: the torrent we joined must be the torrent the
-	// manifest describes. Mismatch = loud abort (never a warning).
+	// 004 §3 binding gate: the torrent the caller joined must be the
+	// torrent the manifest describes. Mismatch = loud abort (never a
+	// warning), and it fires BEFORE any swarm join — an unverified
+	// identity never announces itself.
 	if recon.InfohashHex != ihHex {
 		return nil, fmt.Errorf("%w: joined %s but manifest %s reconstructs to %s (torrent world and digest world disagree; aborting)", ErrBinding, ihHex, recon.ManifestDigest, recon.InfohashHex)
 	}
@@ -302,20 +269,27 @@ func (c *Client) ImportBT(ctx context.Context, magnetOrInfohash, manifestDigest 
 	}
 
 	c.casSt.Register(ihHex, recon.FileSpecs) // replace: all files pinned now
-	spec2, err := specFromRecon(recon, layers, hints.Trackers, hints.Webseeds, hints.Peers)
+	// No webseeds in the spec — see Fill for the upstream planner bug.
+	spec2, err := specFromRecon(recon, layers, hints.Trackers, nil, hints.Peers)
 	if err != nil {
 		return nil, err
 	}
-	t2, _, err := c.tc.AddTorrentSpec(spec2)
+	t2, err := c.addFreshTorrent(spec2, ihHex) // drop-waited: no stale driver from phase 1
 	if err != nil {
 		return nil, fmt.Errorf("swarm: import: re-add full torrent: %w", err)
 	}
 	<-t2.GotInfo()
-	setFillPriorities(t2, &m, recon)
+	setFillPriorities(t2, recon)
 	drv2 := c.casSt.driverFor(ihHex)
 	if drv2 == nil {
 		dropTorrent(t2)
 		return nil, fmt.Errorf("swarm: import: phase-2 driver missing")
+	}
+	// The phase-1 manifest blob is a CAS hit; verify it (and any other
+	// present file) through the engine before waiting on the rest.
+	if err := drv2.VerifyPresent(ctx, t2); err != nil {
+		dropTorrent(t2)
+		return nil, err
 	}
 	if err := drv2.WaitSealed(ctx, len(recon.FileSpecs)); err != nil {
 		dropTorrent(t2)
@@ -365,6 +339,28 @@ func (c *Client) fetchLayersFromHints(ctx context.Context, manifestHex string, h
 	return nil, fmt.Errorf("%w: all webseed hints failed: %w", ErrLayersUnavailable, lastErr)
 }
 
+// fetchManifestFromHints pulls the pinned manifest over the webseed
+// BEP 19 file path. The torrent name is a pure function of the pin
+// (shardr-sha256-<hex>), so the URL is derivable without any trusted
+// identity — and the pin re-check on the fetched bytes is the actual gate.
+func (c *Client) fetchManifestFromHints(ctx context.Context, pinHex string, hints Hints) ([]byte, error) {
+	if len(hints.Webseeds) == 0 {
+		return nil, fmt.Errorf("%w: no webseed source hints for the pinned manifest (BEP 19 file path shardr-sha256-%s/manifest/sha256-%s)", ErrLayersUnavailable, pinHex, pinHex)
+	}
+	name := "shardr-sha256-" + pinHex[:12] // torrent name: manifest digest, 12-hex prefix (004 §2)
+	var lastErr error
+	for _, base := range hints.Webseeds {
+		url := strings.TrimRight(base, "/") + "/" + name + "/manifest/sha256-" + pinHex
+		blob, err := httpGet(ctx, url, 1<<20)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return blob, nil
+	}
+	return nil, fmt.Errorf("%w: all webseed hints failed for the pinned manifest: %w", ErrLayersUnavailable, lastErr)
+}
+
 func httpGet(ctx context.Context, url string, limit int64) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -382,7 +378,8 @@ func httpGet(ctx context.Context, url string, limit int64) ([]byte, error) {
 }
 
 // putLayers pins the acquired layers blob into the CAS under its flat
-// digest when the record names it (identity check: derived == acquired).
+// digest (AddPieceLayers already verified it against the info dict's
+// merkle roots at add time — that, not this store, is the integrity gate).
 func putLayers(store *cas.Store, layers map[string]string, recon *Recon) (string, error) {
 	blob, err := bencodeLayers(layers)
 	if err != nil {
