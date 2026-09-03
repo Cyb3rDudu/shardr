@@ -95,6 +95,18 @@ mutate "ensure-swarm-off-loud" internal/api/server.go \
   's/if s.Swarm == nil {/if false \&\& s.Swarm == nil {/g' \
   'TestEnsureLocalPresence|TestImportBTPinMandatory' ./internal/api/
 
+# 11. Layers blob persistence on import success (identity sidecar; the
+# E2E compares the layers blob across nodes).
+mutate "layers-persist" internal/swarm/fill.go \
+  's/if _, err := putLayers(c.store, layers, recon); err != nil {/if _, err := error(nil), error(nil); err != nil {/' \
+  'TestTwoInstanceE2E' ./internal/swarm/
+
+# 12. Source-hint persistence at import (the /v1/ensure fill depends on
+# it — without hints the fill has no sources and the job fails).
+mutate "hints-persist" internal/swarm/fill.go \
+  's/if hj, err := json.Marshal(hints); err == nil {/if hj, err := json.Marshal(hints); false \&\& err == nil {/' \
+  'TestEnsureFillOverAPI' ./internal/api/
+
 echo
 for r in "${RESULTS[@]}"; do echo "$r"; done
 echo
