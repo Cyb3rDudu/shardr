@@ -246,7 +246,10 @@ Three sources — **local**, **HF**, **BT** — one rule set:
 7. **BT import** pins a manifest digest up front (from shardrbay, a
    peer, or any out-of-band source). The manifest is a file **inside**
    the torrent (`manifest/sha256-<hex>`): fetch it, flat-hash it, and
-   require equality with the pinned digest, then parse it. Torrent
+   require equality with the pinned digest, then parse it. In v1 the
+   in-torrent manifest file is fetched over the webseed channel and
+   pin-checked **before any swarm join** (004 §5, "v1 /import/bt
+   bootstrap"). Torrent
    metainfo alone is never sufficient to reconstruct a manifest — it
    lacks kinds, flat digests, config semantics, and provenance.
    Distribution-record fields (infohash, piece length, piece-layers

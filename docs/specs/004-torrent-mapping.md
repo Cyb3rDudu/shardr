@@ -87,17 +87,24 @@ correctness of bytes is unaffected, name freshness is not.
   (`/bt/piece-layers/<digest>`), (3) a `.torrent` metainfo file (BEP 52
   carries the piece layers within), (4) peer metadata exchange. The blob
   is KB-to-MB scale; any source works because the digest gates it.
-
-  **v1 bootstrap constraint (ruling 1b, 2026-09-02):** `/import/bt`
-  acquires the manifest and piece layers over the **webseed channel
-  before any swarm join**, pin-checked against the pinned manifest
-  digest — identity is untrusted until the pin is satisfied, and an
-  infohash-only join has a metadata window where BTv2 multi-piece
-  content is hashless. Sources (3) and (4) — `.torrent` metainfo and
-  peer metadata exchange — remain valid acquisition paths for later
-  versions (still digest-gated); v1 requires at least one webseed hint.
-  Bulk data always flows over the peer protocol (the upstream webseed
-  download planner panics on v2 padding chunks).
+- **v1 `/import/bt` bootstrap:** the manifest and piece layers are
+  acquired over the webseed channel **before any swarm join**. The
+  manifest is pin-checked first — identity is untrusted until the pin
+  is satisfied, and an infohash-only join has a window in which BTv2
+  multi-piece content cannot yet be merkle-verified (piece layers
+  travel out-of-band in BEP 52). The piece layers themselves are
+  merkle-gated at join time against the info dict reconstructed from
+  the pinned manifest. The webseed well-known path (2) above is keyed
+  by the **manifest digest hex** — the only digest the importing node
+  knows pre-join; servers MAY also serve it under the piece-layers
+  digest. Sources (1), (3) and (4) — resolver envelope sidecar,
+  `.torrent` metainfo, peer metadata exchange — remain digest-gated
+  acquisition paths for later versions; v1 `/import/bt` uses (2) only
+  and requires at least one webseed hint. In v1, bulk data flows over
+  the peer protocol — the pinned anacrolix/torrent webseed download
+  planner does not support BTv2 padding pieces — making the webseed
+  bulk fallback below a later-version path, revisited when upstream
+  fixes the planner.
 - **Fetch** (on `ensure` miss): reconstruct the torrent from the
   manifest + distribution record → join (DHT + PEX + source-hint
   trackers) → set selective priorities for missing blobs (config and
