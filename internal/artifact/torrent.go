@@ -135,13 +135,22 @@ func PieceLayerHashes(data []byte, pieceLength int64) [][sha256.Size]byte {
 	if blocksPerPiece < 1 || blocksPerPiece&(blocksPerPiece-1) != 0 {
 		panic("pieceLength must be a power-of-two multiple of 16 KiB")
 	}
+	// The piece layer is the tree layer whose entries each cover
+	// blocksPerPiece blocks: its width is width/blocksPerPiece (both powers
+	// of two). Stopping at len(level)==blocksPerPiece would instead emit
+	// the layer whose entries cover blocksPerPiece/width blocks — hashes
+	// that no BTv2 client accepts (caught by anacrolix's root check).
+	target := width / blocksPerPiece
+	if target < 1 {
+		target = 1 // file <= one piece: not piece-layer territory, callers skip it
+	}
 	var zero [sha256.Size]byte
 	level := make([][sha256.Size]byte, width)
 	copy(level, leaves)
 	for i := nBlocks; i < width; i++ {
 		level[i] = zero
 	}
-	for len(level) > blocksPerPiece {
+	for len(level) > target {
 		next := make([][sha256.Size]byte, len(level)/2)
 		for i := range next {
 			next[i] = sha256.Sum256(append(append([]byte{}, level[i*2][:]...), level[i*2+1][:]...))

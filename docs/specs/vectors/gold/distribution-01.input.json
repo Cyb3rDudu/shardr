@@ -1,7 +1,7 @@
 {
 	"torrent": {
 		"pieceLength": 1048576,
-		"pieceLayersDigest": "sha256:f21ec447e6e6d25009aa7a16ea60c281d089db2c284ddab425192f484e589710",
+		"pieceLayersDigest": "sha256:b487c6a04385fd35451280419faaea3580029c4a95d42cbd7183f9c89b3bdb27",
 		"infohash": "btmh:1220af65706663f6613022c28bee7db87a00630ee4b240b35b967b458f0eae2f7c5f"
 	},
 	"schemaVersion": 1,
