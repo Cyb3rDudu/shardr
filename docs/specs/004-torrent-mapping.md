@@ -87,6 +87,17 @@ correctness of bytes is unaffected, name freshness is not.
   (`/bt/piece-layers/<digest>`), (3) a `.torrent` metainfo file (BEP 52
   carries the piece layers within), (4) peer metadata exchange. The blob
   is KB-to-MB scale; any source works because the digest gates it.
+
+  **v1 bootstrap constraint (ruling 1b, 2026-09-02):** `/import/bt`
+  acquires the manifest and piece layers over the **webseed channel
+  before any swarm join**, pin-checked against the pinned manifest
+  digest — identity is untrusted until the pin is satisfied, and an
+  infohash-only join has a metadata window where BTv2 multi-piece
+  content is hashless. Sources (3) and (4) — `.torrent` metainfo and
+  peer metadata exchange — remain valid acquisition paths for later
+  versions (still digest-gated); v1 requires at least one webseed hint.
+  Bulk data always flows over the peer protocol (the upstream webseed
+  download planner panics on v2 padding chunks).
 - **Fetch** (on `ensure` miss): reconstruct the torrent from the
   manifest + distribution record → join (DHT + PEX + source-hint
   trackers) → set selective priorities for missing blobs (config and
