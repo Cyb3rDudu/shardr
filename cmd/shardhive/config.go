@@ -11,11 +11,14 @@ import (
 )
 
 // config.toml loading (004 §7): a documented minimal subset parser —
-// sections, key = value (bool/int/string), # comments. No arrays, no
-// nested tables beyond dotted section names (the config surface is
-// local-node knobs only; protocol-affecting knobs do not exist). Anything
-// the parser does not understand is a LOUD error, never silently ignored
-// — a typo must not quietly disable seeding.
+// sections, key = value (bool/int/string), # comments on their own line
+// only (inline comments are NOT stripped: for bool/int keys they fail
+// parsing loudly; for string keys they would become part of the value —
+// keep comments on their own line). No arrays, no nested tables beyond
+// dotted section names (the config surface is local-node knobs only;
+// protocol-affecting knobs do not exist). Anything the parser does not
+// understand is a LOUD error, never silently ignored — a typo must not
+// quietly disable seeding.
 //
 // ponytail: hand-rolled subset instead of a TOML dependency — the dep
 // budget for this slice is anacrolix/torrent + transitive only.

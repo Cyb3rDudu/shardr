@@ -2,7 +2,12 @@ module github.com/Cyb3rDudu/shardr
 
 go 1.25.0
 
-require github.com/cyberphone/json-canonicalization v0.0.0-20241213102144-19d51d7fe467
+require (
+	github.com/anacrolix/generics v0.2.0
+	github.com/anacrolix/torrent v1.61.1-0.20260831123324-4ad31c517078
+	github.com/cyberphone/json-canonicalization v0.0.0-20241213102144-19d51d7fe467
+	golang.org/x/time v0.14.0
+)
 
 require (
 	github.com/RoaringBitmap/roaring/v2 v2.16.0 // indirect
@@ -11,7 +16,6 @@ require (
 	github.com/anacrolix/chansync v0.8.0 // indirect
 	github.com/anacrolix/dht/v2 v2.23.1-0.20260525063928-ec3a9bd99456 // indirect
 	github.com/anacrolix/envpprof v1.4.0 // indirect
-	github.com/anacrolix/generics v0.2.0 // indirect
 	github.com/anacrolix/go-libutp v1.5.0 // indirect
 	github.com/anacrolix/log v0.17.1-0.20251118025802-918f1157b7bb // indirect
 	github.com/anacrolix/missinggo v1.3.0 // indirect
@@ -21,7 +25,6 @@ require (
 	github.com/anacrolix/multiless v0.4.0 // indirect
 	github.com/anacrolix/stm v0.5.0 // indirect
 	github.com/anacrolix/sync v0.5.5-0.20251119100342-d78dd1f686f1 // indirect
-	github.com/anacrolix/torrent v1.61.1-0.20260831123324-4ad31c517078 // indirect
 	github.com/anacrolix/upnp v0.1.4 // indirect
 	github.com/anacrolix/utp v0.1.0 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
@@ -82,7 +85,6 @@ require (
 	golang.org/x/sync v0.18.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.31.0 // indirect
-	golang.org/x/time v0.14.0 // indirect
 	lukechampine.com/blake3 v1.1.6 // indirect
 	modernc.org/libc v1.22.3 // indirect
 	modernc.org/mathutil v1.5.0 // indirect

@@ -631,23 +631,36 @@ func (s *Server) startFillJob(w http.ResponseWriter, job *Job, m *artifact.Manif
 	writeJSON(w, http.StatusCreated, &next)
 	go func() {
 		base := next
+		// Terminal-first discipline: once the terminal state is (being)
+		// published, a late progress tick must never overwrite it. All
+		// job publications go through mu so the check-and-publish pair
+		// is atomic against the terminal publication.
+		var mu sync.Mutex
+		terminal := false
 		err := s.Swarm.Fill(context.Background(), m, manifestBytes, swarm.Hints{},
 			func(done, total int) {
+				mu.Lock()
+				defer mu.Unlock()
+				if terminal {
+					return
+				}
 				prog := base
 				prog.State = "fetching"
 				prog.FilesDone, prog.FilesTotal = done, total
 				s.publishJob(&prog)
 			})
+		mu.Lock()
 		term := base
 		if err != nil {
 			term.State = "failed"
 			term.Error = mapSwarmError(err)
-			s.publishJob(&term)
-			return
+		} else {
+			term.State = "done"
+			term.FilesDone = term.FilesTotal
 		}
-		term.State = "done"
-		term.FilesDone = term.FilesTotal
+		terminal = true
 		s.publishJob(&term)
+		mu.Unlock()
 	}()
 }
 

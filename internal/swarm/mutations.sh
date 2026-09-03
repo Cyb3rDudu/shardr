@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Mutationssicherung: every critical guard must have a test that goes RED
+# Mutation testing: every critical guard must have a test that goes RED
 # when the guard is removed. Applies one mutation at a time against the
 # COMMITTED state, runs the guarding test, expects failure, restores.
 # Run from the repo root: bash internal/swarm/mutations.sh
@@ -12,11 +12,12 @@ declare -a RESULTS
 
 mutate() { # name file sed-expr test [pkg]
   local name="$1" file="$2" expr="$3" test="$4" pkg="${5:-./...}"
-  sed -i '' "$expr" "$file"
+  # sed -i.bak is portable across BSD and GNU sed; the .bak is removed after.
+  sed -i.bak "$expr" "$file" && rm -f "$file.bak"
   if ! go build ./... >/dev/null 2>&1; then
     RESULTS+=("BROKEN-BUILD $name"); fail=$((fail+1)); git checkout -- "$file"; return
   fi
-  if go test "$pkg" -run "$test" >/dev/null 2>&1; then
+  if go test "$pkg" -run "$test" -count=1 >/dev/null 2>&1; then
     RESULTS+=("NOT-RED    $name — test '$test' still green without the guard"); fail=$((fail+1))
   else
     RESULTS+=("RED        $name (test '$test' fails without guard, as required)"); pass=$((pass+1))
@@ -35,8 +36,8 @@ mutate "record-infohash-binding" internal/swarm/recon.go \
   's/if rec.Torrent.Infohash != r.InfohashBtmh {/if false \&\& rec.Torrent.Infohash != r.InfohashBtmh {/' \
   'TestImportBTInfohashBindingAbortsBeforeAnnounce' ./internal/swarm/
 
-# 3. Joined-vs-derived infohash gate in /import/bt phase 2 (probe: an
-# extra-file torrent whose every byte is pin-valid — only this gate fires).
+# 3. Joined-vs-derived infohash gate in /import/bt (probe: an extra-file
+# torrent whose every byte is pin-valid — only this gate fires).
 mutate "import-binding-gate" internal/swarm/fill.go \
   's/if recon.InfohashHex != ihHex {/if false \&\& recon.InfohashHex != ihHex {/' \
   'TestImportBTExtraFileTorrentOnlyBindingCatches' ./internal/swarm/
@@ -46,9 +47,10 @@ mutate "pin-mandatory" internal/api/server.go \
   's/if body.ManifestDigest == "" {/if false \&\& body.ManifestDigest == "" {/' \
   'TestImportBTPinMandatory' ./internal/api/
 
-# 5. Unpinned-file write refusal.
+# 5. Unpinned-file write refusal (WriteAt only — the error message anchors
+# the mutation to the write path, not the Completion reader).
 mutate "unpinned-write-refusal" internal/swarm/storage.go \
-  's/if p.st.spec.Digest == "" {/if false \&\& p.st.spec.Digest == "" {/' \
+  's/return 0, fmt.Errorf("swarm: write into unpinned file (no CAS digest registered); the client must not request this piece")/return len(b), nil/' \
   'TestStorageRefusesUnpinnedWrites' ./internal/swarm/
 
 # 6. Unregistered-torrent loud refusal (ok forced true; map hit falls back
@@ -77,8 +79,21 @@ mutate "fill-wait-target" internal/swarm/fill.go \
   's/target := len(recon.FileSpecs)/target := len(recon.FileSpecs) - 1/' \
   'TestTwoInstanceE2E' ./internal/swarm/
 
+# 11. Unknown-key loudness in the [swarm] TOML subset (001 §8.7 namespacing:
+# config must fail closed on unrecognized keys, not absorb them).
+mutate "swarm-config-unknown-key" cmd/shardhive/config.go \
+  's/if !swarmKeys\[key\] {/if false \&\& !swarmKeys[key] {/' \
+  'TestLoadSwarmConfigUnknownKeyIsLoud' ./cmd/shardhive/
+
+# 12. /v1/ensure with blobs missing but swarm disabled must fail loudly
+# naming the config knob (anchored to the ensure path via the missing-blobs
+# block, not the /import/bt handler).
+mutate "ensure-swarm-off-loud" internal/api/server.go \
+  '/if len(missing) == 0 {/,/break/ s/if s.Swarm == nil {/if false \&\& s.Swarm == nil {/' \
+  'TestEnsureLocalPresence' ./internal/api/
+
 echo
 for r in "${RESULTS[@]}"; do echo "$r"; done
 echo
-echo "mutationssicherung: $pass red (correct), $fail not-red (gaps)"
+echo "mutation testing: $pass red (correct), $fail not-red (gaps)"
 [ "$fail" -eq 0 ]

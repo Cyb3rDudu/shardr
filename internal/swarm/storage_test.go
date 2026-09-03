@@ -4,10 +4,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"os"
 	"testing"
 
+	g "github.com/anacrolix/generics"
+	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/bencode"
 	"github.com/anacrolix/torrent/metainfo"
 	"github.com/anacrolix/torrent/storage"
@@ -91,19 +94,23 @@ func openDriver(t *testing.T, store *cas.Store, mi *metainfo.MetaInfo, specs map
 	return impl
 }
 
+// writeAllPieces drives the anacrolix writeChunk contract: PIECE-relative
+// offsets (msg.Begin within the piece). The simple shape writes each whole
+// piece at offset 0 of the piece — chunk sub-offsets exercise the same
+// translation.
 func writeAllPieces(t *testing.T, impl storage.TorrentImpl, info *metainfo.Info, path string, content []byte) {
 	t.Helper()
 	for i := 0; i < info.NumPieces(); i++ {
 		p := impl.Piece(info.Piece(i))
-		off := int64(i) * info.PieceLength
+		if path != "" && !pieceBelongsTo(info, i, path) {
+			continue
+		}
+		off := int64(i) * info.PieceLength // file-relative slice of the CONTENT
 		end := off + info.PieceLength
 		if end > int64(len(content)) {
 			end = int64(len(content))
 		}
-		if path != "" && !pieceBelongsTo(info, i, path) {
-			continue
-		}
-		if _, err := p.WriteAt(content[off:end], off-info.PieceLength*int64(pieceFileIndex(info, i))); err != nil {
+		if _, err := p.WriteAt(content[off:end], 0); err != nil {
 			t.Fatalf("write piece %d: %v", i, err)
 		}
 	}
@@ -122,14 +129,41 @@ func pieceBelongsTo(info *metainfo.Info, i int, path string) bool {
 	return false
 }
 
-func pieceFileIndex(info *metainfo.Info, i int) int {
+// torrentSpecFromMetaInfo builds the TorrentSpec for a pure-v2 torrent
+// (test-only: production builds specs from reconstructions). NOTE:
+// v1.61.0 released panics on pure-v2 specs (issue #1089) — this build
+// pins upstream master 4ad31c5 which fixed it; the helper exists so the
+// v2-only spec shape is constructed in exactly one place.
+func torrentSpecFromMetaInfo(mi *metainfo.MetaInfo) (*torrent.TorrentSpec, error) {
+	info, err := mi.UnmarshalInfo()
+	if err != nil {
+		return nil, fmt.Errorf("swarm: unmarshal info: %w", err)
+	}
+	if info.HasV1() {
+		return nil, fmt.Errorf("swarm: torrent carries v1 fields; shardr torrents are pure BTv2 (004 §3)")
+	}
+	var v2 g.Option[infohash_v2.T]
+	v2.Set(infohash_v2.HashBytes(mi.InfoBytes))
+	return &torrent.TorrentSpec{
+		AddTorrentOpts: torrent.AddTorrentOpts{
+			InfoHashV2: v2,
+			InfoBytes:  mi.InfoBytes,
+		},
+		PieceLayers: mi.PieceLayers,
+		DisplayName: info.BestName(),
+	}, nil
+}
+
+// pieceFileStart returns the piece's byte offset within its file (0-based;
+// the file-relative position of piece i's first byte).
+func pieceFileStart(info *metainfo.Info, i int) int64 {
 	fis := info.UpvertedFiles()
 	pl := info.PieceLength
 	for _, fi := range fis {
 		begin := int(fi.TorrentOffset / pl)
 		n := (int(fi.Length) + int(pl) - 1) / int(pl)
 		if i >= begin && i < begin+n {
-			return begin
+			return (int64(i) - int64(begin)) * pl
 		}
 	}
 	return 0
@@ -227,9 +261,11 @@ func TestStorageRefusesUnpinnedWrites(t *testing.T) {
 	}
 }
 
-// Sealed (CAS-present) files serve reads from the blob and refuse writes.
+// Sealed (CAS-present) files serve reads from the blob and refuse
+// writes. Multi-piece on purpose: completion is engine-verified for
+// multi-piece CAS hits (single-piece ones are complete on first pull).
 func TestStorageSealedFileServesReads(t *testing.T) {
-	content := deterministicBytes(1<<20, 5)
+	content := deterministicBytes(3<<20, 5) // 3 pieces at 1 MiB piece length
 	files := map[string][]byte{"a.gguf": content}
 	mi, specs, _ := buildTestTorrent(t, files)
 	store, _ := cas.Open(t.TempDir())
@@ -249,12 +285,28 @@ func TestStorageSealedFileServesReads(t *testing.T) {
 			t.Fatal("write into sealed blob refused")
 		}
 		c := p.Completion()
-		if !c.Ok || !c.Complete {
-			t.Fatalf("sealed completion = %+v", c)
+		if !c.Ok || c.Complete {
+			// Complete only after the engine verified the piece — a CAS hit
+			// alone is not an announcement (see Completion).
+			t.Fatalf("sealed-but-unchecked completion = %+v", c)
 		}
+		if err := p.MarkComplete(); err != nil {
+			t.Fatalf("MarkComplete on sealed piece: %v", err)
+		}
+		// PIECE-relative read (anacrolix contract): offset 0 of piece i is
+		// the piece's first bytes in the file, not the file's first bytes.
+		start := pieceFileStart(info, i)
 		buf := make([]byte, 8)
-		if _, err := p.ReadAt(buf, 0); err != nil || string(buf) != string(content[:8]) {
-			t.Fatalf("sealed read: %v %q", err, buf)
+		if _, err := p.ReadAt(buf, 0); err != nil || string(buf) != string(content[start:start+8]) {
+			t.Fatalf("sealed read of piece %d: %v %q", i, err, buf)
+		}
+	}
+	for i := 0; i < info.NumPieces(); i++ {
+		if !pieceBelongsTo(info, i, "a.gguf") {
+			continue
+		}
+		if c := impl.Piece(info.Piece(i)).Completion(); !c.Ok || !c.Complete {
+			t.Fatalf("engine-verified completion = %+v", c)
 		}
 	}
 }

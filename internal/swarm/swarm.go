@@ -196,12 +196,26 @@ func (c *Client) SeedArtifact(ctx context.Context, m *artifact.Manifest, manifes
 	if err != nil {
 		return err
 	}
-	t, _, err := c.tc.AddTorrentSpec(spec)
+	// addFreshTorrent (not raw AddTorrentSpec): a re-seed must not reuse a
+	// stale driver from an earlier add of the same infohash.
+	t, err := c.addFreshTorrent(spec, recon.InfohashHex)
 	if err != nil {
 		return fmt.Errorf("swarm: add seed torrent: %w", err)
 	}
 	// Metadata phase is local: we built the info ourselves.
 	<-t.GotInfo()
+
+	// Sealed multi-piece CAS hits are complete in the engine only after it
+	// hashes them itself (never trust, always verify — 003 §4).
+	drv := c.casSt.driverFor(recon.InfohashHex)
+	if drv == nil {
+		dropTorrent(t)
+		return fmt.Errorf("swarm: seed: driver not open for %s", recon.InfohashHex)
+	}
+	if err := drv.VerifyPresent(ctx, t); err != nil {
+		dropTorrent(t)
+		return err
+	}
 
 	c.seedsMu.Lock()
 	c.seeds[recon.InfohashHex] = &seedEntry{recon: recon, t: t}
