@@ -370,10 +370,10 @@ func (c *Client) layersFor(recon *Recon, rec *artifact.DistributionRecord) (map[
 }
 
 // ---------------------------------------------------------------------------
-// Webseed HTTP surface: /bt/piece-layers/<digest> (004 §5(2); digest =
-// piece-layers digest, or manifest hex via the state link — PR comment
-// filed on the ambiguity) and BEP 19-style <torrent-name>/<file-path>
-// serving straight from CAS blobs.
+// Webseed HTTP surface: /bt/piece-layers/<digest> (004 §5(2), keyed by
+// the MANIFEST digest hex per the v1 bootstrap ruling — the only digest
+// an importing node knows pre-join; the layers digest is also served) and
+// BEP 19-style <torrent-name>/<file-path> serving straight from CAS blobs.
 // ---------------------------------------------------------------------------
 
 func (c *Client) startWebseed() error {

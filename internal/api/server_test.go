@@ -1318,3 +1318,41 @@ func TestImportHFErrorClasses(t *testing.T) {
 		t.Fatalf("code %s want E_SOURCE_FORBIDDEN", e.Error.Code)
 	}
 }
+
+// A non-canonical pin is a 400 BEFORE any job exists — not a failed job
+// later (000 §2 canonicality, consistent with the CLI rule).
+func TestImportBTBadPinIs400NoJob(t *testing.T) {
+	h := newHarness(t)
+	badPins := []string{
+		strings.Repeat("ab", 32),             // bare hex
+		"sha256:" + strings.Repeat("AB", 32), // uppercase
+		"sha256:" + strings.Repeat("a", 63),  // short
+		"sha256:not-hex-at-all-" + strings.Repeat("0", 44),
+	}
+	for _, pin := range badPins {
+		code, body := h.postJSON("/v1/import/bt", map[string]any{
+			"infohash":       "btmh:1220" + strings.Repeat("11", 32),
+			"manifestDigest": pin,
+		})
+		if code != http.StatusBadRequest {
+			t.Fatalf("pin %q: status %d body %s", pin, code, body)
+		}
+		var e struct {
+			Error APIError `json:"error"`
+		}
+		json.Unmarshal(body, &e)
+		if e.Error.Code != ErrBadRequest {
+			t.Fatalf("pin %q: code %s", pin, e.Error.Code)
+		}
+		if !strings.Contains(e.Error.Message, "canonical form is sha256:") {
+			t.Fatalf("pin %q: canonicality hint missing: %s", pin, e.Error.Message)
+		}
+	}
+	// No job was created for any of them.
+	h.server.mu.Lock()
+	n := len(h.server.jobs)
+	h.server.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("no job may exist for a bad pin, got %d", n)
+	}
+}

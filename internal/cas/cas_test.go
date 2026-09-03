@@ -661,15 +661,38 @@ func TestVerifyAllSwarmState(t *testing.T) {
 		t.Fatal("dangling distribution link must surface as Missing")
 	}
 
-	// Corrupt distribution.json → StateErrors (loud, never silently rebuilt).
+	// Record present, MANIFEST blob missing → Missing too (both sides of
+	// the link are checked).
 	s3, _ := Open(t.TempDir())
-	if err := os.MkdirAll(filepath.Join(s3.Root, "state"), 0o755); err != nil {
+	if err := s3.Put(recDigest, bytes.NewReader([]byte(`{"schemaVersion":1}`))); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(s3.Root, "state", "distribution.json"), []byte("{not json"), 0o644); err != nil {
+	if err := s3.SetDistributionLink("sha256:"+manDigest, "sha256:"+recDigest); err != nil {
 		t.Fatal(err)
 	}
 	res, err = s3.VerifyAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundManifest := false
+	for _, d := range res.Missing {
+		if d == manDigest {
+			foundManifest = true
+		}
+	}
+	if !foundManifest {
+		t.Fatalf("missing manifest blob must surface as Missing, got %+v", res.Missing)
+	}
+
+	// Corrupt distribution.json → StateErrors (loud, never silently rebuilt).
+	s4, _ := Open(t.TempDir())
+	if err := os.MkdirAll(filepath.Join(s4.Root, "state"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s4.Root, "state", "distribution.json"), []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err = s4.VerifyAll()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -678,14 +701,14 @@ func TestVerifyAllSwarmState(t *testing.T) {
 	}
 
 	// Corrupt swarm-hints.json → StateErrors.
-	s4, _ := Open(t.TempDir())
-	if err := os.MkdirAll(filepath.Join(s4.Root, "state"), 0o755); err != nil {
+	s5, _ := Open(t.TempDir())
+	if err := os.MkdirAll(filepath.Join(s5.Root, "state"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(s4.Root, "state", "swarm-hints.json"), []byte("[broken"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(s5.Root, "state", "swarm-hints.json"), []byte("[broken"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	res, err = s4.VerifyAll()
+	res, err = s5.VerifyAll()
 	if err != nil {
 		t.Fatal(err)
 	}

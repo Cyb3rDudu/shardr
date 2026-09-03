@@ -709,6 +709,12 @@ func (s *Server) handleImportBT(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, ErrBadRequest, "missing required field: manifestDigest — the pin is mandatory; a magnet alone is never trusted (005 §5)")
 		return
 	}
+	// Canonical form BEFORE the job exists: a non-canonical pin is a bad
+	// request, not a failed import (000 §2; consistent with the CLI rule).
+	if err := swarm.ValidatePin(body.ManifestDigest); err != nil {
+		writeErr(w, http.StatusBadRequest, ErrBadRequest, err.Error())
+		return
+	}
 	if body.Magnet == "" && body.Infohash == "" {
 		writeErr(w, http.StatusBadRequest, ErrBadRequest, "missing required field: magnet or infohash")
 		return

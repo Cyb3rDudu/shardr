@@ -88,6 +88,9 @@ func (c *Client) RecordForManifest(manifestDigest string) (*artifact.Distributio
 	if got := artifact.Digest(b); got != recDigest {
 		return nil, nil, fmt.Errorf("swarm: record blob %s content hashes to %s (corruption; never silently rebuilt)", recDigest, got)
 	}
+	if verr := artifact.ValidateDistribution(&rec); verr != nil {
+		return nil, nil, fmt.Errorf("swarm: record %s fails validation: %s (corruption; never silently rebuilt)", recDigest, verr.Msg)
+	}
 	return &rec, b, nil
 }
 
@@ -347,8 +350,10 @@ func (c *Client) ImportBT(ctx context.Context, magnetOrInfohash, manifestDigest 
 func (c *Client) fetchLayersFromHints(ctx context.Context, manifestHex string, hints Hints) (map[string]string, error) {
 	if len(hints.Webseeds) == 0 {
 		// Without layers only files ≤ piece length can verify; shardr
-		// weights are bigger. Loud, with the acquisition paths named.
-		return nil, fmt.Errorf("%w: no webseed source hints (004 §5 paths: resolver envelope sidecar, webseed /bt/piece-layers/<digest>, .torrent metainfo; pass a webseed hint)", ErrLayersUnavailable)
+		// weights are bigger. v1 acquires via the webseed channel only
+		// (004 §5 "v1 /import/bt bootstrap"); sidecar and .torrent
+		// metainfo are later-version paths.
+		return nil, fmt.Errorf("%w: no webseed source hints — v1 /import/bt acquires the piece layers over the webseed well-known path only (004 §5 v1 bootstrap: /bt/piece-layers/<manifest digest hex>); pass a webseed hint", ErrLayersUnavailable)
 	}
 	var lastErr error
 	for _, base := range hints.Webseeds {
@@ -456,6 +461,14 @@ func readBlob(store *cas.Store, hexDigest string) ([]byte, error) {
 	}
 	defer f.Close()
 	return io.ReadAll(f)
+}
+
+// ValidatePin checks a manifest pin for canonical form (sha256:<64
+// lowercase hex>, 000 §2) without converting — API surfaces use it to
+// reject non-canonical pins with a 400 before any job exists.
+func ValidatePin(manifestDigest string) error {
+	_, err := pinHex(manifestDigest)
+	return err
 }
 
 func pinHex(manifestDigest string) (string, error) {
