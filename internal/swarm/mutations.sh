@@ -88,9 +88,12 @@ mutate "swarm-config-unknown-key" cmd/shardhive/config.go \
 # 12. /v1/ensure with blobs missing but swarm disabled must fail loudly
 # naming the config knob (anchored to the ensure path via the missing-blobs
 # block, not the /import/bt handler).
+# Both s.Swarm == nil guards (handleEnsure + handleImportBT) share the
+# pattern; neutering either nil-derefs in the job goroutine. Both tests
+# must stay green with the guards present.
 mutate "ensure-swarm-off-loud" internal/api/server.go \
-  '/if len(missing) == 0 {/,/break/ s/if s.Swarm == nil {/if false \&\& s.Swarm == nil {/' \
-  'TestEnsureLocalPresence' ./internal/api/
+  's/if s.Swarm == nil {/if false \&\& s.Swarm == nil {/g' \
+  'TestEnsureLocalPresence|TestImportBTPinMandatory' ./internal/api/
 
 echo
 for r in "${RESULTS[@]}"; do echo "$r"; done
