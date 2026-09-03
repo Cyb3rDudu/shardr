@@ -2,6 +2,7 @@ package swarm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -58,6 +59,8 @@ type Client struct {
 	casSt  *CASStorage
 	verify *VerifyCache
 
+	uploadLim *rate.Limiter // shared budget: torrent client AND webseed path (upload_limit is per node, not per transport)
+
 	wsLn     net.Listener
 	wsURL    string // http://host:port — the source-hint webseed base URL
 	wsSrv    *http.Server
@@ -104,9 +107,13 @@ func New(cfg Config) (*Client, error) {
 		tcfg.ListenHost = func(string) string { return cfg.ListenHost }
 	}
 	tcfg.ListenPort = 0 // ephemeral; NAT traversal is DHT/PEX's business
+	var uploadLim *rate.Limiter
 	if cfg.UploadLimit > 0 {
+		// One shared budget across both upload paths (peer protocol +
+		// webseed HTTP): upload_limit is a node-level knob (004 §7).
 		// Burst covers one peer request window (config default if unset).
-		tcfg.UploadRateLimiter = rate.NewLimiter(rate.Limit(cfg.UploadLimit), 1<<16)
+		uploadLim = rate.NewLimiter(rate.Limit(cfg.UploadLimit), 1<<16)
+		tcfg.UploadRateLimiter = uploadLim
 	}
 	tc, err := torrent.NewClient(tcfg)
 	if err != nil {
@@ -114,14 +121,15 @@ func New(cfg Config) (*Client, error) {
 	}
 
 	c := &Client{
-		cfg:      cfg,
-		store:    store,
-		tc:       tc,
-		casSt:    casSt,
-		verify:   verify,
-		seeds:    map[string]*seedEntry{},
-		wsFiles:  map[string]FileSpec{},
-		wsLayers: map[string]string{},
+		cfg:       cfg,
+		store:     store,
+		tc:        tc,
+		casSt:     casSt,
+		verify:    verify,
+		uploadLim: uploadLim,
+		seeds:     map[string]*seedEntry{},
+		wsFiles:   map[string]FileSpec{},
+		wsLayers:  map[string]string{},
 	}
 	if err := c.startWebseed(); err != nil {
 		tc.Close()
@@ -136,6 +144,85 @@ func (c *Client) Store() *cas.Store { return c.store }
 // WebseedURL returns the base URL other nodes can use as a webseed
 // source hint ("" when the listener is off).
 func (c *Client) WebseedURL() string { return c.wsURL }
+
+// PeerAddrs returns this node's TCP listener addresses (the x.pe-style
+// direct-peer hint data; TCP only — a bare host:port is dialed as TCP).
+func (c *Client) PeerAddrs() []string {
+	var out []string
+	for _, a := range c.tc.ListenAddrs() {
+		if a.Network() == "tcp" {
+			out = append(out, a.String())
+		}
+	}
+	return out
+}
+
+// ReconstructFromStore loads a manifest blob from the CAS and derives
+// its torrent identity (001 §7.4).
+func ReconstructFromStore(store *cas.Store, manifestDigest string) (*Recon, *artifact.Manifest, []byte, error) {
+	hexDigest := artifact.DigestHex(manifestDigest)
+	f, err := store.Open(hexDigest)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("swarm: manifest blob %s: %w", manifestDigest, err)
+	}
+	defer f.Close()
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var m artifact.Manifest
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, nil, nil, fmt.Errorf("swarm: parse manifest %s: %w", manifestDigest, err)
+	}
+	if err := artifact.ValidateManifest(&m); err != nil {
+		return nil, nil, nil, fmt.Errorf("swarm: manifest %s fails validation: %w", manifestDigest, err)
+	}
+	recon, err := Reconstruct(&m, b)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return recon, &m, b, nil
+}
+
+// SeedArtifactFromCAS seeds a fully-present artifact by manifest digest:
+// manifest + linked record from the store, binding gate, seed-start
+// re-hash (003 §4), announce.
+func (c *Client) SeedArtifactFromCAS(ctx context.Context, manifestDigest string) error {
+	recon, m, mb, err := ReconstructFromStore(c.store, manifestDigest)
+	if err != nil {
+		return err
+	}
+	rec, recBytes, err := c.RecordForManifest(recon.ManifestDigest)
+	if err != nil {
+		return err
+	}
+	if rec == nil {
+		return fmt.Errorf("swarm: seed: no distribution record linked for manifest %s (seed joins need the binding, 001 §6)", recon.ManifestDigest)
+	}
+	return c.SeedArtifact(ctx, m, mb, rec, recBytes)
+}
+
+// StartupSeed scans state for complete artifacts and joins their swarms
+// as a seeder (004 §5: usage is replication — a restarted daemon seeds
+// everything it holds). Incomplete artifacts are skipped loudly (log
+// only, never fatal: a daemon must start even with holes on disk).
+// Returns the number of artifacts joined.
+func (c *Client) StartupSeed(ctx context.Context, logf func(format string, args ...any)) int {
+	links, err := c.store.DistributionLinks()
+	if err != nil {
+		logf("shardhive: swarm: startup seed: state unreadable: %v", err)
+		return 0
+	}
+	joined := 0
+	for manifestDigest := range links {
+		if err := c.SeedArtifactFromCAS(ctx, manifestDigest); err != nil {
+			logf("shardhive: swarm: startup seed: skip %s: %v", manifestDigest, err)
+			continue
+		}
+		joined++
+	}
+	return joined
+}
 
 // Close drops the engine and the webseed listener.
 func (c *Client) Close() {
@@ -352,5 +439,33 @@ func (c *Client) serveBlob(w http.ResponseWriter, r *http.Request, digest string
 	}
 	defer f.Close()
 	w.Header().Set("Content-Type", "application/octet-stream")
-	http.ServeContent(w, r, "", time.Time{}, f) // range-capable (BEP 19 requirement)
+	out := io.Writer(w)
+	if c.uploadLim != nil {
+		out = &limitWriter{w: w, lim: c.uploadLim, ctx: r.Context()}
+	}
+	http.ServeContent(&wrapResponseWriter{ResponseWriter: w, w: out}, r, "", time.Time{}, f) // range-capable (BEP 19 requirement)
+}
+
+// wrapResponseWriter keeps the http.ResponseWriter surface (Flush,
+// Hijack passthrough) while routing body writes through the limiting
+// writer.
+type wrapResponseWriter struct {
+	http.ResponseWriter
+	w io.Writer
+}
+
+func (l *wrapResponseWriter) Write(p []byte) (int, error) { return l.w.Write(p) }
+
+// limitWriter applies the shared upload budget to webseed body writes.
+type limitWriter struct {
+	w   io.Writer
+	lim *rate.Limiter
+	ctx context.Context
+}
+
+func (l *limitWriter) Write(p []byte) (int, error) {
+	if err := l.lim.WaitN(l.ctx, len(p)); err != nil {
+		return 0, err
+	}
+	return l.w.Write(p)
 }

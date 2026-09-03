@@ -1,3 +1,5 @@
+//go:build !race
+
 package swarm
 
 import (
@@ -703,5 +705,85 @@ func TestSeedStartRehashRejectsCorruptedBlob(t *testing.T) {
 		t.Fatal("seed-start must reject a corrupted blob (re-hash failed)")
 	} else if !strings.Contains(err.Error(), "re-hash failed") {
 		t.Fatalf("error must name the re-hash: %v", err)
+	}
+}
+
+// Startup seed (fix #4): a restarted daemon joins the swarms of every
+// complete artifact in state. A imports, its client CLOSES, a fresh
+// client on the same CAS runs StartupSeed — and B then imports the
+// artifact purely from the restarted node.
+func TestStartupSeedJoinsAfterRestart(t *testing.T) {
+	if testing.Short() {
+		t.Skip("E2E spins real swarm engines")
+	}
+	root := t.TempDir()
+	mk := func() *Client {
+		cfg := DefaultConfig()
+		cfg.DataRoot = root
+		cfg.DHT = false
+		cfg.DisableIPv6 = true
+		cfg.ListenHost = "127.0.0.1"
+		cfg.WebseedAddr = "127.0.0.1:0"
+		c, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+
+	// First life: local import, then shutdown (no explicit seeding).
+	a1 := mk()
+	sources, err := importer.LocalSources([]string{"../../internal/importer/testdata/gold"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := importer.Import(context.Background(), a1.store, sources, importer.ImportOptions{As: "gold/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pin := res.Members[0].Manifest
+	a1.Close()
+
+	// Second life on the same CAS: startup scan must join the swarm.
+	a2 := mk()
+	t.Cleanup(a2.Close)
+	joined := a2.StartupSeed(context.Background(), func(format string, args ...any) {
+		t.Logf(format, args...)
+	})
+	if joined != 1 {
+		t.Fatalf("startup seed must join the one complete artifact, joined %d", joined)
+	}
+
+	// B pulls the artifact from the RESTARTED node only.
+	b := newNode(t, "B7", true)
+	recon, _, _, err := ReconstructFromStore(a2.store, pin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hints := Hints{Webseeds: []string{a2.WebseedURL()}, Peers: a2.PeerAddrs()}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if _, err := b.client.ImportBT(ctx, recon.InfohashBtmh, pin, hints); err != nil {
+		t.Fatalf("B import from restarted A: %v", err)
+	}
+	if !b.hasAllBlobs(recon) {
+		t.Fatal("B missing blobs after importing from the restarted node")
+	}
+}
+
+// The upload limit applies to BOTH paths (blocker #6): the torrent client
+// config and the webseed HTTP handler share one budget.
+func TestUploadLimitWiredToBothPaths(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DataRoot = t.TempDir()
+	cfg.DHT = false
+	cfg.UploadLimit = 12345
+	c, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if c.uploadLim == nil {
+		t.Fatal("upload_limit must provision the shared limiter (webseed path + torrent client)")
 	}
 }

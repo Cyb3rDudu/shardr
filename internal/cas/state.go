@@ -20,6 +20,7 @@ const (
 	namespacesFile   = "namespaces.json"   // ns/name → current index digest
 	tagsFile         = "tags.json"         // tag alias → digest
 	distributionFile = "distribution.json" // manifest digest → distribution record digest (swarm binding link)
+	hintsFile        = "swarm-hints.json"  // manifest digest → source-hint JSON (untrusted operational data, 004 §4)
 )
 
 // Namespaces returns the namespace → current-index-digest mapping.
@@ -75,6 +76,34 @@ func (s *Store) SetDistributionLink(manifestDigest, recordDigest string) error {
 		return fmt.Errorf("cas: distribution link: record digest: %s", rerr.Message)
 	}
 	return s.updateMap(distributionFile, func(m map[string]string) { m[md] = rd })
+}
+
+// HintsFor returns the persisted source-hint JSON for a manifest (""
+// when none). Hints are untrusted operational data (trackers, webseeds,
+// peers) recorded at import so later ensure-fills reuse them; they never
+// participate in identity.
+func (s *Store) HintsFor(manifestDigest string) (string, error) {
+	md, merr := ref.NormalizeDigest(manifestDigest)
+	if merr != nil {
+		return "", fmt.Errorf("cas: hints: %s", merr.Message)
+	}
+	m, err := s.loadMap(hintsFile)
+	if err != nil {
+		return "", err
+	}
+	return m[md], nil
+}
+
+// SetHints persists source-hint JSON for a manifest ("" removes).
+func (s *Store) SetHints(manifestDigest, hintsJSON string) error {
+	md, merr := ref.NormalizeDigest(manifestDigest)
+	if merr != nil {
+		return fmt.Errorf("cas: hints: %s", merr.Message)
+	}
+	if hintsJSON == "" {
+		return s.updateMap(hintsFile, func(m map[string]string) { delete(m, md) })
+	}
+	return s.updateMap(hintsFile, func(m map[string]string) { m[md] = hintsJSON })
 }
 
 // RecordDigestForManifest resolves the linked distribution record digest

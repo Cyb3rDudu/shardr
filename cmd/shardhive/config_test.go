@@ -94,3 +94,49 @@ func TestSeedKnobsMapToEngineConfig(t *testing.T) {
 		t.Fatalf("upload_limit must reach the engine config: %d", cfg.UploadLimit)
 	}
 }
+
+// The 004 §7 example config, verbatim, must parse cleanly — inline
+// comments after values, quoted section keys, all of it.
+func TestLoadSwarmConfigSpecExampleLiteral(t *testing.T) {
+	writeConfig(t, `[swarm]
+enabled = true            # shardhive swarm client (fetch + seed)
+seed = true               # seed complete artifacts (the community mirror)
+upload_limit = 0          # bytes/sec, 0 = unlimited
+dht = true                # DHT + PEX
+
+[references]
+# Interactive-CLI comfort ONLY: applied when a human types a
+# selector-less ref. Never applied in Modelfiles, the API, manifests,
+# or shardrbay entries — those always require an explicit selector.
+default_selector = ""
+
+[runtimes.llama]          # overlay layer 2 (002 §2)
+n_threads = 8
+
+[models."unsloth/qwen3.8-27b-gguf:ud-q4_k_m"]   # per-model overlay
+[models."unsloth/qwen3.8-27b-gguf:ud-q4_k_m".llama]
+n_gpu_layers = 40
+`)
+	cfg, err := loadSwarmConfig()
+	if err != nil {
+		t.Fatalf("spec example must parse: %v", err)
+	}
+	want := swarm.DefaultConfig()
+	if cfg != want {
+		t.Fatalf("spec example must yield the documented defaults: %+v", cfg)
+	}
+}
+
+// Inline comments are stripped outside strings; a # inside a quoted
+// string value survives.
+func TestStripCommentSemantics(t *testing.T) {
+	if got := stripComment(`true            # shardhive swarm client`); got != "true" {
+		t.Fatalf("inline bool comment: %q", got)
+	}
+	if got := stripComment(`"a#b"  # trailing`); got != `"a#b"` {
+		t.Fatalf("quoted hash survives: %q", got)
+	}
+	if got := stripComment("127.0.0.1:0"); got != "127.0.0.1:0" {
+		t.Fatalf("no comment untouched: %q", got)
+	}
+}

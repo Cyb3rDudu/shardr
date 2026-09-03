@@ -631,13 +631,24 @@ func (s *Server) startFillJob(w http.ResponseWriter, job *Job, m *artifact.Manif
 	writeJSON(w, http.StatusCreated, &next)
 	go func() {
 		base := next
+		// Source hints recorded at import time (untrusted operational
+		// data, 004 §4) — the API fill reuses them; without them discovery
+		// is DHT-only.
+		hints, herr := s.Swarm.HintsForManifest(strings.TrimPrefix(job.Manifest, ref.DigestSchemePrefix))
+		if herr != nil {
+			term := base
+			term.State = "failed"
+			term.Error = &APIError{Code: ErrInternal, Message: "load source hints: " + herr.Error()}
+			s.publishJob(&term)
+			return
+		}
 		// Terminal-first discipline: once the terminal state is (being)
 		// published, a late progress tick must never overwrite it. All
 		// job publications go through mu so the check-and-publish pair
 		// is atomic against the terminal publication.
 		var mu sync.Mutex
 		terminal := false
-		err := s.Swarm.Fill(context.Background(), m, manifestBytes, swarm.Hints{},
+		err := s.Swarm.Fill(context.Background(), m, manifestBytes, hints,
 			func(done, total int) {
 				mu.Lock()
 				defer mu.Unlock()

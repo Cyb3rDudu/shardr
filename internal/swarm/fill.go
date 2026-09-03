@@ -2,6 +2,7 @@ package swarm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -33,6 +34,20 @@ type Hints struct {
 	Trackers []string
 	Webseeds []string
 	Peers    []string
+}
+
+// HintsForManifest loads the persisted source hints for a manifest
+// (recorded by /import/bt on success). Empty hints when none.
+func (c *Client) HintsForManifest(manifestDigest string) (Hints, error) {
+	var h Hints
+	raw, err := c.store.HintsFor(manifestDigest)
+	if err != nil || raw == "" {
+		return h, err
+	}
+	if err := unmarshalJSON([]byte(raw), &h); err != nil {
+		return h, fmt.Errorf("swarm: hints state for %s: %w", manifestDigest, err)
+	}
+	return h, nil
 }
 
 // MissingFiles lists manifest files whose blobs are absent from the CAS.
@@ -252,19 +267,13 @@ func (c *Client) ImportBT(ctx context.Context, magnetOrInfohash, manifestDigest 
 		return nil, fmt.Errorf("%w: joined %s but manifest %s reconstructs to %s (torrent world and digest world disagree; aborting)", ErrBinding, ihHex, recon.ManifestDigest, recon.InfohashHex)
 	}
 
-	// Store the layers blob content-addressed + link the derived record.
-	layersDigest, err := putLayers(c.store, layers, recon)
-	if err != nil {
-		return nil, err
-	}
+	// Derive the identity set IN MEMORY first — layers blob, record, and
+	// the state link are only persisted AFTER the full artifact is sealed
+	// (publish ordering: a failure between here and success must leave no
+	// permanent record link behind).
+	layersDigest := artifact.Digest(layersBlobOf(layers))
 	rec, recBytes, err := derivedRecord(recon, layersDigest)
 	if err != nil {
-		return nil, err
-	}
-	if err := c.store.Put(artifact.DigestHex(artifact.Digest(recBytes)), strings.NewReader(string(recBytes))); err != nil {
-		return nil, fmt.Errorf("swarm: import: store record: %w", err)
-	}
-	if err := c.store.SetDistributionLink(recon.ManifestDigest, artifact.Digest(recBytes)); err != nil {
 		return nil, err
 	}
 
@@ -274,7 +283,7 @@ func (c *Client) ImportBT(ctx context.Context, magnetOrInfohash, manifestDigest 
 	if err != nil {
 		return nil, err
 	}
-	t2, err := c.addFreshTorrent(spec2, ihHex) // drop-waited: no stale driver from phase 1
+	t2, err := c.addFreshTorrent(spec2, ihHex) // drop-waited: no stale driver from phase 1; AddTorrentSpec verifies the layers against the info dict's merkle roots here
 	if err != nil {
 		return nil, fmt.Errorf("swarm: import: re-add full torrent: %w", err)
 	}
@@ -296,6 +305,26 @@ func (c *Client) ImportBT(ctx context.Context, magnetOrInfohash, manifestDigest 
 		return nil, err
 	}
 	dropTorrent(t2)
+
+	// Success: persist layers blob + record + state link (deferred until
+	// here on purpose — everything above can fail without leaving a
+	// permanent binding behind).
+	if _, err := putLayers(c.store, layers, recon); err != nil {
+		return nil, err
+	}
+	if err := c.store.Put(artifact.DigestHex(artifact.Digest(recBytes)), strings.NewReader(string(recBytes))); err != nil {
+		return nil, fmt.Errorf("swarm: import: store record: %w", err)
+	}
+	if err := c.store.SetDistributionLink(recon.ManifestDigest, artifact.Digest(recBytes)); err != nil {
+		return nil, err
+	}
+	// Persist the source hints that worked (untrusted operational data —
+	// later ensure-fills reuse them; 004 §4).
+	if hj, err := json.Marshal(hints); err == nil {
+		if err := c.store.SetHints(recon.ManifestDigest, string(hj)); err != nil {
+			return nil, err
+		}
+	}
 
 	if c.cfg.Seed {
 		if err := c.SeedArtifact(ctx, &m, manifestBytes, rec, recBytes); err != nil {
@@ -380,11 +409,21 @@ func httpGet(ctx context.Context, url string, limit int64) ([]byte, error) {
 // putLayers pins the acquired layers blob into the CAS under its flat
 // digest (AddPieceLayers already verified it against the info dict's
 // merkle roots at add time — that, not this store, is the integrity gate).
-func putLayers(store *cas.Store, layers map[string]string, recon *Recon) (string, error) {
-	blob, err := bencodeLayers(layers)
+// layersBlobOf re-encodes a layers map deterministically to its bytes
+// (the same form putLayers stores).
+func layersBlobOf(layers map[string]string) []byte {
+	b, err := bencodeLayers(layers)
 	if err != nil {
-		return "", err
+		panic(err) // map[string]string always bencodes
 	}
+	return b
+}
+
+// putLayers pins the acquired layers blob into the CAS under its flat
+// digest (identity anchored by the add-time merkle verification against
+// the info dict's roots and the E2E record convergence).
+func putLayers(store *cas.Store, layers map[string]string, recon *Recon) (string, error) {
+	blob := layersBlobOf(layers)
 	digest := artifact.Digest(blob)
 	if err := store.Put(artifact.DigestHex(digest), strings.NewReader(string(blob))); err != nil {
 		return "", fmt.Errorf("swarm: import: store layers: %w", err)
