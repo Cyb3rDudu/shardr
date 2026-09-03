@@ -208,6 +208,9 @@ func (c *Client) SeedArtifactFromCAS(ctx context.Context, manifestDigest string)
 // only, never fatal: a daemon must start even with holes on disk).
 // Returns the number of artifacts joined.
 func (c *Client) StartupSeed(ctx context.Context, logf func(format string, args ...any)) int {
+	if !c.cfg.Seed {
+		return 0 // seeding disabled: no joins, no "seeding N" log lies
+	}
 	links, err := c.store.DistributionLinks()
 	if err != nil {
 		logf("shardhive: swarm: startup seed: state unreadable: %v", err)

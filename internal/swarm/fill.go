@@ -459,14 +459,24 @@ func readBlob(store *cas.Store, hexDigest string) ([]byte, error) {
 }
 
 func pinHex(manifestDigest string) (string, error) {
-	s := strings.TrimPrefix(manifestDigest, "sha256:")
+	// Canonical form only (000 §2): sha256: + 64 LOWERCASE hex. Bare hex
+	// and uppercase are rejected loudly with the canonicality hint — the
+	// pin is a trust anchor and must never be normalized silently.
+	const hint = "canonical form is sha256:<64 lowercase hex> (000 §2); digests are never silently normalized"
+	if !strings.HasPrefix(manifestDigest, "sha256:") {
+		return "", fmt.Errorf("swarm: import: manifestDigest %q lacks the sha256: prefix; %s", manifestDigest, hint)
+	}
+	s := manifestDigest[len("sha256:"):]
 	if len(s) != 64 {
-		return "", fmt.Errorf("swarm: import: manifestDigest must be canonical sha256:<64hex>, got %q", manifestDigest)
+		return "", fmt.Errorf("swarm: import: manifestDigest %q: want 64 hex chars after sha256:, got %d; %s", manifestDigest, len(s), hint)
+	}
+	if strings.ToLower(s) != s {
+		return "", fmt.Errorf("swarm: import: manifestDigest %q: uppercase hex is not canonical; %s", manifestDigest, hint)
 	}
 	if _, err := hexDecode(s); err != nil {
-		return "", fmt.Errorf("swarm: import: bad manifestDigest %q: %w", manifestDigest, err)
+		return "", fmt.Errorf("swarm: import: manifestDigest %q: %w; %s", manifestDigest, err, hint)
 	}
-	return strings.ToLower(s), nil
+	return s, nil
 }
 
 // addFreshTorrent drops any live torrent with the same infohash (its
