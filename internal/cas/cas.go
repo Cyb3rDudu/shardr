@@ -295,8 +295,9 @@ func (s *Store) VerifyAll() (VerifyResult, error) {
 		res.StateErrors = append(res.StateErrors, "tags: "+tagsErr.Error())
 	}
 	// Swarm state files: the distribution links are verified per entry
-	// (manifest digest validity, record blob presence); the hints file is
-	// operational data — parseability is all it owes.
+	// (digest validity, and presence of BOTH linked blobs — record and
+	// manifest); the hints file is operational data — parseability is all
+	// it owes.
 	links, linksErr := s.DistributionLinks()
 	if linksErr != nil {
 		res.StateErrors = append(res.StateErrors, "distribution: "+linksErr.Error())
@@ -312,6 +313,9 @@ func (s *Store) VerifyAll() (VerifyResult, error) {
 			}
 			if !s.Has(stateDigestHex(recordDigest)) {
 				res.Missing = append(res.Missing, stateDigestHex(recordDigest))
+			}
+			if !s.Has(stateDigestHex(manifestDigest)) {
+				res.Missing = append(res.Missing, stateDigestHex(manifestDigest))
 			}
 		}
 	}
