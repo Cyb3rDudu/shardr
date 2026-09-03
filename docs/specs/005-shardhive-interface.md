@@ -54,7 +54,11 @@ declaration — there is no separate negotiation header in v1.
 rebuilt), `E_INVALID_INDEX` (index fails validation), `E_SOURCE_NOT_REGULAR`
 (local import source is not a regular file — hard boundary),
 `E_SOURCE_UNAVAILABLE` (reserved source not implemented in this build),
-`E_NOT_IMPLEMENTED` (endpoint reserved for a later slice), `E_RANGE_INVALID`
+`E_NOT_IMPLEMENTED` (endpoint reserved for a later slice),
+`E_NOT_IMPORTABLE` (the requested import fails the 001 §8 rule set or
+post-import verification — unimportable content, a manifest pin that
+never satisfies, or a distribution-record/identity binding failure;
+terminal for the job, never silently retried), `E_RANGE_INVALID`
 (blob range does not overlap), `E_UNSUPPORTED_VERSION`, `E_BAD_REQUEST`,
 `E_NOT_FOUND`, `E_INTERNAL` (daemon bug — never a user-input verdict).
 
