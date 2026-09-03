@@ -12,13 +12,12 @@ import (
 
 // config.toml loading (004 §7): a documented minimal subset parser —
 // sections, key = value (bool/int/string), # comments on their own line
-// only (inline comments are NOT stripped: for bool/int keys they fail
-// parsing loudly; for string keys they would become part of the value —
-// keep comments on their own line). No arrays, no nested tables beyond
-// dotted section names (the config surface is local-node knobs only;
-// protocol-affecting knobs do not exist). Anything the parser does not
-// understand is a LOUD error, never silently ignored — a typo must not
-// quietly disable seeding.
+// or inline after a value (outside quoted strings, TOML semantics — the
+// 004 §7 example config uses inline comments). No arrays, no nested
+// tables beyond dotted section names (the config surface is local-node
+// knobs only; protocol-affecting knobs do not exist). Anything the parser
+// does not understand is a LOUD error, never silently ignored — a typo
+// must not quietly disable seeding.
 //
 // ponytail: hand-rolled subset instead of a TOML dependency — the dep
 // budget for this slice is anacrolix/torrent + transitive only.
@@ -88,7 +87,7 @@ func loadSwarmConfig() (swarm.Config, error) {
 			return cfg, fmt.Errorf("config %s:%d: expected key = value, got %q", path, ln+1, line)
 		}
 		key = strings.TrimSpace(key)
-		val = strings.TrimSpace(val)
+		val = stripComment(strings.TrimSpace(val))
 		if !swarmKeys[key] {
 			return cfg, fmt.Errorf("config %s:%d: unknown [swarm] key %q (known: enabled, seed, upload_limit, dht, no_seed_verify, webseed_addr)", path, ln+1, key)
 		}
@@ -115,6 +114,24 @@ func loadSwarmConfig() (swarm.Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+// stripComment removes a TOML inline comment (# to end of line) from a
+// value, honoring double-quoted strings: a # inside quotes does not
+// start a comment.
+func stripComment(v string) string {
+	inQuote := false
+	for i, r := range v {
+		switch r {
+		case '"':
+			inQuote = !inQuote
+		case '#':
+			if !inQuote {
+				return strings.TrimSpace(v[:i])
+			}
+		}
+	}
+	return v
 }
 
 func parseBool(path string, ln int, v string) (bool, error) {

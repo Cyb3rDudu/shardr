@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -110,6 +111,15 @@ func runServe(args []string) int {
 			return 1
 		}
 		defer sw.Close()
+		// Seed-by-default across restarts (004 §5): join the swarms of
+		// every complete artifact in state. Synchronous by design — the
+		// 003 §4 seed-start re-hash cost is documented and --seed-no-verify
+		// is the unsafe opt-out.
+		if n := sw.StartupSeed(context.Background(), func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, format+"\n", args...)
+		}); n > 0 {
+			fmt.Fprintf(os.Stderr, "shardhive: swarm: seeding %d artifact(s)\n", n)
+		}
 	}
 	store, err := cas.Open("")
 	if err != nil {
