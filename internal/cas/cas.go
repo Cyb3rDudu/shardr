@@ -16,6 +16,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/Cyb3rDudu/shardr/internal/ref"
 )
 
 // Sentinel verification results. Callers map these to exit codes:
@@ -291,6 +293,30 @@ func (s *Store) VerifyAll() (VerifyResult, error) {
 	}
 	if tagsErr != nil {
 		res.StateErrors = append(res.StateErrors, "tags: "+tagsErr.Error())
+	}
+	// Swarm state files: the distribution links are verified per entry
+	// (manifest digest validity, record blob presence); the hints file is
+	// operational data — parseability is all it owes.
+	links, linksErr := s.DistributionLinks()
+	if linksErr != nil {
+		res.StateErrors = append(res.StateErrors, "distribution: "+linksErr.Error())
+	} else {
+		for manifestDigest, recordDigest := range links {
+			if _, verr := ref.NormalizeDigest(manifestDigest); verr != nil {
+				res.StateErrors = append(res.StateErrors, fmt.Sprintf("distribution: link key %q: %s", manifestDigest, verr.Message))
+				continue
+			}
+			if _, verr := ref.NormalizeDigest(recordDigest); verr != nil {
+				res.StateErrors = append(res.StateErrors, fmt.Sprintf("distribution: link %s → %q: %s", manifestDigest, recordDigest, verr.Message))
+				continue
+			}
+			if !s.Has(stateDigestHex(recordDigest)) {
+				res.Missing = append(res.Missing, stateDigestHex(recordDigest))
+			}
+		}
+	}
+	if _, hintsErr := s.loadMap(hintsFile); hintsErr != nil {
+		res.StateErrors = append(res.StateErrors, "swarm-hints: "+hintsErr.Error())
 	}
 	refs := map[string]bool{}
 	for _, m := range []map[string]string{ns, tags} {

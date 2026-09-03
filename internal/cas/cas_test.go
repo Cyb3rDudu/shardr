@@ -625,3 +625,87 @@ func TestStateConcurrentUpdatesNoLostWrite(t *testing.T) {
 		t.Fatalf("lost updates: %d/%d namespaces survived", len(ns), n)
 	}
 }
+
+// VerifyAll covers the swarm state files: a corrupt distribution.json is
+// a StateError; a link pointing at a missing record blob is Missing.
+func TestVerifyAllSwarmState(t *testing.T) {
+	root := t.TempDir()
+	s, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Healthy link: record blob present.
+	recDigest := putTestBlob(t, s, []byte(`{"schemaVersion":1}`))
+	manDigest := putTestBlob(t, s, []byte(`{"artifactType":"model"}`))
+	if err := s.SetDistributionLink("sha256:"+manDigest, "sha256:"+recDigest); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.VerifyAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.StateErrors) != 0 || len(res.Missing) != 0 {
+		t.Fatalf("healthy state: %+v", res)
+	}
+
+	// Link to a missing record blob → Missing.
+	s2, _ := Open(t.TempDir())
+	if err := s2.SetDistributionLink("sha256:"+manDigest, "sha256:"+recDigest); err != nil {
+		t.Fatal(err)
+	}
+	res, err = s2.VerifyAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Missing) == 0 {
+		t.Fatal("dangling distribution link must surface as Missing")
+	}
+
+	// Corrupt distribution.json → StateErrors (loud, never silently rebuilt).
+	s3, _ := Open(t.TempDir())
+	if err := os.MkdirAll(filepath.Join(s3.Root, "state"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s3.Root, "state", "distribution.json"), []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err = s3.VerifyAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.StateErrors) == 0 || !strings.Contains(res.StateErrors[0], "distribution") {
+		t.Fatalf("corrupt distribution.json must be a StateError, got %+v", res.StateErrors)
+	}
+
+	// Corrupt swarm-hints.json → StateErrors.
+	s4, _ := Open(t.TempDir())
+	if err := os.MkdirAll(filepath.Join(s4.Root, "state"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s4.Root, "state", "swarm-hints.json"), []byte("[broken"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err = s4.VerifyAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range res.StateErrors {
+		if strings.Contains(e, "swarm-hints") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("corrupt swarm-hints.json must be a StateError, got %+v", res.StateErrors)
+	}
+}
+
+func putTestBlob(t *testing.T, s *Store, content []byte) string {
+	t.Helper()
+	sum := sha256.Sum256(content)
+	d := hex.EncodeToString(sum[:])
+	if err := s.Put(d, bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+	return d
+}

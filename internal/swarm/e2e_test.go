@@ -8,6 +8,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -785,5 +787,113 @@ func TestUploadLimitWiredToBothPaths(t *testing.T) {
 	defer c.Close()
 	if c.uploadLim == nil {
 		t.Fatal("upload_limit must provision the shared limiter (webseed path + torrent client)")
+	}
+}
+
+// StartupSeed with seed=false joins nothing and reports zero honestly —
+// no "seeding N artifacts" log lie for a node that seeds nothing.
+func TestStartupSeedDisabledJoinsNothing(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DataRoot = t.TempDir()
+	cfg.DHT = false
+	cfg.Seed = false
+	c, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	// Even with a complete artifact linked in state: zero joins.
+	sources, err := importer.LocalSources([]string{"../../internal/importer/testdata/gold"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := importer.Import(context.Background(), c.store, sources, importer.ImportOptions{As: "gold/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if joined := c.StartupSeed(context.Background(), func(string, ...any) {}); joined != 0 {
+		t.Fatalf("seed=false must join 0, joined %d", joined)
+	}
+	for _, t2 := range c.tc.Torrents() {
+		if t2.Info() != nil {
+			t.Fatal("seed=false must not join any torrent at startup")
+		}
+	}
+	_ = res
+}
+
+// Publish ordering (review round 2, blocker #2): a webseed serving EVIL
+// piece layers (valid bencode, wrong roots) makes the import fail at the
+// add-time layer verification — and leaves NOTHING behind: no
+// distribution link, no record blob, no layers blob in the victim's
+// state or CAS.
+func TestImportBTEvilLayersLeavesNoState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("E2E spins real swarm engines")
+	}
+	a := newNode(t, "A6", true)
+	res := a.importLocal()
+	manifestDigest := res.Members[0].Manifest
+	recon := a.seedArtifact(manifestDigest)
+	pinHex := artifact.DigestHex(manifestDigest)
+
+	// Real manifest bytes + real layers blob from A; corrupt one hash so
+	// the bencode stays valid but the merkle roots disagree with the info
+	// dict (the add-time verification must reject it).
+	manifestBytes, _ := readBlob(a.client.store, pinHex)
+	recA, _, _ := a.client.RecordForManifest(manifestDigest)
+	layersBytes, err := readBlob(a.client.store, artifact.DigestHex(recA.Torrent.PieceLayersDigest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	evil := append([]byte(nil), layersBytes...)
+	for i := 0; i < len(evil); i++ { // flip a digit inside the blob
+		if evil[i] >= '0' && evil[i] <= '8' {
+			evil[i] = evil[i] + 1
+			break
+		}
+	}
+
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/bt/piece-layers/"+pinHex:
+			w.Write(evil)
+		case r.URL.Path == "/shardr-sha256-"+pinHex[:12]+"/manifest/sha256-"+pinHex:
+			w.Write(manifestBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer stub.Close()
+
+	b := newNode(t, "B6", true)
+	hints := Hints{Webseeds: []string{stub.URL}, Peers: a.peerAddrs()}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := b.client.ImportBT(ctx, recon.InfohashBtmh, manifestDigest, hints); err == nil {
+		t.Fatal("import with evil layers must fail")
+	}
+
+	// Nothing permanent: no state link, no empty-or-not distribution map
+	// entries, no layers blob, no content blobs.
+	if d, err := b.client.store.RecordDigestForManifest(manifestDigest); err != nil || d != "" {
+		t.Fatalf("distribution link must be absent, got %q err %v", d, err)
+	}
+	links, err := b.client.store.DistributionLinks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(links) != 0 {
+		t.Fatalf("state/distribution.json must be empty, got %v", links)
+	}
+	if b.client.store.Has(artifact.DigestHex(recA.Torrent.PieceLayersDigest)) {
+		t.Fatal("real layers blob must not be present (never written)")
+	}
+	var m artifact.Manifest
+	unmarshalJSON(manifestBytes, &m)
+	for _, f := range m.Files {
+		if b.client.store.Has(artifact.DigestHex(f.Digest)) {
+			t.Fatalf("evil import produced content blob %s", f.Name)
+		}
 	}
 }
