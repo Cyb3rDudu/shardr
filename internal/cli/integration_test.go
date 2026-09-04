@@ -3,12 +3,15 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -750,11 +753,16 @@ func TestRegistryCrossProcessAdd(t *testing.T) {
 		mine := filepath.Join(readyDir, actor)
 		other := filepath.Join(readyDir, map[string]string{"a": "b", "b": "a"}[actor])
 		os.WriteFile(mine, []byte("1"), 0o600)
+		synced := false
 		for i := 0; i < 500; i++ {
 			if _, err := os.Stat(other); err == nil {
+				synced = true
 				break
 			}
 			time.Sleep(2 * time.Millisecond)
+		}
+		if !synced {
+			os.Exit(4) // sibling never arrived — proceeding would fake determinism
 		}
 		if err := reg.Add(runner.Instance{ID: "cp-" + actor, Endpoint: "http://127.0.0.1:1", PID: os.Getpid()}); err != nil {
 			os.Exit(3)
@@ -803,4 +811,161 @@ func TestRegistryCrossProcessAdd(t *testing.T) {
 			t.Fatalf("round %d: both cross-process registrations must survive the flock (got %d: %+v)", round, len(list), list)
 		}
 	}
+}
+
+// countLaunchDirs counts per-launch scratch dirs under the split root.
+func countLaunchDirs(t *testing.T) int {
+	t.Helper()
+	root := splitRootForTest()
+	n := 0
+	filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err == nil && d.IsDir() && strings.Contains(p, string(filepath.Separator)) {
+			// leaf = a dir whose parent chain is <root>/<hex>/<launch>
+			rel, rerr := filepath.Rel(root, p)
+			if rerr == nil && len(strings.Split(rel, string(filepath.Separator))) == 2 {
+				n++
+			}
+		}
+		return nil
+	})
+	return n
+}
+
+func splitRootForTest() string { return runnerSplitRoot() }
+
+// B1 regression: three FAILED starts in a row (binary missing, spawn
+// dies at startup, registry unreachable) leave ZERO scratch remains —
+// hardlinks pin CAS inodes while they exist.
+func TestFailedLaunchLeavesNoScratch(t *testing.T) {
+	if stubBinary == "" {
+		t.Skip("stub not built")
+	}
+	root := t.TempDir()
+	t.Setenv("SHARDR_CAS", root)
+	store, _ := cas.Open(root)
+	sockDir, _ := os.MkdirTemp(os.TempDir(), "sx")
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "hive.sock")
+	srv, _ := api.New(store, sock)
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	go srv.Serve()
+	t.Cleanup(func() { srv.Close() })
+	t.Setenv("SHARDR_SOCKET", sock)
+	t.Setenv("SHARDR_CONFIG", writeCfg(t, ""))
+	state := filepath.Join(t.TempDir(), "instances.json")
+
+	sources, _ := importer.LocalSources([]string{"../../internal/importer/testdata/gold"})
+	res, err := importer.Import(context.Background(), store, sources, importer.ImportOptions{As: "gold/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := "gold/repo:" + res.Members[0].Quant
+
+	type failCase struct {
+		name string
+		env  map[string]string
+	}
+	cases := []failCase{
+		{"binary-missing", map[string]string{"SHARDR_LLAMA_SERVER": "/nonexistent/llama-server"}},
+		{"startup-death", map[string]string{"SHARDR_LLAMA_SERVER": stubBinary, "STUB_EXIT_EARLY": "1"}},
+		{"registry-unreachable", map[string]string{
+			"SHARDR_LLAMA_SERVER": stubBinary,
+			// parent of the state path is a FILE → OpenRegistry fails
+			"SHARDR_RUNNER_STATE": state,
+		}},
+	}
+	for i, tc := range cases {
+		for k, v := range tc.env {
+			t.Setenv(k, v)
+		}
+		if tc.name == "registry-unreachable" {
+			blocker := filepath.Join(t.TempDir(), "blocker")
+			os.WriteFile(blocker, []byte("x"), 0o600)
+			t.Setenv("SHARDR_RUNNER_STATE", blocker+"/sub/instances.json")
+		}
+		before := countLaunchDirs(t)
+		c, _ := NewClient()
+		err := Serve(context.Background(), c, ref, RunOptions{}, io.Discard)
+		if err == nil {
+			t.Fatalf("%s: serve must fail", tc.name)
+		}
+		after := countLaunchDirs(t)
+		if after != before {
+			t.Fatalf("case %d (%s): scratch leaked (%d → %d dirs) — hardlinks pin CAS inodes", i, tc.name, before, after)
+		}
+	}
+}
+
+// W2: a symlinked INTERMEDIATE directory (root/<hex> → elsewhere)
+// defeats nothing — the boundary refuses to remove through it.
+func TestSymlinkedIntermediateRefused(t *testing.T) {
+	root := splitRootForTest()
+	// Per-run unique hex (valid shape, no cross-run contamination).
+	nameSum := sha256.Sum256([]byte(t.Name() + time.Now().Format(time.StampNano)))
+	hex := hex.EncodeToString(nameSum[:])
+	// Real victim tree outside the scratch root; the launch dir (created
+	// through the symlink by MkdirAll) holds the sentinel — RemoveAll
+	// follows INTERMEDIATE symlinks, so a boundary hole deletes exactly
+	// this file.
+	victim := t.TempDir()
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, hex)
+	if err := os.Symlink(victim, link); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(link) })
+	stored := filepath.Join(link, "123-456")
+	if err := os.MkdirAll(stored, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(stored, "part.gguf")
+	if err := os.WriteFile(sentinel, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeSplitDir(stored); err == nil {
+		t.Fatal("symlinked intermediate must be refused")
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatal("victim content was deleted through the symlink")
+	}
+}
+
+// W3: a helper child whose sibling never arrives must FAIL (exit 4),
+// not proceed unsynchronized.
+func TestRegistryReExecReadyTimeout(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	readyDir := t.TempDir()
+	state := filepath.Join(t.TempDir(), "instances.json")
+	cmd := exec.Command(exe, "-test.run=TestRegistryCrossProcessAdd")
+	cmd.Env = append(os.Environ(),
+		"SHARDR_REG_CHILD=1", "SHARDR_REG_STATE="+state,
+		"SHARDR_REG_ACTOR=a", "SHARDR_REG_READY_DIR="+readyDir)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("child without sibling must fail, got success: %s", out)
+	}
+	if !strings.Contains(string(out), "exit status 4") && cmd.ProcessState.ExitCode() != 4 {
+		t.Fatalf("child must exit 4 (synchronization timeout), got: %s", out)
+	}
+}
+
+func runnerSplitRoot() string {
+	// mirrors splitRoot() in run.go (same env resolution)
+	base := os.Getenv("XDG_RUNTIME_DIR")
+	if base == "" {
+		base = filepath.Join(os.TempDir(), "shardr-"+func() string {
+			if u, err := user.Current(); err == nil {
+				return u.Uid
+			}
+			return "0"
+		}())
+	}
+	return filepath.Join(base, "shardr-split")
 }

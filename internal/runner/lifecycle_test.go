@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -164,6 +165,8 @@ func dirUsage(t *testing.T, dir string) int64 {
 // SIGTERM deadline (002 §4 supervisor duty): a process that ignores
 // SIGTERM is SIGKILLed after the grace window — never waited forever.
 func TestTerminateDeadlineSIGKILL(t *testing.T) {
+	restore := shortGrace(t, 1500*time.Millisecond)
+	defer restore()
 	w := weightsFile(t, 128)
 	t.Setenv("STUB_IGNORE_SIGTERM", "1") // deadbeat mode BEFORE spawn (inherited env)
 	rt, err := Spawn(SpawnRequest{
@@ -303,6 +306,8 @@ func TestUserConfigOverlay(t *testing.T) {
 // must abort WITHOUT the kill — the deadbeat process survives and the
 // error names the refusal.
 func TestTerminateVerifiedRefusesKillOnIdentityFlip(t *testing.T) {
+	restore := shortGrace(t, 1500*time.Millisecond)
+	defer restore()
 	w := weightsFile(t, 128)
 	t.Setenv("STUB_IGNORE_SIGTERM", "1") // deadbeat: ignores SIGTERM
 	rt, err := Spawn(SpawnRequest{Binary: stubPath, Weights: w, Stdout: os.Stderr, Stderr: os.Stderr})
@@ -314,17 +319,16 @@ func TestTerminateVerifiedRefusesKillOnIdentityFlip(t *testing.T) {
 		t.Fatal(err)
 	}
 	pid := rt.PID()
-	calls := 0
-	flip := func() bool {
-		calls++
-		return calls == 1 // true before SIGTERM, false before SIGKILL
-	}
-	err = TerminateVerified(pid, flip)
+	termCalls := 0
+	killCalls := 0
+	verifyTerm := func() bool { termCalls++; return true }
+	verifyKill := func() bool { killCalls++; return false } // identity flipped mid-window
+	err = TerminateVerified(pid, verifyTerm, verifyKill)
 	if err == nil || !strings.Contains(err.Error(), "identity changed") {
 		t.Fatalf("identity flip during grace must abort with a refusal: %v", err)
 	}
-	if calls < 2 {
-		t.Fatalf("verifier must run before SIGTERM and before SIGKILL, got %d calls", calls)
+	if termCalls != 1 || killCalls != 1 {
+		t.Fatalf("verifiers must each run exactly once (TERM %d, KILL %d)", termCalls, killCalls)
 	}
 	// The deadbeat process must STILL be alive — no SIGKILL landed.
 	if err := syscall.Kill(pid, 0); err != nil {
@@ -346,7 +350,7 @@ func TestTerminateVerifiedRefusesBeforeSIGTERM(t *testing.T) {
 		t.Fatal(err)
 	}
 	pid := rt.PID()
-	err = TerminateVerified(pid, func() bool { return false })
+	err = TerminateVerified(pid, func() bool { return false }, nil)
 	if err == nil || !strings.Contains(err.Error(), "before SIGTERM") {
 		t.Fatalf("first-check failure must refuse with the named stage: %v", err)
 	}
@@ -369,4 +373,114 @@ func TestStartTokenCarriesBootIdentity(t *testing.T) {
 	if tok != tok2 {
 		t.Fatalf("token must be stable: %q vs %q", tok, tok2)
 	}
+}
+
+// B2 token precision (darwin source): two children spawned within the
+// SAME wall-clock second must carry DISTINCT tokens — the old ps lstart
+// token was second-granular and collapsed them. Also: self token stable.
+func TestStartTokenPrecision(t *testing.T) {
+	self, err := ProcessStartToken(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS == "darwin" && !strings.Contains(self, ".") {
+		t.Fatalf("darwin token must be microsecond-precise (sec.usec): %q", self)
+	}
+	again, _ := ProcessStartToken(os.Getpid())
+	if self != again {
+		t.Fatalf("token must be stable: %q vs %q", self, again)
+	}
+	spawn := func() *exec.Cmd {
+		cmd := exec.Command("sleep", "5")
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		return cmd
+	}
+	a, b := spawn(), spawn() // same wall-clock second
+	defer a.Process.Kill()
+	defer b.Process.Kill()
+	ta, err := ProcessStartToken(a.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tb, err := ProcessStartToken(b.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ta == tb {
+		t.Fatalf("same-second children must have distinct start tokens (precision broken): %q", ta)
+	}
+}
+
+// B2 zombie contract: a process that closed its listener after SIGTERM
+// and hangs in shutdown must receive its SIGKILL WITHIN the grace —
+// the pre-kill identity check is endpoint-free by design. Short grace
+// via the test hook keeps this fast.
+func TestZombieGetsSIGKILLWithinGrace(t *testing.T) {
+	w := weightsFile(t, 128)
+	t.Setenv("STUB_ZOMBIE", "1")
+	restore := shortGrace(t, 1500*time.Millisecond)
+	defer restore()
+	rt, err := Spawn(SpawnRequest{Binary: stubPath, Weights: w, Stdout: os.Stderr, Stderr: os.Stderr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Terminate()
+	if err := rt.WaitReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	pid := rt.PID()
+	token, err := ProcessStartToken(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	// verifyTerm like Stop: token + /v1/models probe against the live
+	// endpoint (still up pre-TERM). verifyKill: endpoint-free token —
+	// the zombie's listener is CLOSED by the time it runs.
+	endpoint := rt.Endpoint()
+	err = TerminateVerified(pid,
+		func() bool { return StartIdentityOK(pid, token) && probeID(endpoint) },
+		func() bool { return StartIdentityOK(pid, token) },
+	)
+	if err != nil {
+		t.Fatalf("zombie must be killed, not refused: %v", err)
+	}
+	d := time.Since(start)
+	if d > TerminateGrace+2*time.Second {
+		t.Fatalf("kill took %s — grace window broken", d)
+	}
+	// SIGKILL is asynchronous — poll for reaping instead of a single
+	// check that races the kernel.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err != nil {
+			return // reaped
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("zombie still alive after TerminateVerified + SIGKILL")
+}
+
+// probeID mirrors the endpoint factor of Stop's pre-TERM check.
+func probeID(endpoint string) bool {
+	cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(cctx, http.MethodGet, endpoint+"/v1/models", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// shortGrace narrows TerminateGrace for one test (round-3 warning 5:
+// termination tests ran ~30 s each; production default stays 30 s).
+func shortGrace(t *testing.T, d time.Duration) func() {
+	t.Helper()
+	old := TerminateGrace
+	TerminateGrace = d
+	return func() { TerminateGrace = old }
 }

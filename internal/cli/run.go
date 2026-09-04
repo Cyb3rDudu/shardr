@@ -58,10 +58,13 @@ func Run(ctx context.Context, c *Client, arg string, opts RunOptions, out io.Wri
 	if err != nil {
 		return err
 	}
-	// Per-launch scratch cleanup on every foreground exit path.
+	// Per-launch scratch cleanup on every foreground exit path (W1:
+	// removal errors surface on stderr, never silently "success").
 	defer func() {
 		if rt.SplitDir != "" {
-			removeSplitDir(rt.SplitDir)
+			if err := removeSplitDir(rt.SplitDir); err != nil {
+				fmt.Fprintf(os.Stderr, "shardr: split cleanup: %v\n", err)
+			}
 		}
 	}()
 	defer rt.Terminate() // one terminate path: signal or ctx, never both fire twice
@@ -137,9 +140,14 @@ func Stop(ctx context.Context, c *Client, id string, all bool, out io.Writer) er
 				in.ID, in.PID, reg.Path())
 		}
 		fmt.Fprintf(out, "stopping %s (pid %d)…\n", in.ID, in.PID)
-		// TerminateVerified re-checks identity immediately before SIGTERM
-		// AND before SIGKILL (the 30 s window can recycle a dead pid).
-		if err := runner.TerminateVerified(in.PID, func() bool { return identityOK(ctx, *in) }); err != nil {
+		// Split identity (round 3): before SIGTERM the full two-factor
+		// check (start token + served ref); before SIGKILL the start
+		// identity ONLY — a shutdown-hanging process that already closed
+		// its listener is still ours and must get its owed kill.
+		if err := runner.TerminateVerified(in.PID,
+			func() bool { return identityOK(ctx, *in) },
+			func() bool { return runner.StartIdentityOK(in.PID, in.StartToken) },
+		); err != nil {
 			return err
 		}
 		// Split-scratch cleanup (per-launch dir — only THIS instance's
@@ -147,8 +155,10 @@ func Stop(ctx context.Context, c *Client, id string, all bool, out io.Writer) er
 		// recomputed scratch root and expected shape before any removal:
 		// a corrupted or tampered registry must never turn stop into a
 		// recursive delete of an arbitrary directory.
-		if in.SplitDir != "" && !removeSplitDir(in.SplitDir) {
-			fmt.Fprintf(out, "warning: split dir %q failed validation — left in place, remove manually if stale\n", in.SplitDir)
+		if in.SplitDir != "" {
+			if err := removeSplitDir(in.SplitDir); err != nil {
+				fmt.Fprintf(out, "warning: %v\n", err)
+			}
 		}
 		if err := reg.Remove(tid); err != nil {
 			return err
@@ -159,10 +169,9 @@ func Stop(ctx context.Context, c *Client, id string, all bool, out io.Writer) er
 }
 
 // identityOK is the two-factor guard (start token + served ref),
-// evaluated LIVE — used before stop and re-checked before every signal.
+// evaluated LIVE — used before stop and before SIGTERM.
 func identityOK(ctx context.Context, in runner.Instance) bool {
-	liveToken, terr := runner.ProcessStartToken(in.PID)
-	if terr != nil || in.StartToken == "" || liveToken != in.StartToken {
+	if !runner.StartIdentityOK(in.PID, in.StartToken) {
 		return false
 	}
 	id, ok := probeModelID(ctx, in.Endpoint)
@@ -220,9 +229,20 @@ func launch(ctx context.Context, c *Client, arg string, opts RunOptions, out io.
 	}
 	if err := l.Runtime.WaitReady(ctx); err != nil {
 		l.Runtime.Terminate()
+		cleanFailedLaunch(l)
 		return nil, err
 	}
 	return l, nil
+}
+
+// cleanFailedLaunch releases everything a failed launch still owns:
+// the per-launch split scratch (hardlinks pin CAS inodes while alive).
+func cleanFailedLaunch(l *launched) {
+	if l != nil && l.SplitDir != "" {
+		if err := removeSplitDir(l.SplitDir); err != nil {
+			fmt.Fprintf(os.Stderr, "shardr: split cleanup after failed launch: %v\n", err)
+		}
+	}
 }
 
 func launchDetached(ctx context.Context, c *Client, arg string, opts RunOptions, out io.Writer) (*launched, error) {
@@ -232,9 +252,7 @@ func launchDetached(ctx context.Context, c *Client, arg string, opts RunOptions,
 	}
 	if err := l.Runtime.WaitReady(ctx); err != nil {
 		l.Runtime.Terminate()
-		if l.SplitDir != "" {
-			removeSplitDir(l.SplitDir)
-		}
+		cleanFailedLaunch(l)
 		return nil, err
 	}
 	// Start token at serve time: pid-reuse identity for every later stop
@@ -243,9 +261,7 @@ func launchDetached(ctx context.Context, c *Client, arg string, opts RunOptions,
 	token, terr := runner.ProcessStartToken(l.Runtime.PID())
 	if terr != nil {
 		l.Runtime.Terminate()
-		if l.SplitDir != "" {
-			removeSplitDir(l.SplitDir)
-		}
+		cleanFailedLaunch(l)
 		return nil, terr
 	}
 	// Register only after readiness — a dead instance never lands in the
@@ -253,6 +269,7 @@ func launchDetached(ctx context.Context, c *Client, arg string, opts RunOptions,
 	reg, err := runner.OpenRegistry()
 	if err != nil {
 		l.Runtime.Terminate()
+		cleanFailedLaunch(l)
 		return nil, err
 	}
 	if err := reg.Add(runner.Instance{
@@ -261,9 +278,7 @@ func launchDetached(ctx context.Context, c *Client, arg string, opts RunOptions,
 		StartToken: token, SplitDir: l.SplitDir,
 	}); err != nil {
 		l.Runtime.Terminate()
-		if l.SplitDir != "" {
-			removeSplitDir(l.SplitDir)
-		}
+		cleanFailedLaunch(l)
 		return nil, err
 	}
 	return l, nil
@@ -349,7 +364,15 @@ func prepare(ctx context.Context, c *Client, arg string, opts RunOptions, out io
 	if err != nil {
 		return nil, fmt.Errorf("E_CONFIG: %w", err)
 	}
-	splitDirUsed := ""                      // set when a split scratch dir was linked
+	splitDirUsed := "" // set when a split scratch dir was linked
+	// Ownership model (round-3 blocker 1): prepare() owns the scratch
+	// until it returns SUCCESS; every failure path — linking,
+	// ResolveBinary, serve log, Spawn — runs through exactly this defer.
+	defer func() {
+		if splitDirUsed != "" {
+			os.RemoveAll(splitDirUsed)
+		}
+	}()
 	variant := merged["mmproj_variant"].Str // "" → f16 default (002 §5.7)
 	weights, parts, mmproj, warns, err := pickWeights(open.Files, variant)
 	for _, w := range warns {
@@ -368,13 +391,6 @@ func prepare(ctx context.Context, c *Client, arg string, opts RunOptions, out io
 		if serr != nil {
 			return nil, serr
 		}
-		// Error paths from here on must not leak the scratch dir.
-		ok := false
-		defer func() {
-			if !ok {
-				os.RemoveAll(splitDir)
-			}
-		}()
 		for _, p := range parts {
 			dst := filepath.Join(splitDir, p.Name)
 			// Manifest names may be nested ("dir/part.gguf") — the
@@ -387,8 +403,7 @@ func prepare(ctx context.Context, c *Client, arg string, opts RunOptions, out io
 			}
 		}
 		weights.Path = filepath.Join(splitDir, parts[0].Name)
-		splitDirUsed = splitDir
-		ok = true
+		splitDirUsed = splitDir // the function-scope defer owns it now
 	}
 
 	bin, err := runner.ResolveBinary()
@@ -418,7 +433,9 @@ func prepare(ctx context.Context, c *Client, arg string, opts RunOptions, out io
 	if err != nil {
 		return nil, err
 	}
-	return &launched{Runtime: rt, Ref: canonical, ID: idFor(opts.ID, p), SplitDir: splitDirUsed}, nil
+	handed := splitDirUsed
+	splitDirUsed = "" // ownership transfers to the caller — defer stands down
+	return &launched{Runtime: rt, Ref: canonical, ID: idFor(opts.ID, p), SplitDir: handed}, nil
 }
 
 // pickWeights selects the weights.gguf file and the vision-projector aux
@@ -511,16 +528,31 @@ func validSplitDir(stored string) bool {
 	if stored == "" {
 		return false
 	}
-	rel, err := filepath.Rel(splitRoot(), stored)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+	root := splitRoot()
+	rel, err := filepath.Rel(root, stored)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
 		return false
 	}
 	segs := strings.Split(rel, string(filepath.Separator))
-	if len(segs) != 2 || !isHex64(segs[0]) || segs[1] == "" || strings.Contains(segs[1], string(filepath.Separator)) {
+	if len(segs) != 2 || !isHex64(segs[0]) || segs[1] == "" {
 		return false
 	}
-	fi, err := os.Lstat(stored)
-	return err == nil && fi.IsDir()
+	// EVERY component below the root must be a real directory — a
+	// symlink anywhere in the path (root/manifesthex → elsewhere)
+	// escapes the boundary no matter how correct the final shape looks
+	// (round-3 warning 2).
+	partial := root
+	if fi, err := os.Lstat(partial); err != nil || !fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	for _, seg := range segs {
+		partial = filepath.Join(partial, seg)
+		fi, err := os.Lstat(partial)
+		if err != nil || !fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func isHex64(s string) bool {
@@ -535,15 +567,17 @@ func isHex64(s string) bool {
 	return true
 }
 
-// removeSplitDir removes a stored split dir after validation; returns
-// whether removal happened (invalid/foreign paths are left untouched
-// and reported).
-func removeSplitDir(stored string) bool {
+// removeSplitDir removes a stored split dir after validation. An
+// invalid/foreign path is left untouched and reported as an error; a
+// failing RemoveAll is returned, never swallowed.
+func removeSplitDir(stored string) error {
 	if !validSplitDir(stored) {
-		return false
+		return fmt.Errorf("E_STATE: split dir %q failed validation — left in place, remove manually if stale", stored)
 	}
-	os.RemoveAll(stored)
-	return true
+	if err := os.RemoveAll(stored); err != nil {
+		return fmt.Errorf("E_STATE: remove split dir %s: %w", stored, err)
+	}
+	return nil
 }
 
 // linkPart places one split part under its original name: hardlink

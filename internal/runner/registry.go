@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"regexp"
@@ -229,25 +228,38 @@ func salvagePIDs(b []byte) []int {
 // be killable (002 §4 supervisor duty cuts both ways).
 func ProcessStartToken(pid int) (string, error) {
 	// The token binds pid → (boot, start): boot identity survives pid
-	// reuse across reboots, start identity within a boot. lstart is only
-	// second-granular on darwin — the boot prefix is what makes the
-	// token load-bearing despite that.
+	// reuse across reboots, start identity within a boot. Resolution:
+	// linux = kernel start ticks; darwin = the process structure's
+	// microsecond start time (kern.proc sysctl) — the ps lstart fallback
+	// (second-granular) deliberately no longer participates.
 	if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)); err == nil {
 		// Field 22 after the parenthesized comm (comm may contain spaces).
 		s := string(b)
 		if i := strings.LastIndexByte(s, ')'); i >= 0 && i+2 <= len(s) {
 			fields := strings.Fields(s[i+2:])
 			if len(fields) >= 20 {
-				return "linux:" + linuxBootTime() + ":" + fields[19], nil // fields[0] is state (field 3); +19 = field 22
+				btime := linuxBootTime()
+				if btime == "?" {
+					return "", fmt.Errorf("E_STATE: cannot resolve boot identity (/proc/stat btime) for pid %d — refusing to trust a boot-less token", pid)
+				}
+				return "linux:" + btime + ":" + fields[19], nil // fields[0] is state (field 3); +19 = field 22
 			}
 		}
 		return "", fmt.Errorf("E_STATE: /proc/%d/stat: unexpected layout", pid)
 	}
-	out, err := exec.Command("ps", "-o", "lstart=", "-p", strconv.Itoa(pid)).Output()
-	if err != nil || len(out) == 0 {
-		return "", fmt.Errorf("E_STATE: cannot derive start token for pid %d: %v", pid, err)
+	start := darwinProcStart(pid)
+	if start == "" {
+		return "", fmt.Errorf("E_STATE: cannot derive microsecond start identity for pid %d (proc_pidinfo unavailable)", pid)
 	}
-	return "darwin:" + darwinBootTime() + ":" + strings.Join(strings.Fields(string(out)), " "), nil
+	return "darwin:" + darwinBootTime() + ":" + start, nil
+}
+
+// StartIdentityOK is the endpoint-free factor: the LIVE start token of
+// the pid must match the recorded one. This is the check that runs
+// immediately before SIGKILL — it must never depend on HTTP surfaces.
+func StartIdentityOK(pid int, recorded string) bool {
+	live, err := ProcessStartToken(pid)
+	return err == nil && recorded != "" && live == recorded
 }
 
 // linuxBootTime reads the boot epoch from /proc/stat (btime line).

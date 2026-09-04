@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -50,13 +51,34 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	if os.Getenv("STUB_EXIT_EARLY") == "1" {
+		// Spawn-then-die: WaitReady fails (startup-failure path).
+		fmt.Fprintln(os.Stderr, "stub: early exit as requested")
+		os.Exit(1)
+	}
 
+	// Listener handle for zombie mode.
+	ln, lerr := net.Listen("tcp", host+":"+port)
+	if lerr != nil {
+		fmt.Fprintln(os.Stderr, "stub:", lerr)
+		os.Exit(1)
+	}
 	// Exit-clean-on-signal discipline (002 §5.3): SIGTERM → clean exit.
 	go func() {
 		sig := make(chan os.Signal, 2)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		s := <-sig
-		if os.Getenv("STUB_IGNORE_SIGTERM") == "1" && s == syscall.SIGTERM {
+		switch {
+		case os.Getenv("STUB_ZOMBIE") == "1" && s == syscall.SIGTERM:
+			// Zombie mode: close the listener (endpoint probe now fails),
+			// then hang in shutdown forever — the runner's endpoint-free
+			// kill-identity check must still deliver SIGKILL.
+			ln.Close()
+			fmt.Fprintln(os.Stderr, "stub: zombie — listener closed, hanging")
+			for {
+				time.Sleep(time.Hour)
+			}
+		case os.Getenv("STUB_IGNORE_SIGTERM") == "1" && s == syscall.SIGTERM:
 			// Deadbeat mode: never exit — the runner must SIGKILL us.
 			fmt.Fprintln(os.Stderr, "stub: ignoring SIGTERM (deadline test)")
 			for {
@@ -126,9 +148,17 @@ func main() {
 		fmt.Fprintf(w, `{"id":"stub","object":"chat.completion","model":%q,"choices":[{"index":0,"message":{"role":"assistant","content":%q}}]}`,
 			body.Model, "echo: "+content+suffix)
 	})
-	addr := host + ":" + port
-	fmt.Fprintf(os.Stderr, "stub-llama-server listening on %s (model %s)\n", addr, model)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	fmt.Fprintf(os.Stderr, "stub-llama-server listening on %s (model %s)\n", ln.Addr(), model)
+	if err := http.Serve(ln, mux); err != nil {
+		if os.Getenv("STUB_ZOMBIE") == "1" {
+			// Zombie mode: the listener close (our SIGTERM handler) kills
+			// Serve's accept loop — the PROCESS must hang on regardless;
+			// only the runner's SIGKILL may end it.
+			fmt.Fprintln(os.Stderr, "stub: zombie serve loop ended — hanging")
+			for {
+				time.Sleep(time.Hour)
+			}
+		}
 		fmt.Fprintln(os.Stderr, "stub:", err)
 		os.Exit(1)
 	}
