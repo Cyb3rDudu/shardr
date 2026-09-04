@@ -159,6 +159,12 @@ const (
 	ErrInvalidIndex       = "E_INVALID_INDEX"
 	ErrRangeInvalid       = "E_RANGE_INVALID"
 	ErrInternal           = "E_INTERNAL"
+
+	// ErrCorruption is the dedicated CAS-corruption class (issue #26
+	// review: corruption must not report as E_INTERNAL — 005 §3 reads
+	// that as "daemon bug"; a corrupt blob is a storage verdict, not a
+	// code bug). Spec note: additive to the 005 §3 v1 inventory.
+	ErrCorruption = "E_CORRUPTION"
 )
 
 // New creates a server for the store. socket == "" → DefaultSocketPath.
@@ -653,10 +659,10 @@ func (s *Server) loadManifest(hexDigest string) (*artifact.Manifest, []byte, *ht
 	}
 	var m artifact.Manifest
 	if err := json.Unmarshal(b, &m); err != nil {
-		return nil, nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInternal, Message: "manifest blob " + hexDigest + " is not valid JSON (CAS corruption — never silently rebuilt): " + err.Error()}}
+		return nil, nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrCorruption, Message: "manifest blob " + hexDigest + " is not valid JSON (CAS corruption — never silently rebuilt): " + err.Error()}}
 	}
 	if err := artifact.ValidateManifest(&m); err != nil {
-		return nil, nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrInternal, Message: "manifest blob " + hexDigest + " fails validation (CAS corruption): " + err.Error()}}
+		return nil, nil, &httpError{http.StatusInternalServerError, &APIError{Code: ErrCorruption, Message: "manifest blob " + hexDigest + " fails validation (CAS corruption): " + err.Error()}}
 	}
 	return &m, b, nil
 }

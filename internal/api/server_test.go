@@ -434,6 +434,13 @@ func TestOpenListsPathsAndMissing(t *testing.T) {
 	if !strings.Contains(string(body), "corruption") {
 		t.Fatalf("error must name the corruption class: %s", body)
 	}
+	var cerr struct {
+		Error APIError `json:"error"`
+	}
+	json.Unmarshal(body, &cerr)
+	if cerr.Error.Code != ErrCorruption {
+		t.Fatalf("corrupt manifest must carry E_CORRUPTION, got %s", cerr.Error.Code)
+	}
 	// Absent manifest: listed as missing, never fetched.
 	code, body = h.get("/v1/open?ref=" + url.QueryEscape("shardr:///ns/models:q4_0"))
 	if code != http.StatusOK {

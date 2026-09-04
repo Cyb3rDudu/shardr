@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -294,5 +295,78 @@ func TestUserConfigOverlay(t *testing.T) {
 	got2 := UserConfigOverlay(f, "llama", "third/repo:q8_0")
 	if got2["n_threads"].Int != 8 {
 		t.Fatalf("runtime-global must apply: %+v", got2)
+	}
+}
+
+// C4: identity is re-checked IMMEDIATELY BEFORE SIGKILL. A verifier that
+// flips to false during the grace window (pid died and was recycled)
+// must abort WITHOUT the kill — the deadbeat process survives and the
+// error names the refusal.
+func TestTerminateVerifiedRefusesKillOnIdentityFlip(t *testing.T) {
+	w := weightsFile(t, 128)
+	t.Setenv("STUB_IGNORE_SIGTERM", "1") // deadbeat: ignores SIGTERM
+	rt, err := Spawn(SpawnRequest{Binary: stubPath, Weights: w, Stdout: os.Stderr, Stderr: os.Stderr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Terminate()
+	if err := rt.WaitReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	pid := rt.PID()
+	calls := 0
+	flip := func() bool {
+		calls++
+		return calls == 1 // true before SIGTERM, false before SIGKILL
+	}
+	err = TerminateVerified(pid, flip)
+	if err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("identity flip during grace must abort with a refusal: %v", err)
+	}
+	if calls < 2 {
+		t.Fatalf("verifier must run before SIGTERM and before SIGKILL, got %d calls", calls)
+	}
+	// The deadbeat process must STILL be alive — no SIGKILL landed.
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatal("SIGKILL landed despite failed identity verification")
+	}
+	rt.Terminate() // cleanup without verifier
+}
+
+// C4: identity checked before SIGTERM — a failing first check never
+// signals at all.
+func TestTerminateVerifiedRefusesBeforeSIGTERM(t *testing.T) {
+	w := weightsFile(t, 128)
+	rt, err := Spawn(SpawnRequest{Binary: stubPath, Weights: w, Stdout: os.Stderr, Stderr: os.Stderr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Terminate()
+	if err := rt.WaitReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	pid := rt.PID()
+	err = TerminateVerified(pid, func() bool { return false })
+	if err == nil || !strings.Contains(err.Error(), "before SIGTERM") {
+		t.Fatalf("first-check failure must refuse with the named stage: %v", err)
+	}
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatal("process was signaled despite failed verification")
+	}
+}
+
+// Boot identity is part of the token (pid reuse across reboots).
+func TestStartTokenCarriesBootIdentity(t *testing.T) {
+	tok, err := ProcessStartToken(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(tok, ":") {
+		t.Fatalf("token must be prefixed by platform+boot identity: %q", tok)
+	}
+	// Same pid twice → same token (stable within a boot).
+	tok2, _ := ProcessStartToken(os.Getpid())
+	if tok != tok2 {
+		t.Fatalf("token must be stable: %q vs %q", tok, tok2)
 	}
 }

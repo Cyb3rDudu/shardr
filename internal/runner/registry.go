@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -228,13 +229,17 @@ func salvagePIDs(b []byte) []int {
 // every signal: a stale registry entry whose pid was reused must NEVER
 // be killable (002 §4 supervisor duty cuts both ways).
 func ProcessStartToken(pid int) (string, error) {
+	// The token binds pid → (boot, start): boot identity survives pid
+	// reuse across reboots, start identity within a boot. lstart is only
+	// second-granular on darwin — the boot prefix is what makes the
+	// token load-bearing despite that.
 	if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)); err == nil {
 		// Field 22 after the parenthesized comm (comm may contain spaces).
 		s := string(b)
 		if i := strings.LastIndexByte(s, ')'); i >= 0 && i+2 <= len(s) {
 			fields := strings.Fields(s[i+2:])
 			if len(fields) >= 20 {
-				return "linux:" + fields[19], nil // fields[0] is state (field 3); +19 = field 22
+				return "linux:" + linuxBootTime() + ":" + fields[19], nil // fields[0] is state (field 3); +19 = field 22
 			}
 		}
 		return "", fmt.Errorf("E_STATE: /proc/%d/stat: unexpected layout", pid)
@@ -243,5 +248,32 @@ func ProcessStartToken(pid int) (string, error) {
 	if err != nil || len(out) == 0 {
 		return "", fmt.Errorf("E_STATE: cannot derive start token for pid %d: %v", pid, err)
 	}
-	return "ps:" + strings.Join(strings.Fields(string(out)), " "), nil
+	return "darwin:" + darwinBootTime() + ":" + strings.Join(strings.Fields(string(out)), " "), nil
+}
+
+// linuxBootTime reads the boot epoch from /proc/stat (btime line).
+func linuxBootTime() string {
+	b, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return "?"
+	}
+	for _, ln := range strings.Split(string(b), "\n") {
+		if strings.HasPrefix(ln, "btime ") {
+			return strings.TrimSpace(strings.TrimPrefix(ln, "btime "))
+		}
+	}
+	return "?"
+}
+
+// darwinBootTime reads kern.boottime (seconds since epoch).
+func darwinBootTime() string {
+	b, err := syscall.Sysctl("kern.boottime")
+	if err != nil || len(b) < 8 {
+		return "?"
+	}
+	var sec int64
+	if err := binary.Read(strings.NewReader(b[:8]), binary.LittleEndian, &sec); err != nil {
+		return "?"
+	}
+	return strconv.FormatInt(sec, 10)
 }

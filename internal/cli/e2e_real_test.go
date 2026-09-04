@@ -154,14 +154,23 @@ func TestRealBinaryE2E(t *testing.T) {
 	answer := strings.TrimSpace(chat.Choices[0].Message.Content + chat.Choices[0].Message.ReasoningContent)
 	fmt.Printf("chat answered: %.80s…\n", answer)
 
+	// The real runtime reports timings; a fake or degraded backend does
+	// not — positive tok/s is part of the assertion, not decoration.
+	if chat.Timings.PromptPerSecond <= 0 || chat.Timings.PredictedPerSecond <= 0 {
+		t.Fatalf("missing positive timings (prompt %.2f / predicted %.2f tok/s) — not a real-runtime proof",
+			chat.Timings.PromptPerSecond, chat.Timings.PredictedPerSecond)
+	}
+
 	// Proof artifact: EVERYTHING the test asserts must be visible in the
 	// artifact (chat status, served model id, response, tok/s) — a green
-	// check without recorded evidence is unfalsifiable.
+	// check without recorded evidence is unfalsifiable. When the proof
+	// env is set, a failed write FAILS the test.
 	if p := os.Getenv("SHARDR_E2E_PROOF"); p != "" {
 		proof := fmt.Sprintf("e2e real-binary proof (TestRealBinaryE2E)\nref:        %s\nendpoint:   %s\nmodel id:   %s\nchat:       HTTP %d\nanswer:     %.120s\ntok/s:      prompt %.1f / predicted %.1f\nexit:       ",
 			shortRef, endpoint, models.Models[0].ID, cresp.StatusCode, answer, chat.Timings.PromptPerSecond, chat.Timings.PredictedPerSecond)
-		_ = proof
-		os.WriteFile(p+".partial", []byte(proof), 0o644)
+		if err := os.WriteFile(p+".partial", []byte(proof), 0o644); err != nil {
+			t.Fatalf("write proof artifact %s: %v", p+".partial", err)
+		}
 		t.Cleanup(func() { os.Remove(p + ".partial") })
 	}
 
@@ -178,8 +187,12 @@ func TestRealBinaryE2E(t *testing.T) {
 	}
 	fmt.Printf("clean exit after %s\n", time.Since(start).Round(time.Millisecond))
 	if p := os.Getenv("SHARDR_E2E_PROOF"); p != "" {
-		if b, err := os.ReadFile(p + ".partial"); err == nil {
-			os.WriteFile(p, append(b, []byte(fmt.Sprintf("clean after %s\n", time.Since(start).Round(time.Millisecond)))...), 0o644)
+		b, err := os.ReadFile(p + ".partial")
+		if err != nil {
+			t.Fatalf("read partial proof artifact: %v", err)
+		}
+		if err := os.WriteFile(p, append(b, []byte(fmt.Sprintf("clean after %s\n", time.Since(start).Round(time.Millisecond)))...), 0o644); err != nil {
+			t.Fatalf("finalize proof artifact %s: %v", p, err)
 		}
 	}
 }
