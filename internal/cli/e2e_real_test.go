@@ -81,7 +81,7 @@ func TestRealBinaryE2E(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	out := &bytes.Buffer{}
+	out := &syncBuffer{}
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, c, shortRef, RunOptions{}, out) }()
 	endpoint := ""

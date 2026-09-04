@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -173,7 +174,7 @@ func TestRunForegroundLifecycle(t *testing.T) {
 	}
 
 	c, _ := NewClient()
-	out := &bytes.Buffer{}
+	out := &syncBuffer{}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -234,6 +235,26 @@ func TestRunUnknownConfigKeyIsLoud(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "E_CONFIG") || !strings.Contains(err.Error(), "user config") {
 		t.Fatalf("unknown key must be loud with layer: %v", err)
 	}
+}
+
+// syncBuffer is a mutex-guarded bytes.Buffer: Run writes from its
+// goroutine while the test polls String() — the race detector demands
+// synchronization (caught in CI, not locally — exactly what it is for).
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
 }
 
 func serveEndpoint(serveOut string) string {
