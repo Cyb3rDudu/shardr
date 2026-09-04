@@ -731,7 +731,7 @@ func TestCleanupRefusesTamperedSplitDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stop with tampered dir must still stop the process: %v", err)
 	}
-	if !strings.Contains(out.String(), "failed validation") {
+	if !strings.Contains(out.String(), "left in place") {
 		t.Fatalf("warning must name the refused cleanup:\n%s", out.String())
 	}
 	if b, err := os.ReadFile(victimFile); err != nil || string(b) != "keep me" {
