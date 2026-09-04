@@ -1,7 +1,6 @@
 package runner
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -263,17 +262,4 @@ func linuxBootTime() string {
 		}
 	}
 	return "?"
-}
-
-// darwinBootTime reads kern.boottime (seconds since epoch).
-func darwinBootTime() string {
-	b, err := syscall.Sysctl("kern.boottime")
-	if err != nil || len(b) < 8 {
-		return "?"
-	}
-	var sec int64
-	if err := binary.Read(strings.NewReader(b[:8]), binary.LittleEndian, &sec); err != nil {
-		return "?"
-	}
-	return strconv.FormatInt(sec, 10)
 }
