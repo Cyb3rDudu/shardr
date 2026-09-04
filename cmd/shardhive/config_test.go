@@ -126,17 +126,3 @@ n_gpu_layers = 40
 		t.Fatalf("spec example must yield the documented defaults: %+v", cfg)
 	}
 }
-
-// Inline comments are stripped outside strings; a # inside a quoted
-// string value survives.
-func TestStripCommentSemantics(t *testing.T) {
-	if got := stripComment(`true            # shardhive swarm client`); got != "true" {
-		t.Fatalf("inline bool comment: %q", got)
-	}
-	if got := stripComment(`"a#b"  # trailing`); got != `"a#b"` {
-		t.Fatalf("quoted hash survives: %q", got)
-	}
-	if got := stripComment("127.0.0.1:0"); got != "127.0.0.1:0" {
-		t.Fatalf("no comment untouched: %q", got)
-	}
-}

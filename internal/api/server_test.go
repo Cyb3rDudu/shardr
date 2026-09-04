@@ -1432,3 +1432,149 @@ func TestEnsureInvalidRecordMapsNotImportable(t *testing.T) {
 		t.Fatalf("message must name the validation failure: %s", term.Error.Message)
 	}
 }
+
+// /v1/verify with a digest: re-hash job against the imported gold
+// artifact — clean case done, corrupted case failed E_VERIFY_FAILED.
+func TestVerifyEndpoint(t *testing.T) {
+	h := newHarness(t)
+	fixtures := "../../internal/importer/testdata/gold"
+	sources, err := importer.LocalSources([]string{fixtures})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lres, err := importer.Import(context.Background(), h.store, sources, importer.ImportOptions{As: "gold/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := lres.Members[0].Manifest
+
+	// Clean: done, all blobs re-hashed (manifest + files).
+	code, body := h.postJSON("/v1/verify", map[string]string{"target": manifest})
+	if code != http.StatusCreated {
+		t.Fatalf("verify: %d %s", code, body)
+	}
+	var job Job
+	json.Unmarshal(body, &job)
+	term := waitJob(t, h, job.ID)
+	if term.State != "done" || term.FilesTotal < 2 {
+		t.Fatalf("clean verify: %+v", term)
+	}
+
+	// By ref (canonical) → same manifest.
+	ref := "shardr:///gold/repo:" + lres.Members[0].Quant
+	code, body = h.postJSON("/v1/verify", map[string]string{"target": ref})
+	if code != http.StatusCreated {
+		t.Fatalf("verify by ref: %d %s", code, body)
+	}
+	json.Unmarshal(body, &job)
+	term = waitJob(t, h, job.ID)
+	if term.State != "done" || term.Manifest != manifest {
+		t.Fatalf("verify by ref: %+v", term)
+	}
+
+	// --all: everything present → done with a Verify result.
+	code, body = h.postJSON("/v1/verify", map[string]string{"target": "all"})
+	if code != http.StatusCreated {
+		t.Fatalf("verify all: %d", code)
+	}
+	json.Unmarshal(body, &job)
+	term = waitJob(t, h, job.ID)
+	if term.State != "done" {
+		t.Fatalf("verify all: %+v", term)
+	}
+
+	// Corrupt one blob → failed E_VERIFY_FAILED naming it.
+	var mf struct {
+		Files []struct {
+			Digest string `json:"digest"`
+		} `json:"files"`
+	}
+	fh, _ := h.store.Open(strings.TrimPrefix(manifest, "sha256:"))
+	mb, _ := io.ReadAll(fh)
+	fh.Close()
+	json.Unmarshal(mb, &mf)
+	victim := strings.TrimPrefix(mf.Files[0].Digest, "sha256:")
+	vp, err := h.store.BlobPath(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Chmod(vp, 0o644)
+	os.WriteFile(vp, []byte("corrupted"), 0o644)
+	code, body = h.postJSON("/v1/verify", map[string]string{"target": manifest})
+	json.Unmarshal(body, &job)
+	term = waitJob(t, h, job.ID)
+	if term.State != "failed" || term.Error.Code != "E_VERIFY_FAILED" || !strings.Contains(term.Error.Message, victim) {
+		t.Fatalf("corrupt verify: %+v", term)
+	}
+}
+
+// /v1/jobs lists every job.
+func TestJobsList(t *testing.T) {
+	h := newHarness(t)
+	code, _ := h.postJSON("/v1/ensure", map[string]string{"ref": "shardr:///ns/none:q8_0"})
+	if code != http.StatusCreated {
+		t.Fatalf("ensure: %d", code)
+	}
+	code, body := h.do(http.MethodGet, "/v1/jobs", nil)
+	if code != http.StatusOK {
+		t.Fatalf("jobs: %d", code)
+	}
+	var list struct {
+		Jobs []Job `json:"jobs"`
+	}
+	json.Unmarshal(body, &list)
+	if len(list.Jobs) == 0 {
+		t.Fatal("job list must not be empty")
+	}
+	found := false
+	for _, j := range list.Jobs {
+		if j.Kind == "ensure" && j.State == "failed" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ensure job must be listed: %+v", list.Jobs)
+	}
+}
+
+// /v1/open on a fully present artifact returns the COMPLETE file list
+// with CAS paths (weights included) and no missing — the runner surface.
+func TestOpenFullFileList(t *testing.T) {
+	h := newHarness(t)
+	sources, err := importer.LocalSources([]string{"../../internal/importer/testdata/gold"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lres, err := importer.Import(context.Background(), h.store, sources, importer.ImportOptions{As: "gold/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := "shardr:///gold/repo:" + lres.Members[0].Quant
+	code, body := h.do(http.MethodGet, "/v1/open?ref="+ref, nil)
+	if code != http.StatusOK {
+		t.Fatalf("open: %d %s", code, body)
+	}
+	var res struct {
+		Files []struct {
+			Path string `json:"path"`
+			Kind string `json:"kind"`
+		} `json:"files"`
+		Missing []string `json:"missing"`
+	}
+	json.Unmarshal(body, &res)
+	if len(res.Missing) != 0 {
+		t.Fatalf("nothing may be missing: %+v", res.Missing)
+	}
+	var weights int
+	for _, f := range res.Files {
+		if f.Kind == "weights.gguf" {
+			weights++
+			if _, err := os.Stat(f.Path); err != nil {
+				t.Fatalf("weights path must exist: %s", f.Path)
+			}
+		}
+	}
+	if weights != 2 { // gold is a 2-part split GGUF
+		t.Fatalf("both split parts must be listed: %d", weights)
+	}
+}

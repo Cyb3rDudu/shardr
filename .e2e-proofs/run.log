@@ -1,0 +1,6 @@
+resolve shardr:///qwen/test:raw
+spawn /etc/profiles/per-user/dudu/bin/llama-server
+  weights /tmp/shardr-e2e/cas/blobs/sha256/8a/e8fd04e30c5a4af3ef72654729fb0d7f33615cac1ba335dd88084a56287934 (zero-copy mmap)
+ready: http://127.0.0.1:61526 (model id shardr:///qwen/test:raw) — Ctrl-C to stop
+
+stopping (SIGTERM; SIGKILL after 30 s)
