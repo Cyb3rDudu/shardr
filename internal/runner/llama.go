@@ -103,6 +103,15 @@ func Spawn(req SpawnRequest) (*Runtime, error) {
 		argv = append(argv, "--mmproj", req.Mmproj)
 	}
 	cmd := exec.Command(req.Binary, argv...)
+	// Fail-fast WITH reason (002 §5.6): nil sinks would swallow the
+	// runtime's startup diagnostics (/dev/null) — foreground runs stream
+	// them so a failed spawn says why.
+	if req.Stdout == nil {
+		req.Stdout = os.Stdout
+	}
+	if req.Stderr == nil {
+		req.Stderr = os.Stderr
+	}
 	cmd.Stdout, cmd.Stderr = req.Stdout, req.Stderr
 	if req.Detached {
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}

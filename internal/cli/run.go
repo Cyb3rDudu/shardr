@@ -2,11 +2,13 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -44,6 +46,7 @@ type openFile struct {
 	Role    string `json:"role,omitempty"`
 	Variant string `json:"variant,omitempty"`
 	Part    *int64 `json:"part,omitempty"`
+	Runtime string `json:"runtime,omitempty"`
 }
 
 // Run executes the foreground lifecycle (002 §4): resolve → ensure →
@@ -54,7 +57,7 @@ func Run(ctx context.Context, c *Client, arg string, opts RunOptions, out io.Wri
 	if err != nil {
 		return err
 	}
-	defer rt.Terminate()
+	defer rt.Terminate() // one terminate path: signal or ctx, never both fire twice
 	fmt.Fprintf(out, "ready: %s (model id %s) — Ctrl-C to stop\n", rt.Endpoint(), rt.Ref)
 
 	sig := make(chan os.Signal, 2)
@@ -64,7 +67,7 @@ func Run(ctx context.Context, c *Client, arg string, opts RunOptions, out io.Wri
 		fmt.Fprintln(out, "\nstopping (SIGTERM; SIGKILL after 30 s)")
 	case <-ctx.Done():
 	}
-	return rt.Terminate()
+	return nil
 }
 
 // Serve executes the background lifecycle (002 §4): detached spawn,
@@ -115,6 +118,15 @@ func Stop(ctx context.Context, c *Client, id string, all bool, out io.Writer) er
 		if err != nil {
 			return err
 		}
+		// PID-reuse guard: a stale registry entry after a crash/reboot
+		// could name an unrelated recycled PID — SIGTERM (+SIGKILL after
+		// 30 s) would kill it. Verify identity first: the instance's
+		// /v1/models must serve id == the registered ref (--alias makes
+		// the real runtime do exactly that).
+		if id, ok := probeModelID(ctx, in.Endpoint); !ok || id != in.Ref {
+			return fmt.Errorf("E_STATE: refusing to stop %s: pid %d does not serve %s on %s (stale entry or pid reuse?) — verify and clean %s manually",
+				in.ID, in.PID, in.Ref, in.Endpoint, reg.Path())
+		}
 		fmt.Fprintf(out, "stopping %s (pid %d)…\n", in.ID, in.PID)
 		if err := runner.TerminatePID(in.PID); err != nil {
 			return err
@@ -125,6 +137,31 @@ func Stop(ctx context.Context, c *Client, id string, all bool, out io.Writer) er
 		fmt.Fprintf(out, "stopped %s\n", tid)
 	}
 	return nil
+}
+
+// probeModelID asks a serve endpoint for its model id (identity check
+// before signaling; 002 §6 id = reference).
+func probeModelID(ctx context.Context, endpoint string) (string, bool) {
+	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, http.MethodGet, endpoint+"/v1/models", nil)
+	if err != nil {
+		return "", false
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", false
+	}
+	defer resp.Body.Close()
+	var list struct {
+		Models []struct {
+			ID string `json:"model"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil || len(list.Models) == 0 {
+		return "", false
+	}
+	return list.Models[0].ID, true
 }
 
 func idsOf(list []runner.Instance) string {
@@ -185,7 +222,7 @@ func launchDetached(ctx context.Context, c *Client, arg string, opts RunOptions,
 
 // prepare does resolve → ensure → open → overlay → spawn.
 func prepare(ctx context.Context, c *Client, arg string, opts RunOptions, out io.Writer, detached bool) (*launched, error) {
-	canonical, cfgFile, err := canonicalizeWithConfig(arg, opts.ConfigFile)
+	canonical, userCfgFile, layer3File, err := canonicalizeWithConfig(arg, opts.ConfigFile)
 	if err != nil {
 		return nil, err
 	}
@@ -225,8 +262,13 @@ func prepare(ctx context.Context, c *Client, arg string, opts RunOptions, out io
 	if len(open.Missing) > 0 {
 		return nil, fmt.Errorf("E_SOURCE_UNAVAILABLE: %d files still missing after ensure: %s", len(open.Missing), strings.Join(open.Missing, ", "))
 	}
-	// Overlays (002 §2): advisory ← runtime-config blob via /blob.
-	ov := runner.Overlay{UserConfig: runner.UserConfigOverlay(cfgFile, "llama", shortRefOf(p))}
+	// Overlays (002 §2): advisory ← runtime-config blob via /blob; user
+	// config and --config stay SEPARATE layers so unknown-key errors name
+	// the true source (layer provenance, 002 §2.2).
+	ov := runner.Overlay{
+		UserConfig: runner.UserConfigOverlay(userCfgFile, "llama", shortRefOf(p)),
+		ConfigFile: runner.ConfigFileOverlay(layer3File, "llama", shortRefOf(p)),
+	}
 	if open.ManifestDigest != "" {
 		if adv, aerr := advisory(ctx, c, open.Files); aerr != nil {
 			return nil, aerr
@@ -248,12 +290,35 @@ func prepare(ctx context.Context, c *Client, arg string, opts RunOptions, out io
 		return nil, fmt.Errorf("E_CONFIG: %w", err)
 	}
 	variant := merged["mmproj_variant"].Str // "" → f16 default (002 §5.7)
-	weights, mmproj, warns, err := pickWeights(open.Files, variant)
+	weights, parts, mmproj, warns, err := pickWeights(open.Files, variant)
 	for _, w := range warns {
 		fmt.Fprintf(out, "warning: %s\n", w)
 	}
 	if err != nil {
 		return nil, err
+	}
+	if len(parts) > 1 {
+		// Split GGUFs: llama.cpp discovers siblings by the
+		// <prefix>-0000N-of-0000M.gguf naming pattern — content-addressed
+		// CAS names never match. Hardlink the parts under their ORIGINAL
+		// manifest names into a per-manifest scratch dir: a hardlink
+		// copies zero bytes (zero-copy law intact, 002 §4).
+		splitDir, serr := splitScratchDir(open.ManifestDigest)
+		if serr != nil {
+			return nil, serr
+		}
+		for _, p := range parts {
+			dst := filepath.Join(splitDir, p.Name)
+			// Self-healing link: remove-then-link. A leftover from an
+			// earlier process whose CAS root died has nlink 1 (its
+			// original was unlinked); relinking against the live CAS
+			// source restores the shared-bytes state.
+			os.Remove(dst)
+			if err := os.Link(p.Path, dst); err != nil {
+				return nil, fmt.Errorf("E_RUNTIME: hardlink split part %s: %w", p.Name, err)
+			}
+		}
+		weights.Path = filepath.Join(splitDir, parts[0].Name)
 	}
 
 	bin, err := runner.ResolveBinary()
@@ -276,6 +341,9 @@ func prepare(ctx context.Context, c *Client, arg string, opts RunOptions, out io
 		Binary: bin, Weights: weights.Path, Argv: runner.Argv(merged), Mmproj: mmproj, Ref: canonical,
 		Detached: detached, Stdout: stdout, Stderr: stderr,
 	})
+	if stdout != nil {
+		stdout.Close() // the child owns its dup; our fd must not leak per Serve
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -285,13 +353,12 @@ func prepare(ctx context.Context, c *Client, arg string, opts RunOptions, out io
 // pickWeights selects the weights.gguf file and the vision-projector aux
 // (002 §5.7): variant from mmproj_variant (default f16); a multimodal
 // artifact without a projector warns; unknown aux roles log and continue.
-func pickWeights(files []openFile, variant string) (weights openFile, mmproj string, warns []string, err error) {
+func pickWeights(files []openFile, variant string) (weights openFile, parts []openFile, mmproj string, warns []string, err error) {
 	if variant == "" {
 		variant = "f16" // 002 §5.7 default
 	}
 	anyProjector := false
 	match := false
-	var parts []openFile
 	for _, f := range files {
 		switch f.Kind {
 		case "weights.gguf":
@@ -312,44 +379,73 @@ func pickWeights(files []openFile, variant string) (weights openFile, mmproj str
 		}
 	}
 	if len(parts) == 0 {
-		return weights, "", warns, fmt.Errorf("E_NOT_IMPORTABLE: artifact has no weights.gguf file (llama runtime, 002 §5.1)")
+		return weights, nil, "", warns, fmt.Errorf("E_NOT_IMPORTABLE: artifact has no weights.gguf file (llama runtime, 002 §5.1)")
 	}
 	// Split GGUFs (001 §3.1 Part field): one logical weights set in N
 	// ordered parts — llama-server takes part 1 via -m and discovers the
 	// siblings by its own naming convention. Contiguity was validated at
 	// import; parts of a split share the CAS directory.
-	sort.Slice(parts, func(i, j int) bool {
-		if parts[i].Part == nil || parts[j].Part == nil {
-			return false
+	partOf := func(f openFile) int64 {
+		if f.Part != nil {
+			return *f.Part
 		}
-		return *parts[i].Part < *parts[j].Part
-	})
+		return 0
+	}
+	sort.Slice(parts, func(i, j int) bool { return partOf(parts[i]) < partOf(parts[j]) })
 	weights = parts[0]
 	if anyProjector && !match {
 		// Multimodal artifact without the selected projector variant: a
 		// warning, never an abort (002 §5.7).
 		warns = append(warns, "vision-projector variant "+variant+" not found — serving text-only")
 	}
-	return weights, mmproj, warns, nil
+	return weights, parts, mmproj, warns, nil
+}
+
+// splitScratchDir is the per-manifest hardlink home for split GGUFs
+// ($XDG_RUNTIME_DIR or the per-uid tmp fallback, mirroring the registry).
+func splitScratchDir(manifestDigest string) (string, error) {
+	base := os.Getenv("XDG_RUNTIME_DIR")
+	if base == "" {
+		uid := "0"
+		if u, uerr := user.Current(); uerr == nil {
+			uid = u.Uid
+		}
+		base = filepath.Join(os.TempDir(), "shardr-"+uid)
+	}
+	dir := filepath.Join(base, "shardr-split", strings.TrimPrefix(manifestDigest, "sha256:"))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("E_STATE: split scratch dir: %w", err)
+	}
+	return dir, nil
 }
 
 func advisory(ctx context.Context, c *Client, files []openFile) (map[string]config.Value, error) {
+	out := map[string]config.Value{}
 	for _, f := range files {
-		if f.Kind != "runtime-config" {
+		// Only THIS runtime's advisory entries (001 §3.1 Runtime id): a
+		// foreign runtime's neutral keys must not leak into the llama
+		// layer, and all matching entries merge.
+		if f.Kind != "runtime-config" || f.Runtime != "llama" {
 			continue
 		}
 		resp, err := c.Do(ctx, http.MethodGet, "/v1/blob/"+strings.TrimPrefix(f.Digest, "sha256:"), nil)
 		if err != nil {
 			return nil, err
 		}
-		defer resp.Body.Close()
 		b, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		if err != nil {
 			return nil, fmt.Errorf("E_INTERNAL: read advisory blob: %w", err)
 		}
-		return runner.ParseScalars(b)
+		scalars, err := runner.ParseScalars(b)
+		if err != nil {
+			return nil, fmt.Errorf("E_CONFIG: advisory runtime-config %s: %w", f.Name, err)
+		}
+		for k, v := range scalars {
+			out[k] = v
+		}
 	}
-	return nil, nil
+	return out, nil
 }
 
 func shortRefOf(p *ref.Ref) string {
@@ -393,10 +489,10 @@ func urlEscape(s string) string {
 // canonicalizeWithConfig canonicalizes the ref (default_selector
 // comfort) and loads the merged layer-2/3 config file: user config ∪
 // --config (per-key, --config wins — it is the more specific layer 3).
-func canonicalizeWithConfig(arg, configFile string) (string, config.File, error) {
+func canonicalizeWithConfig(arg, configFile string) (string, config.File, config.File, error) {
 	userCfg, err := config.Load()
 	if err != nil {
-		return "", nil, fmt.Errorf("E_CONFIG: %w", err)
+		return "", nil, nil, fmt.Errorf("E_CONFIG: %w", err)
 	}
 	sel := ""
 	if sec, ok := userCfg["references"]; ok {
@@ -406,32 +502,18 @@ func canonicalizeWithConfig(arg, configFile string) (string, config.File, error)
 	}
 	canonical, err := Canonicalize(arg, sel)
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
 	if configFile == "" {
-		return canonical, userCfg, nil
+		return canonical, userCfg, config.File{}, nil
 	}
 	b, err := os.ReadFile(configFile)
 	if err != nil {
-		return "", nil, fmt.Errorf("E_CONFIG: read --config: %w", err)
+		return "", nil, nil, fmt.Errorf("E_CONFIG: read --config: %w", err)
 	}
 	layer3, err := config.Parse(configFile, string(b))
 	if err != nil {
-		return "", nil, fmt.Errorf("E_CONFIG: %w", err)
+		return "", nil, nil, fmt.Errorf("E_CONFIG: %w", err)
 	}
-	// Layer 3 replaces keys per section on top of layer 2 (002 §2.2).
-	merged := config.File{}
-	for sec, kv := range userCfg {
-		merged[sec] = kv
-	}
-	for sec, kv := range layer3 {
-		if merged[sec] == nil {
-			merged[sec] = kv
-			continue
-		}
-		for k, v := range kv {
-			merged[sec][k] = v
-		}
-	}
-	return canonical, merged, nil
+	return canonical, userCfg, layer3, nil
 }

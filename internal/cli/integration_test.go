@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -17,7 +18,13 @@ import (
 	"github.com/Cyb3rDudu/shardr/internal/api"
 	"github.com/Cyb3rDudu/shardr/internal/cas"
 	"github.com/Cyb3rDudu/shardr/internal/importer"
+	"github.com/Cyb3rDudu/shardr/internal/runner"
+	"syscall"
 )
+
+var runnerRegistryAt = runner.OpenRegistryAt
+
+type runnerInstance = runner.Instance
 
 var stubBinary string
 
@@ -283,4 +290,119 @@ func TestMain(m *testing.M) {
 		stubBinary = ""
 	}
 	os.Exit(m.Run())
+}
+
+// Split GGUFs serve through the ORIGINAL-name hardlink dir: llama.cpp
+// discovers siblings only by the <prefix>-0000N-of-0000M.gguf pattern —
+// a bare CAS path would load part 1 alone. The gold fixture is 2-part.
+func TestSplitGGUFHardlinkNaming(t *testing.T) {
+	if stubBinary == "" {
+		t.Skip("stub not built")
+	}
+	root := t.TempDir()
+	t.Setenv("SHARDR_CAS", root)
+	store, err := cas.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sockDir, _ := os.MkdirTemp(os.TempDir(), "sx")
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "hive.sock")
+	srv, err := api.New(store, sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	go srv.Serve()
+	t.Cleanup(func() { srv.Close() })
+	t.Setenv("SHARDR_SOCKET", sock)
+	t.Setenv("SHARDR_LLAMA_SERVER", stubBinary)
+	t.Setenv("SHARDR_CONFIG", writeCfg(t, ""))
+	af := filepath.Join(t.TempDir(), "argv.json")
+	t.Setenv("STUB_ARGV_FILE", af)
+	t.Setenv("SHARDR_RUNNER_STATE", filepath.Join(t.TempDir(), "instances.json"))
+
+	sources, _ := importer.LocalSources([]string{"../../internal/importer/testdata/gold"})
+	res, err := importer.Import(context.Background(), store, sources, importer.ImportOptions{As: "gold/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _ := NewClient()
+	out := &syncBuffer{}
+	if err := Serve(context.Background(), c, "gold/repo:"+res.Members[0].Quant, RunOptions{}, out); err != nil {
+		t.Fatalf("serve: %v\n%s", err, out.String())
+	}
+	// The stub recorded its argv: -m must point at the hardlink dir with
+	// the ORIGINAL part name, not the bare CAS hex path.
+	b, err := os.ReadFile(af)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var argv []string
+	json.Unmarshal(b, &argv)
+	joined := strings.Join(argv, " ")
+	if !strings.Contains(joined, "-of-00002.gguf") {
+		t.Fatalf("-m must use the original split name (pattern -00001-of-00002.gguf): %s", joined)
+	}
+	if !strings.Contains(joined, "shardr-split") {
+		t.Fatalf("-m must come from the split scratch dir: %s", joined)
+	}
+	// Zero-copy: the hardlink shares bytes — every scratch entry must be
+	// a link (st_nlink > 1), never a copy.
+	Stop(context.Background(), c, "", true, io.Discard)
+	var mPath string
+	for i, a := range argv {
+		if a == "-m" && i+1 < len(argv) {
+			mPath = argv[i+1]
+		}
+	}
+	splitDir := filepath.Dir(mPath)
+	entries, err := os.ReadDir(splitDir)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("split dir must hold both parts: %v %v", entries, err)
+	}
+	for _, e := range entries {
+		fi, err := os.Lstat(filepath.Join(splitDir, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !fi.Mode().IsRegular() {
+			t.Fatalf("%s must be a regular file (hardlink)", e.Name())
+		}
+		if nlink := fi.Sys().(*syscall.Stat_t).Nlink; nlink < 2 {
+			t.Fatalf("%s is a COPY, not a hardlink (nlink=%d)", e.Name(), nlink)
+		}
+	}
+}
+
+// stop REFUSES to signal when the pid does not serve the registered ref
+// (stale entry / pid reuse) — an unrelated process must never get
+// SIGTERM+SIGKILL.
+func TestStopRefusesForeignPID(t *testing.T) {
+	if stubBinary == "" {
+		t.Skip("stub not built")
+	}
+	state := filepath.Join(t.TempDir(), "instances.json")
+	t.Setenv("SHARDR_RUNNER_STATE", state)
+	// A live "unrelated" process (sleep) wearing the registered pid.
+	sleep := exec.Command("sleep", "60")
+	if err := sleep.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer sleep.Process.Kill()
+	reg := runnerRegistryAt(state)
+	if err := reg.Add(runnerInstance{ID: "victim", Ref: "shardr:///x/y:q8_0", Endpoint: "http://127.0.0.1:1", PID: sleep.Process.Pid}); err != nil {
+		t.Fatal(err)
+	}
+	c, _ := NewClient()
+	err := Stop(context.Background(), c, "victim", false, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "refusing to stop") {
+		t.Fatalf("foreign pid must be refused: %v", err)
+	}
+	// The sleep survived.
+	if err := sleep.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatal("unrelated process was killed — pid-reuse guard broken")
+	}
 }

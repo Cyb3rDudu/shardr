@@ -1578,3 +1578,59 @@ func TestOpenFullFileList(t *testing.T) {
 		t.Fatalf("both split parts must be listed: %d", weights)
 	}
 }
+
+// verify --all on a PRESENT-but-corrupted blob (content mismatch, not
+// missing) must FAIL — the integrity gate must not invert (003 §4).
+func TestVerifyAllDetectsMismatch(t *testing.T) {
+	h := newHarness(t)
+	sources, err := importer.LocalSources([]string{"../../internal/importer/testdata/gold"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lres, err := importer.Import(context.Background(), h.store, sources, importer.ImportOptions{As: "gold/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = lres
+	// Corrupt one sealed blob IN PLACE (same length, different bytes) —
+	// present-but-wrong content.
+	var anyBlob string
+	entries, _ := os.ReadDir(h.store.Root + "/blobs/sha256")
+	for _, e := range entries {
+		if e.IsDir() {
+			sub := h.store.Root + "/blobs/sha256/" + e.Name()
+			fs, _ := os.ReadDir(sub)
+			if len(fs) > 0 {
+				anyBlob = sub + "/" + fs[0].Name()
+				break
+			}
+		}
+	}
+	if anyBlob == "" {
+		t.Fatal("no blobs to corrupt")
+	}
+	b, _ := os.ReadFile(anyBlob)
+	if len(b) == 0 {
+		t.Skip("empty blob")
+	}
+	b[0] ^= 0xFF
+	os.Chmod(anyBlob, 0o644)
+	os.WriteFile(anyBlob, b, 0o644)
+
+	code, body := h.postJSON("/v1/verify", map[string]string{"target": "--all"})
+	if code != http.StatusCreated {
+		t.Fatalf("verify --all: %d %s", code, body)
+	}
+	var job Job
+	json.Unmarshal(body, &job)
+	if job.Kind != "verify" {
+		t.Fatalf("job %+v", job)
+	}
+	term := waitJob(t, h, job.ID)
+	if term.State != "failed" || term.Error.Code != "E_VERIFY_FAILED" {
+		t.Fatalf("corrupted blob must fail verify --all: %+v", term)
+	}
+	if term.Verify == nil || len(term.Verify.Mismatched) == 0 {
+		t.Fatalf("mismatch must be surfaced: %+v", term.Verify)
+	}
+}

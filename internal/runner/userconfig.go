@@ -3,6 +3,7 @@ package runner
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/Cyb3rDudu/shardr/internal/config"
@@ -21,6 +22,9 @@ func ParseScalars(b []byte) (map[string]config.Value, error) {
 		case bool:
 			out[k] = config.Value{Kind: config.KindBool, Bool: t}
 		case float64:
+			if t != math.Trunc(t) {
+				return nil, fmt.Errorf("key %q: non-integral number %v (want int)", k, t)
+			}
 			out[k] = config.Value{Kind: config.KindInt, Int: int64(t)}
 		case string:
 			out[k] = config.Value{Kind: config.KindString, Str: t}

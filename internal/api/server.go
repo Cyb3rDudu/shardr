@@ -86,11 +86,12 @@ type Server struct {
 // after creation (done, or failed with E_SOURCE_UNAVAILABLE naming the
 // reserved sources).
 type Job struct {
-	ID       string    `json:"id"`
-	Ref      string    `json:"ref"`
-	State    string    `json:"state"` // waiting|fetching|done|failed
-	Manifest string    `json:"manifest,omitempty"`
-	Error    *APIError `json:"error,omitempty"`
+	ID        string    `json:"id"`
+	Ref       string    `json:"ref"`
+	State     string    `json:"state"` // waiting|fetching|done|failed
+	CreatedAt time.Time `json:"createdAt"`
+	Manifest  string    `json:"manifest,omitempty"`
+	Error     *APIError `json:"error,omitempty"`
 
 	// Import jobs (001 §8). Jobs are immutable once published: every state
 	// transition publishes a fresh instance via publishJob (atomic swap).
@@ -359,7 +360,8 @@ type fileRecord struct {
 	Kind    string `json:"kind,omitempty"` // manifest kind (weights.gguf, config, …)
 	Role    string `json:"role,omitempty"` // weights.aux role (vision-projector, …)
 	Variant string `json:"variant,omitempty"`
-	Part    *int64 `json:"part,omitempty"` // split-GGUF part number (001 §3.1)
+	Part    *int64 `json:"part,omitempty"`    // split-GGUF part number (001 §3.1)
+	Runtime string `json:"runtime,omitempty"` // runtime-config runtime id
 }
 
 // resolveLocal resolves a parsed reference against local state only (005
@@ -551,7 +553,7 @@ func (s *Server) handleOpen(w http.ResponseWriter, r *http.Request) {
 					if fi, err := os.Stat(path); err == nil {
 						size = fi.Size()
 					}
-					res.Files = append(res.Files, fileRecord{Digest: f.Digest, Path: path, Size: size, Name: f.Name, Kind: f.Kind, Role: f.Role, Variant: f.Variant, Part: f.Part})
+					res.Files = append(res.Files, fileRecord{Digest: f.Digest, Path: path, Size: size, Name: f.Name, Kind: f.Kind, Role: f.Role, Variant: f.Variant, Part: f.Part, Runtime: f.Runtime})
 				}
 			}
 		}
@@ -583,7 +585,7 @@ func (s *Server) handleEnsure(w http.ResponseWriter, r *http.Request) {
 	// Compute the terminal state FIRST, publish afterwards: jobs are
 	// immutable once visible, so concurrent /jobs readers can never see a
 	// half-mutated Job (data race on the map entry).
-	job := &Job{ID: newJobID(), Ref: p.Canonical, State: "waiting", Kind: "ensure"}
+	job := &Job{ID: newJobID(), CreatedAt: time.Now().UTC(), Ref: p.Canonical, State: "waiting", Kind: "ensure"}
 	res, he := s.resolveLocal(p)
 	switch {
 	case he != nil:
@@ -772,7 +774,7 @@ func (s *Server) handleImportBT(w http.ResponseWriter, r *http.Request) {
 			"swarm client disabled — set [swarm] enabled = true in ~/.config/shardr/config.toml (004 §7)")
 		return
 	}
-	job := &Job{ID: newJobID(), Ref: loc, Kind: "import-bt", State: "waiting", Manifest: body.ManifestDigest}
+	job := &Job{ID: newJobID(), CreatedAt: time.Now().UTC(), Ref: loc, Kind: "import-bt", State: "waiting", Manifest: body.ManifestDigest}
 	s.mu.Lock()
 	s.jobs[job.ID] = job
 	s.mu.Unlock()
@@ -866,24 +868,29 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, ErrBadRequest, "missing required field: target (ref, digest, or \"all\")")
 		return
 	}
-	job := &Job{ID: newJobID(), State: "waiting", Kind: "verify"}
+	job := &Job{ID: newJobID(), CreatedAt: time.Now().UTC(), State: "waiting", Kind: "verify"}
 	// Resolve the target to a digest set first (loud on unknown refs).
+	target := body.Target
+	if target == "--all" { // CLI convention: the flag spelled out
+		target = "all"
+	}
 	switch {
-	case body.Target == "all":
+	case target == "all":
 		job.Ref = "all"
 		job.Target = "all"
 	default:
-		var target string
+		resolved := ""
 		if ref.IsDigest(body.Target) || strings.HasPrefix(body.Target, "sha256:") {
 			d, derr := ref.NormalizeDigest(body.Target)
 			if derr != nil {
 				writeErr(w, http.StatusBadRequest, derr.Class, derr.Message)
 				return
 			}
-			target = d
+			resolved = d
 			job.Manifest = d
+			job.Ref = d
 		} else {
-			p, rerr := ref.Parse(body.Target) // canonical form only (parseRefParam rule)
+			p, rerr := ref.Parse(target) // canonical form only (parseRefParam rule)
 			if rerr != nil {
 				writeErr(w, http.StatusBadRequest, rerr.Class, shortRefHint(body.Target, rerr), rerr.Candidates...)
 				return
@@ -893,11 +900,11 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 				writeHTTPError(w, he)
 				return
 			}
-			target = res.ManifestDigest
+			resolved = res.ManifestDigest
 			job.Ref = p.Canonical
 			job.Manifest = res.ManifestDigest
 		}
-		job.Target = target
+		job.Target = resolved
 	}
 	s.mu.Lock()
 	s.jobs[job.ID] = job
@@ -917,18 +924,24 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 				s.publishJob(&term)
 				return
 			}
-			if len(res.Missing) > 0 || len(res.StateErrors) > 0 {
+			if len(res.Mismatched) > 0 || len(res.Missing) > 0 || len(res.StateErrors) > 0 {
 				term.State = "failed"
 				term.Error = &APIError{Code: "E_VERIFY_FAILED",
-					Message: fmt.Sprintf("verify: %d missing, %d state errors: %v %v", len(res.Missing), len(res.StateErrors), res.Missing, res.StateErrors)}
+					Message: fmt.Sprintf("verify: %d mismatched, %d missing, %d state errors: %v %v %v",
+						len(res.Mismatched), len(res.Missing), len(res.StateErrors), res.Mismatched, res.Missing, res.StateErrors)}
 			} else {
 				term.State = "done"
 			}
-			term.Verify = &VerifyResult{Missing: res.Missing, StateErrors: res.StateErrors}
+			term.FilesTotal = s.store.BlobCount()
+			term.FilesDone = term.FilesTotal
+			term.Verify = &VerifyResult{Mismatched: res.Mismatched, Missing: res.Missing, StateErrors: res.StateErrors}
 			s.publishJob(&term)
 			return
 		}
 		digests = []string{strings.TrimPrefix(base.Target, ref.DigestSchemePrefix)}
+		if base.Ref == "" {
+			base.Ref = base.Target
+		}
 		// A manifest target verifies the manifest blob and every file blob.
 		if s.store.Has(digests[0]) {
 			if m, _, herr := s.loadManifest(digests[0]); herr == nil {
@@ -959,24 +972,22 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 
 // VerifyResult is the terminal payload of a verify job.
 type VerifyResult struct {
+	Mismatched  []string `json:"mismatched,omitempty"` // present-but-wrong content (003 §4)
 	Missing     []string `json:"missing,omitempty"`
 	StateErrors []string `json:"stateErrors,omitempty"`
 }
 
-// handleJobsList lists jobs newest-first (005 §4 `shardr status` without
-// an id; additive to the §3 table — filed as a spec note in the runner PR).
+// handleJobsList lists jobs newest-first by creation time (005 §4
+// `shardr status` without an id; additive to the §3 table — filed as a
+// spec note in the runner PR).
 func (s *Server) handleJobsList(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
-	ids := make([]string, 0, len(s.jobs))
-	for id := range s.jobs {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	jobs := make([]*Job, 0, len(ids))
-	for _, id := range ids {
-		jobs = append(jobs, s.jobs[id])
+	jobs := make([]*Job, 0, len(s.jobs))
+	for _, j := range s.jobs {
+		jobs = append(jobs, j)
 	}
 	s.mu.Unlock()
+	sort.Slice(jobs, func(i, j int) bool { return jobs[i].CreatedAt.After(jobs[j].CreatedAt) })
 	writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
 }
 
@@ -1067,7 +1078,7 @@ func (s *Server) handleImportLocal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	job := &Job{ID: newJobID(), Kind: "import-local", Ref: body.As, As: body.As, State: "waiting", FilesTotal: len(sources)}
+	job := &Job{ID: newJobID(), CreatedAt: time.Now().UTC(), Kind: "import-local", Ref: body.As, As: body.As, State: "waiting", FilesTotal: len(sources)}
 	s.publishJob(job)
 	go s.runImport(job, func(progress func(int, int)) (*importer.ImportResult, error) {
 		// Background context: the request dies with the 201 response;
@@ -1125,7 +1136,7 @@ func (s *Server) handleImportHF(w http.ResponseWriter, r *http.Request) {
 		}})
 	}
 
-	job := &Job{ID: newJobID(), Kind: "import-hf", Ref: body.Repo, As: ns, State: "waiting", FilesTotal: len(sources)}
+	job := &Job{ID: newJobID(), CreatedAt: time.Now().UTC(), Kind: "import-hf", Ref: body.Repo, As: ns, State: "waiting", FilesTotal: len(sources)}
 	s.publishJob(job)
 	go s.runImport(job, func(progress func(int, int)) (*importer.ImportResult, error) {
 		return importer.Import(context.Background(), s.store, sources, importer.ImportOptions{
