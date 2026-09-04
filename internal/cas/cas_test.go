@@ -648,8 +648,12 @@ func TestVerifyAllSwarmState(t *testing.T) {
 		t.Fatalf("healthy state: %+v", res)
 	}
 
-	// Link to a missing record blob → Missing.
+	// Case A — manifest PRESENT, record blob missing: Missing is exactly
+	// the record digest (not the manifest, not both).
 	s2, _ := Open(t.TempDir())
+	if err := s2.Put(manDigest, bytes.NewReader([]byte(`{"artifactType":"model"}`))); err != nil {
+		t.Fatal(err)
+	}
 	if err := s2.SetDistributionLink("sha256:"+manDigest, "sha256:"+recDigest); err != nil {
 		t.Fatal(err)
 	}
@@ -657,12 +661,12 @@ func TestVerifyAllSwarmState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Missing) == 0 {
-		t.Fatal("dangling distribution link must surface as Missing")
+	if len(res.Missing) != 1 || res.Missing[0] != recDigest {
+		t.Fatalf("case A (record missing): Missing must be exactly [%s], got %v", recDigest, res.Missing)
 	}
 
-	// Record present, MANIFEST blob missing → Missing too (both sides of
-	// the link are checked).
+	// Case B — record blob PRESENT, manifest missing: Missing is exactly
+	// the manifest digest.
 	s3, _ := Open(t.TempDir())
 	if err := s3.Put(recDigest, bytes.NewReader([]byte(`{"schemaVersion":1}`))); err != nil {
 		t.Fatal(err)
@@ -674,14 +678,8 @@ func TestVerifyAllSwarmState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	foundManifest := false
-	for _, d := range res.Missing {
-		if d == manDigest {
-			foundManifest = true
-		}
-	}
-	if !foundManifest {
-		t.Fatalf("missing manifest blob must surface as Missing, got %+v", res.Missing)
+	if len(res.Missing) != 1 || res.Missing[0] != manDigest {
+		t.Fatalf("case B (manifest missing): Missing must be exactly [%s], got %v", manDigest, res.Missing)
 	}
 
 	// Corrupt distribution.json → StateErrors (loud, never silently rebuilt).
