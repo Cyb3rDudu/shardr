@@ -14,6 +14,8 @@ trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/build/build/bin"
 printf '#!/bin/sh\nfake-llama-server\n' > "$TMP/build/build/bin/llama-server"
 chmod +x "$TMP/build/build/bin/llama-server"
+# build-llama.sh exposes the binary as $LLAMA_BUILD_DIR/llama-server
+cp "$TMP/build/build/bin/llama-server" "$TMP/build/llama-server"
 BIN="$TMP/bin" LLAMA_BUILD_DIR="$TMP/build" make deploy-llama >/dev/null
 test -x "$TMP/bin/llama-server"
 grep -q fake-llama-server "$TMP/bin/llama-server"
