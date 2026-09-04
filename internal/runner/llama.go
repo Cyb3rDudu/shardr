@@ -18,8 +18,9 @@ import (
 const LlamaPin = "v0.3.0"
 
 // TerminateGrace is the supervisor duty window (002 §4/§5.3): SIGTERM,
-// clean exit within 30 s, SIGKILL after.
-const TerminateGrace = 30 * time.Second
+// clean exit within 30 s, SIGKILL after. Production default 30 s; tests
+// shorten it via this var (the only sanctioned mutation point).
+var TerminateGrace = 30 * time.Second
 
 // ReadyTimeout is how long the runner waits for /health + /v1/models
 // before declaring the spawn failed.
@@ -167,28 +168,30 @@ func (rt *Runtime) Terminate() error {
 }
 
 // TerminatePID sends SIGTERM, waits up to TerminateGrace for the process
-// to disappear, then SIGKILLs. This is the stop/stop --all path for
-// detached serve instances and the exit path for foreground runs.
+// to disappear, then SIGKILLs — without identity guards (own-child
+// paths: foreground run; tests).
 func TerminatePID(pid int) error {
-	return terminateVerified(pid, nil)
+	return terminateVerified(pid, nil, nil)
 }
 
-// TerminateVerified is the guarded discipline (002 §4): the caller's
-// verify callback is checked IMMEDIATELY BEFORE SIGTERM and — after the
-// grace window expires — IMMEDIATELY BEFORE SIGKILL. The pid can die
-// and be recycled inside the 30 s window; without the second check the
-// SIGKILL would land on an unrelated process. A failing verification
-// aborts WITHOUT any signal: false means "not provably ours anymore".
-func TerminateVerified(pid int, verify func() bool) error {
-	return terminateVerified(pid, verify)
+// TerminateVerified is the guarded discipline (002 §4) with SPLIT
+// identity checks: verifyTerm runs IMMEDIATELY BEFORE SIGTERM and may
+// include liveness surfaces (HTTP endpoint, readiness); verifyKill runs
+// IMMEDIATELY BEFORE SIGKILL and must be endpoint-free — a process that
+// closed its listener after SIGTERM and hangs in shutdown is still
+// OUR process (start identity confirmed) and MUST receive the
+// contractually owed SIGKILL. A failing verification aborts WITHOUT
+// any signal: false means "not provably ours anymore".
+func TerminateVerified(pid int, verifyTerm, verifyKill func() bool) error {
+	return terminateVerified(pid, verifyTerm, verifyKill)
 }
 
-func terminateVerified(pid int, verify func() bool) error {
+func terminateVerified(pid int, verifyTerm, verifyKill func() bool) error {
 	p, err := os.FindProcess(pid)
 	if err != nil {
 		return nil // already gone (macOS FindProcess always succeeds; kill below is the real check)
 	}
-	if verify != nil && !verify() {
+	if verifyTerm != nil && !verifyTerm() {
 		return fmt.Errorf("E_STATE: refusing to signal pid %d — identity verification failed before SIGTERM", pid)
 	}
 	if err := p.Signal(syscall.SIGTERM); err != nil {
@@ -204,10 +207,11 @@ func terminateVerified(pid int, verify func() bool) error {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	// Grace expired: re-verify identity before the kill. A pid that
-	// died mid-window and was reused must never receive SIGKILL.
-	if verify != nil && !verify() {
-		return fmt.Errorf("E_STATE: refusing to SIGKILL pid %d — identity changed during the %s grace window (pid reuse?)", pid, TerminateGrace)
+	// Grace expired: start-identity-only re-check before the kill. A pid
+	// that died mid-window and was recycled must never receive SIGKILL;
+	// a confirmed zombie always must.
+	if verifyKill != nil && !verifyKill() {
+		return fmt.Errorf("E_STATE: refusing to SIGKILL pid %d — start identity changed during the %s grace window (pid reuse?)", pid, TerminateGrace)
 	}
 	if err := p.Kill(); err != nil && !isGone(err) {
 		return fmt.Errorf("E_RUNTIME: SIGKILL %d: %w", pid, err)
