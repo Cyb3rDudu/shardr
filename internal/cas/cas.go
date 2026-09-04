@@ -264,6 +264,24 @@ type VerifyResult struct {
 // expectation, and state/ is the record of what should exist. Foreign files
 // under blobs/sha256/ (e.g. .DS_Store, AppleDouble junk) are skipped, not
 // errors — they are not blobs and must not mask verification of real ones.
+// BlobCount counts sealed blobs (verify --all progress reporting).
+func (s *Store) BlobCount() int {
+	entries, err := os.ReadDir(s.blobsDir())
+	if err != nil {
+		return 0
+	}
+	shallow := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			n, err := os.ReadDir(filepath.Join(s.blobsDir(), e.Name()))
+			if err == nil {
+				shallow += len(n)
+			}
+		}
+	}
+	return shallow
+}
+
 func (s *Store) VerifyAll() (VerifyResult, error) {
 	var res VerifyResult
 	err := filepath.WalkDir(s.blobsDir(), func(path string, d fs.DirEntry, err error) error {

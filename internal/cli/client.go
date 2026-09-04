@@ -71,8 +71,7 @@ func (c *Client) Do(ctx context.Context, method, path string, body any) (*http.R
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("E_DAEMON_UNREACHABLE: shardhive daemon not reachable on %s — is it running? (%v)",
-			strings.TrimPrefix(lastDialPath(c), ""), err)
+		return nil, fmt.Errorf("E_DAEMON_UNREACHABLE: shardhive daemon not reachable — is it running? (%v)", err)
 	}
 	if resp.StatusCode >= 300 {
 		defer resp.Body.Close()
@@ -82,12 +81,10 @@ func (c *Client) Do(ctx context.Context, method, path string, body any) (*http.R
 		if jerr := json.NewDecoder(resp.Body).Decode(&env); jerr == nil && env.Error != nil {
 			return nil, env.Error
 		}
-		return nil, fmt.Errorf("E_DAEMON_UNREACHABLE: HTTP %d (no error envelope)", resp.StatusCode)
+		return nil, fmt.Errorf("E_BAD_RESPONSE: HTTP %d without an error envelope", resp.StatusCode)
 	}
 	return resp, nil
 }
-
-func lastDialPath(c *Client) string { return "" }
 
 // DoJSON issues a request and decodes a 2xx JSON body into out.
 func (c *Client) DoJSON(ctx context.Context, method, path string, body, out any) error {
@@ -183,7 +180,7 @@ func (c *Client) WaitJob(ctx context.Context, id string, onTick func(j Job)) (*J
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, fmt.Errorf("E_CANCELLED: waiting for job %s aborted: %w", id, ctx.Err())
 		case <-ticker.C:
 		}
 	}

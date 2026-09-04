@@ -2,11 +2,14 @@ package runner
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 )
 
 // Instance is one registered serve entry (002 §4): a daemonized
@@ -80,7 +83,15 @@ func (r *Registry) List() ([]Instance, error) {
 	}
 	var list []Instance
 	if err := json.Unmarshal(b, &list); err != nil {
-		return nil, fmt.Errorf("E_STATE: parse %s: %w", r.path, err)
+		// Salvage any readable PIDs into the error so live instances stay
+		// stoppable manually — a corrupt state file must not strand
+		// GB-scale runtimes.
+		pids := salvagePIDs(b)
+		msg := fmt.Sprintf("E_STATE: parse %s: %v", r.path, err)
+		if len(pids) > 0 {
+			msg += fmt.Sprintf(" — possible instance pids still running: %v (kill manually if shardr is done; then remove the file)", pids)
+		}
+		return nil, errors.New(msg)
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
 	return list, nil
@@ -139,9 +150,29 @@ func (r *Registry) write(list []Instance) error {
 	if err := os.MkdirAll(filepath.Dir(r.path), 0o700); err != nil {
 		return fmt.Errorf("E_STATE: %w", err)
 	}
-	tmp := r.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return fmt.Errorf("E_STATE: write %s: %w", tmp, err)
+	tmp, err := os.CreateTemp(filepath.Dir(r.path), filepath.Base(r.path)+".*")
+	if err != nil {
+		return fmt.Errorf("E_STATE: %w", err)
 	}
-	return os.Rename(tmp, r.path)
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		return fmt.Errorf("E_STATE: write %s: %w", tmp.Name(), err)
+	}
+	tmp.Close()
+	return os.Rename(tmp.Name(), r.path)
+}
+
+var pidRe = regexp.MustCompile(`"pid":\s*(\d+)`)
+
+// salvagePIDs scrapes raw registry bytes for pid numbers (corruption
+// recovery aid).
+func salvagePIDs(b []byte) []int {
+	var out []int
+	for _, m := range pidRe.FindAllSubmatch(b, -1) {
+		if n, err := strconv.Atoi(string(m[1])); err == nil && n > 1 {
+			out = append(out, n)
+		}
+	}
+	return out
 }

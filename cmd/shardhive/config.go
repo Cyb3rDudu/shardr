@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/Cyb3rDudu/shardr/internal/config"
 	"github.com/Cyb3rDudu/shardr/internal/swarm"
@@ -97,7 +96,7 @@ func wantInt(key string, v config.Value) (int64, error) {
 }
 
 func configPathForError() string {
-	if p := os.Getenv("SHARDR_CONFIG"); p != "" {
+	if p, err := config.Path(); err == nil {
 		return p
 	}
 	return "config.toml"

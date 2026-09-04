@@ -119,10 +119,11 @@ func cmdImport(ctx context.Context, args []string) int {
 		for i := 1; i < len(args); i++ {
 			switch args[i] {
 			case "--as":
-				i++
-				if i < len(args) {
-					as = args[i]
+				if i+1 >= len(args) {
+					return fail(fmt.Errorf("E_BAD_REQUEST: --as needs a value (it is the last argument)"))
 				}
+				i++
+				as = args[i]
 			default:
 				paths = append(paths, args[i])
 			}
@@ -164,23 +165,35 @@ func cmdImport(ctx context.Context, args []string) int {
 func cmdLifecycle(ctx context.Context, args []string, serve bool) int {
 	var refArg string
 	var opts cli.RunOptions
+	flagValue := func(name string, i int) (string, error) {
+		if i+1 >= len(args) {
+			return "", fmt.Errorf("E_BAD_REQUEST: %s needs a value (it is the last argument)", name)
+		}
+		return args[i+1], nil
+	}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--id":
-			i++
-			if i < len(args) {
-				opts.ID = args[i]
+			v, err := flagValue(args[i], i)
+			if err != nil {
+				return fail(err)
 			}
+			opts.ID = v
+			i++
 		case "--config":
-			i++
-			if i < len(args) {
-				opts.ConfigFile = args[i]
+			v, err := flagValue(args[i], i)
+			if err != nil {
+				return fail(err)
 			}
+			opts.ConfigFile = v
+			i++
 		case "--set":
-			i++
-			if i < len(args) {
-				opts.Sets = append(opts.Sets, args[i])
+			v, err := flagValue(args[i], i)
+			if err != nil {
+				return fail(err)
 			}
+			opts.Sets = append(opts.Sets, v)
+			i++
 		default:
 			if refArg != "" {
 				return fail(fmt.Errorf("E_BAD_REQUEST: exactly one ref expected, got %q and %q", refArg, args[i]))
