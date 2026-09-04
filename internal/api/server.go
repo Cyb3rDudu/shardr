@@ -541,20 +541,27 @@ func (s *Server) handleOpen(w http.ResponseWriter, r *http.Request) {
 	if res.ManifestDigest != "" {
 		hex := strings.TrimPrefix(res.ManifestDigest, ref.DigestSchemePrefix)
 		if s.store.Has(hex) {
-			if m, _, herr := s.loadManifest(hex); herr == nil {
-				for _, f := range m.Files {
-					fhex := strings.TrimPrefix(f.Digest, ref.DigestSchemePrefix)
-					path, err := s.store.BlobPath(fhex)
-					if err != nil || !s.store.Has(fhex) {
-						res.Missing = append(res.Missing, f.Digest)
-						continue
-					}
-					var size int64
-					if fi, err := os.Stat(path); err == nil {
-						size = fi.Size()
-					}
-					res.Files = append(res.Files, fileRecord{Digest: f.Digest, Path: path, Size: size, Name: f.Name, Kind: f.Kind, Role: f.Role, Variant: f.Variant, Part: f.Part, Runtime: f.Runtime})
+			// Fail LOUD: a present-but-unparseable manifest blob is CAS
+			// corruption — answering 200 with an index/manifest-only file
+			// list would silently hide it (005 §2.3; the loadManifest
+			// error already carries the corruption class and path).
+			m, _, herr := s.loadManifest(hex)
+			if herr != nil {
+				writeHTTPError(w, herr)
+				return
+			}
+			for _, f := range m.Files {
+				fhex := strings.TrimPrefix(f.Digest, ref.DigestSchemePrefix)
+				path, err := s.store.BlobPath(fhex)
+				if err != nil || !s.store.Has(fhex) {
+					res.Missing = append(res.Missing, f.Digest)
+					continue
 				}
+				var size int64
+				if fi, err := os.Stat(path); err == nil {
+					size = fi.Size()
+				}
+				res.Files = append(res.Files, fileRecord{Digest: f.Digest, Path: path, Size: size, Name: f.Name, Kind: f.Kind, Role: f.Role, Variant: f.Variant, Part: f.Part, Runtime: f.Runtime})
 			}
 		}
 	}

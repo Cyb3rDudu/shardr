@@ -5,21 +5,26 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
+	"syscall"
 )
 
 // Instance is one registered serve entry (002 §4): a daemonized
 // llama-server with a stable id, its ref, port, and pid.
 type Instance struct {
-	ID       string `json:"id"`
-	Ref      string `json:"ref"` // canonical shardr:/// URI
-	Endpoint string `json:"endpoint"`
-	PID      int    `json:"pid"`
-	Started  string `json:"started"` // RFC3339
+	ID         string `json:"id"`
+	Ref        string `json:"ref"` // canonical shardr:/// URI
+	Endpoint   string `json:"endpoint"`
+	PID        int    `json:"pid"`
+	Started    string `json:"started"`            // RFC3339
+	StartToken string `json:"startToken"`         // process start-time identity (pid-reuse guard)
+	SplitDir   string `json:"splitDir,omitempty"` // split-GGUF scratch dir (cleanup on last stop)
 }
 
 // Registry is the local serve-instance state file: $XDG_RUNTIME_DIR if
@@ -72,8 +77,14 @@ func OpenRegistryAt(path string) *Registry { return &Registry{path: path} }
 // Path exposes the state file location (CLI output).
 func (r *Registry) Path() string { return r.path }
 
-// List returns all registered instances, sorted by id.
+// List returns all registered instances, sorted by id (lock-free read;
+// the write path renames atomically, so a reader sees either the old or
+// the new file, never a torn one).
 func (r *Registry) List() ([]Instance, error) {
+	return r.listLocked()
+}
+
+func (r *Registry) listLocked() ([]Instance, error) {
 	b, err := os.ReadFile(r.path)
 	if os.IsNotExist(err) {
 		return nil, nil
@@ -98,34 +109,59 @@ func (r *Registry) List() ([]Instance, error) {
 }
 
 // Add registers an instance; an existing id is a loud error (stable ids
-// are stable).
+// are stable). The read-modify-write runs under a cross-process flock —
+// two concurrent serve invocations both survive registration (the
+// unlocked last-writer-wins silently dropped one before).
 func (r *Registry) Add(in Instance) error {
-	list, err := r.List()
-	if err != nil {
-		return err
-	}
-	for _, e := range list {
-		if e.ID == in.ID {
-			return fmt.Errorf("E_STATE: serve id %q already running (%s) — pick another --id or stop it first", in.ID, in.Endpoint)
+	return r.withLock(func() error {
+		list, err := r.listLocked()
+		if err != nil {
+			return err
 		}
-	}
-	list = append(list, in)
-	return r.write(list)
+		for _, e := range list {
+			if e.ID == in.ID {
+				return fmt.Errorf("E_STATE: serve id %q already running (%s) — pick another --id or stop it first", in.ID, in.Endpoint)
+			}
+		}
+		list = append(list, in)
+		return r.writeLocked(list)
+	})
 }
 
-// Remove drops an instance by id (stop path).
+// Remove drops an instance by id (stop path) under the same lock.
 func (r *Registry) Remove(id string) error {
-	list, err := r.List()
-	if err != nil {
-		return err
-	}
-	out := list[:0]
-	for _, e := range list {
-		if e.ID != id {
-			out = append(out, e)
+	return r.withLock(func() error {
+		list, err := r.listLocked()
+		if err != nil {
+			return err
 		}
+		out := list[:0]
+		for _, e := range list {
+			if e.ID != id {
+				out = append(out, e)
+			}
+		}
+		return r.writeLocked(out)
+	})
+}
+
+// withLock serializes registry mutations across processes via an flock
+// sidecar file (LOCK_EX blocking). ponytail: flock file instead of a
+// lock library — syscall.Flock is stdlib on every unix we ship.
+func (r *Registry) withLock(fn func() error) error {
+	if err := os.MkdirAll(filepath.Dir(r.path), 0o700); err != nil {
+		return fmt.Errorf("E_STATE: %w", err)
 	}
-	return r.write(out)
+	f, err := os.OpenFile(r.path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("E_STATE: open lock: %w", err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("E_STATE: flock: %w", err)
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	return fn()
 }
 
 // Find returns the instance with the given id.
@@ -142,7 +178,7 @@ func (r *Registry) Find(id string) (*Instance, error) {
 	return nil, fmt.Errorf("E_STATE: no serve instance %q — see `shardr status`", id)
 }
 
-func (r *Registry) write(list []Instance) error {
+func (r *Registry) writeLocked(list []Instance) error {
 	b, err := json.MarshalIndent(list, "", "  ")
 	if err != nil {
 		return err
@@ -175,4 +211,29 @@ func salvagePIDs(b []byte) []int {
 		}
 	}
 	return out
+}
+
+// ProcessStartToken returns a pid's process-start identity: Linux reads
+// the kernel starttime (field 22 of /proc/<pid>/stat — unique per boot,
+// so a recycled pid has a different token), darwin/BSD fall back to ps
+// lstart. The token is recorded at serve time and re-derived before
+// every signal: a stale registry entry whose pid was reused must NEVER
+// be killable (002 §4 supervisor duty cuts both ways).
+func ProcessStartToken(pid int) (string, error) {
+	if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)); err == nil {
+		// Field 22 after the parenthesized comm (comm may contain spaces).
+		s := string(b)
+		if i := strings.LastIndexByte(s, ')'); i >= 0 && i+2 <= len(s) {
+			fields := strings.Fields(s[i+2:])
+			if len(fields) >= 20 {
+				return "linux:" + fields[19], nil // fields[0] is state (field 3); +19 = field 22
+			}
+		}
+		return "", fmt.Errorf("E_STATE: /proc/%d/stat: unexpected layout", pid)
+	}
+	out, err := exec.Command("ps", "-o", "lstart=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil || len(out) == 0 {
+		return "", fmt.Errorf("E_STATE: cannot derive start token for pid %d: %v", pid, err)
+	}
+	return "ps:" + strings.Join(strings.Fields(string(out)), " "), nil
 }

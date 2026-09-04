@@ -74,8 +74,14 @@ func ImportBT(ctx context.Context, c *Client, magnetOrInfohash, manifest string,
 	if manifest == "" {
 		return fmt.Errorf("E_BAD_REQUEST: --manifest <sha256:…> is mandatory — a magnet alone is never trusted (005 §5)")
 	}
+	// The API takes {magnet | infohash} as DISTINCT fields (005 §3) — a
+	// magnet URI in the infohash field is a 400 waiting to happen.
+	field := "infohash"
+	if strings.HasPrefix(magnetOrInfohash, "magnet:") {
+		field = "magnet"
+	}
 	return runImportJob(ctx, c, out, "/v1/import/bt", map[string]any{
-		"infohash": magnetOrInfohash, "manifestDigest": manifest})
+		field: magnetOrInfohash, "manifestDigest": manifest})
 }
 
 func runImportJob(ctx context.Context, c *Client, out io.Writer, path string, body any) error {
@@ -196,7 +202,13 @@ func Status(ctx context.Context, c *Client, jobID string, out io.Writer) error {
 		fmt.Fprintln(out, "no jobs yet")
 		return nil
 	}
-	for i := len(list.Jobs) - 1; i >= 0 && i >= len(list.Jobs)-20; i-- {
+	// Server sorts newest-first (createdAt); show the 20 most recent in
+	// that order — newest at the top.
+	n := len(list.Jobs)
+	if n > 20 {
+		n = 20
+	}
+	for i := 0; i < n; i++ {
 		j := list.Jobs[i]
 		line := fmt.Sprintf("%s %s %s", j.ID, j.Kind, j.State)
 		if j.Ref != "" && j.Ref != "all" {

@@ -415,3 +415,198 @@ func TestStopRefusesForeignPID(t *testing.T) {
 		t.Fatal("unrelated process was killed — pid-reuse guard broken")
 	}
 }
+
+// B2: two CONCURRENT serves both stay registered — the registry
+// read-modify-write runs under a cross-process flock; without it the
+// last writer silently dropped the first instance.
+func TestConcurrentServeBothRegistered(t *testing.T) {
+	if stubBinary == "" {
+		t.Skip("stub not built")
+	}
+	root := t.TempDir()
+	t.Setenv("SHARDR_CAS", root)
+	store, err := cas.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sockDir, _ := os.MkdirTemp(os.TempDir(), "sx")
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "hive.sock")
+	srv, err := api.New(store, sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	go srv.Serve()
+	t.Cleanup(func() { srv.Close() })
+	t.Setenv("SHARDR_SOCKET", sock)
+	t.Setenv("SHARDR_LLAMA_SERVER", stubBinary)
+	t.Setenv("SHARDR_CONFIG", writeCfg(t, ""))
+	t.Setenv("SHARDR_RUNNER_STATE", filepath.Join(t.TempDir(), "instances.json"))
+
+	sources, _ := importer.LocalSources([]string{"../../internal/importer/testdata/gold"})
+	res, err := importer.Import(context.Background(), store, sources, importer.ImportOptions{As: "gold/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _ := NewClient()
+	ref := "gold/repo:" + res.Members[0].Quant
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = Serve(context.Background(), c, ref, RunOptions{ID: fmt.Sprintf("par-%d", i)}, io.Discard)
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("serve %d: %v", i, err)
+		}
+	}
+	reg := runner.OpenRegistryAt(mustStatePath(t))
+	list, err := reg.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("both concurrent serves must be registered: %+v", list)
+	}
+	Stop(context.Background(), c, "", true, io.Discard)
+}
+
+func mustStatePath(t *testing.T) string {
+	t.Helper()
+	p := os.Getenv("SHARDR_RUNNER_STATE")
+	if p == "" {
+		t.Fatal("SHARDR_RUNNER_STATE not set")
+	}
+	return p
+}
+
+// B3: a tampered start token makes stop REFUSE — the live process is
+// never signaled (identity mismatch = stale entry or pid reuse).
+func TestStopRefusesWrongStartToken(t *testing.T) {
+	if stubBinary == "" {
+		t.Skip("stub not built")
+	}
+	root := t.TempDir()
+	t.Setenv("SHARDR_CAS", root)
+	store, _ := cas.Open(root)
+	sockDir, _ := os.MkdirTemp(os.TempDir(), "sx")
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "hive.sock")
+	srv, err := api.New(store, sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	go srv.Serve()
+	t.Cleanup(func() { srv.Close() })
+	t.Setenv("SHARDR_SOCKET", sock)
+	t.Setenv("SHARDR_LLAMA_SERVER", stubBinary)
+	t.Setenv("SHARDR_CONFIG", writeCfg(t, ""))
+	state := filepath.Join(t.TempDir(), "instances.json")
+	t.Setenv("SHARDR_RUNNER_STATE", state)
+
+	sources, _ := importer.LocalSources([]string{"../../internal/importer/testdata/gold"})
+	res, err := importer.Import(context.Background(), store, sources, importer.ImportOptions{As: "gold/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _ := NewClient()
+	if err := Serve(context.Background(), c, "gold/repo:"+res.Members[0].Quant, RunOptions{ID: "tok"}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	// Tamper: wrong start token for the LIVE pid.
+	reg := runner.OpenRegistryAt(state)
+	list, _ := reg.List()
+	if len(list) != 1 {
+		t.Fatalf("setup: %+v", list)
+	}
+	pid := list[0].PID
+	list[0].StartToken = "forged-token"
+	if err := writeInstances(state, list); err != nil {
+		t.Fatal(err)
+	}
+	err = Stop(context.Background(), c, "tok", false, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "refusing to stop") {
+		t.Fatalf("forged token must be refused: %v", err)
+	}
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatal("live process was killed despite token mismatch")
+	}
+	// Cleanup via correct registry state (kill directly, remove entry).
+	runner.TerminatePID(pid)
+	list2, _ := reg.List()
+	list2[0].StartToken = ""
+	_ = writeInstances(state, list2)
+}
+
+func writeInstances(path string, list []runner.Instance) error {
+	b, err := json.MarshalIndent(list, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o600)
+}
+
+// Split-scratch cleanup: after the last serving instance stops, the
+// manifest's hardlink dir is gone (CAS blobs untouched).
+func TestSplitDirCleanedAfterLastStop(t *testing.T) {
+	if stubBinary == "" {
+		t.Skip("stub not built")
+	}
+	root := t.TempDir()
+	t.Setenv("SHARDR_CAS", root)
+	store, _ := cas.Open(root)
+	sockDir, _ := os.MkdirTemp(os.TempDir(), "sx")
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "hive.sock")
+	srv, err := api.New(store, sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	go srv.Serve()
+	t.Cleanup(func() { srv.Close() })
+	t.Setenv("SHARDR_SOCKET", sock)
+	t.Setenv("SHARDR_LLAMA_SERVER", stubBinary)
+	t.Setenv("SHARDR_CONFIG", writeCfg(t, ""))
+	state := filepath.Join(t.TempDir(), "instances.json")
+	t.Setenv("SHARDR_RUNNER_STATE", state)
+
+	sources, _ := importer.LocalSources([]string{"../../internal/importer/testdata/gold"})
+	res, err := importer.Import(context.Background(), store, sources, importer.ImportOptions{As: "gold/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _ := NewClient()
+	if err := Serve(context.Background(), c, "gold/repo:"+res.Members[0].Quant, RunOptions{ID: "splitclean"}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	reg := runner.OpenRegistryAt(state)
+	list, _ := reg.List()
+	if len(list) != 1 || list[0].SplitDir == "" {
+		t.Fatalf("split dir must be recorded: %+v", list)
+	}
+	splitDir := list[0].SplitDir
+	if _, err := os.Stat(splitDir); err != nil {
+		t.Fatalf("split dir must exist while serving: %v", err)
+	}
+	if err := Stop(context.Background(), c, "splitclean", false, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(splitDir); !os.IsNotExist(err) {
+		t.Fatalf("split dir must be cleaned after the last stop: %v", err)
+	}
+}
