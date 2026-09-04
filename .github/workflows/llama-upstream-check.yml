@@ -1,0 +1,93 @@
+# Workflow A — detect new exact llama.cpp vX.Y.Z releases and open a
+# lockfile update PR. Never merges, never releases: upstream change →
+# lockfile PR → build/E2E → review/merge → release (workflow C).
+# Nightly bNNNN tags are rejected here (canary = workflow D).
+name: llama upstream check
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      llama_ref:
+        description: "Optional exact vX.Y.Z tag"
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: llama-upstream-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+
+      - name: Check upstream for a new stable tag
+        id: decide
+        run: |
+          args=(check-update --write)
+          if [ -n "${{ inputs.llama_ref }}" ]; then args+=(--ref "${{ inputs.llama_ref }}"); fi
+          out=$(go run ./cmd/llama-lock "${args[@]}")
+          echo "$out"
+          case "$out" in
+            noop*)  echo "decision=noop"  >> "$GITHUB_OUTPUT" ;;
+            update*) echo "decision=update" >> "$GITHUB_OUTPUT"
+                     echo "$out" | awk '{print "new_ref=" $3}' >> "$GITHUB_OUTPUT" ;;
+            *) echo "unexpected output" >&2; exit 1 ;;
+          esac
+
+      - name: Open lockfile update PR
+        if: steps.decide.outputs.decision == 'update'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_REF: ${{ steps.decide.outputs.new_ref }}
+        run: |
+          old_lock=$(git show HEAD:runtime/llama.lock)
+          new_ref=$(go run ./cmd/llama-lock ref)
+          new_commit=$(go run ./cmd/llama-lock validate | python3 -c 'import sys,json;print(json.load(sys.stdin)["Commit"])')
+          new_sha=$(go run ./cmd/llama-lock validate | python3 -c 'import sys,json;print(json.load(sys.stdin)["SourceSHA256"])')
+          old_ref=$(printf '%s\n' "$old_lock" | sed -n 's/^ref = "\(.*\)"$/\1/p')
+          old_commit=$(printf '%s\n' "$old_lock" | sed -n 's/^commit = "\(.*\)"$/\1/p')
+
+          branch="bot/llama-${new_ref}"
+          git config user.name "shardr-llama-bot"
+          git config user.email "noreply@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add runtime/llama.lock
+          git commit -m "chore(llama): pin ${new_ref} (source-verified lockfile update)"
+          git push --force-with-lease origin "$branch"
+
+          cat > /tmp/pr-body.md <<EOF
+          Automated llama.cpp lockfile update (workflow A). No auto-merge.
+
+          - old ref: \`${old_ref}\` (\`${old_commit}\`)
+          - new ref: \`${new_ref}\` (\`${new_commit}\`)
+          - upstream compare: https://github.com/ggml-org/llama.cpp/compare/${old_commit}...${new_commit}
+          - source archive sha256: \`${new_sha}\`
+          - compatibility matrix: this PR triggers \`llama build + E2E\`
+            (Ubuntu x86-64 CPU, macOS Apple Silicon Metal) — check its
+            status below before merging. Release happens only after merge
+            (workflow C), never from this branch.
+          EOF
+          # One PR per target ref: reuse the existing one if present.
+          if ! gh pr view "$branch" --json url >/dev/null 2>&1; then
+            gh pr create --base main --head "$branch" \
+              --title "chore(llama): pin ${new_ref}" \
+              --body-file /tmp/pr-body.md
+          else
+            gh pr edit "$branch" --body-file /tmp/pr-body.md
+            echo "existing PR for $branch updated"
+          fi
+
+      - name: No-op summary
+        if: steps.decide.outputs.decision != 'update'
+        run: echo "No new upstream vX.Y.Z — no PR (noop run)." >> "$GITHUB_STEP_SUMMARY"

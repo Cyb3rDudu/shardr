@@ -1,0 +1,118 @@
+# Workflow B — llama.cpp build + real runner E2E.
+# Reusable (workflow_call) so the release pipeline and the nightly canary
+# run the EXACT same matrix the lockfile PR is gated on.
+#
+# Platform note: GitHub-hosted macos-latest images ARE native Apple
+# Silicon (arm64) — this is a real Metal runtime test, no crossbuild.
+name: llama build + E2E
+
+on:
+  workflow_call:
+    inputs:
+      llama_ref:
+        description: "Override ref (canary channel only; stable uses runtime/llama.lock)"
+        type: string
+        required: false
+      llama_commit:
+        type: string
+        required: false
+      llama_source_sha256:
+        type: string
+        required: false
+  workflow_dispatch:
+    inputs:
+      llama_ref:
+        description: "Optional override ref (canary: exact bNNNN)"
+        required: false
+      llama_commit:
+        required: false
+      llama_source_sha256:
+        required: false
+  pull_request:
+    paths:
+      - runtime/llama.lock
+      - scripts/build-llama.sh
+      - .github/workflows/llama-build-e2e.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: llama-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+# Pinned test model (rule: no unversioned HF downloads).
+env:
+  E2E_MODEL_URL: https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf
+  E2E_MODEL_SHA256: ed5fa30c487b282ec156c29062f1222e5c20875a944ac98289dbd242e947f747
+
+jobs:
+  matrix:
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux_amd64
+          - os: macos-latest # native arm64 + Metal
+            platform: darwin_arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      # Canary overrides; empty on PR runs (lockfile is the truth there).
+      LLAMA_REF: ${{ inputs.llama_ref }}
+      LLAMA_COMMIT: ${{ inputs.llama_commit }}
+      LLAMA_SOURCE_SHA256: ${{ inputs.llama_source_sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+
+      - name: Validate lockfile (stable channel only)
+        if: inputs.llama_ref == ''
+        run: go run ./cmd/llama-lock validate
+
+      - name: Build llama-server from pinned source
+        run: bash scripts/build-llama.sh .llama-build
+
+      - name: CLI contract — flags the runner uses must still exist
+        run: |
+          help="$(.llama-build/llama-server --help 2>&1 || true)"
+          for flag in --host --port -m --alias --mmproj; do
+            grep -q -- "$flag" <<<"$help" || { echo "E_CONTRACT: llama-server no longer knows $flag" >&2; exit 1; }
+          done
+          echo "CLI contract OK (--host --port -m --alias --mmproj)"
+
+      - name: Build + test shardr
+        run: |
+          go build ./...
+          go vet ./...
+          go test ./...
+
+      - name: Fetch pinned E2E model
+        run: |
+          curl -sSL --fail --max-time 900 --retry 2 "$E2E_MODEL_URL" -o model.gguf
+          actual=$(sha256sum model.gguf 2>/dev/null | cut -d' ' -f1 || shasum -a 256 model.gguf | cut -d' ' -f1)
+          [ "$actual" = "$E2E_MODEL_SHA256" ] || { echo "E_MODEL_DIGEST: $actual != $E2E_MODEL_SHA256" >&2; exit 1; }
+
+      - name: Real runner E2E (shardr → llama-server)
+        run: |
+          SHARDR_E2E_REAL=1 \
+          SHARDR_LLAMA_SERVER="$PWD/.llama-build/llama-server" \
+          SHARDR_E2E_MODEL="$PWD/model.gguf" \
+          go test ./internal/cli -run TestRealBinaryE2E -v -timeout 30m
+
+      - name: Stage runner binaries (short-lived CI artifacts)
+        run: |
+          mkdir -p dist
+          cp -L .llama-build/llama-server dist/llama-server
+          cp .llama-build/*/LICENSE dist/llama-LICENSE
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: runner-bin-${{ matrix.platform }}
+          retention-days: 7
+          path: dist/
+          if-no-files-found: error

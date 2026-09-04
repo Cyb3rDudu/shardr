@@ -11,11 +11,13 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/Cyb3rDudu/shardr/internal/llamalock"
 )
 
-// LlamaPin is the llama.cpp release `make llama` builds (strand design
-// decision: managed subprocess of a pinned upstream release, no cgo).
-const LlamaPin = "v0.3.0"
+// LlamaPin is the llama.cpp release `make llama` builds, read from
+// runtime/llama.lock — the SINGLE version truth (no second pin).
+func LlamaPin() string { return llamalock.RefOf() }
 
 // TerminateGrace is the supervisor duty window (002 §4/§5.3): SIGTERM,
 // clean exit within 30 s, SIGKILL after. Production default 30 s; tests
@@ -55,7 +57,7 @@ func ResolveBinary() (string, error) {
 	if p, err := exec.LookPath("llama-server"); err == nil {
 		return p, nil
 	}
-	return "", fmt.Errorf("E_BINARY: no llama-server binary found — set $SHARDR_LLAMA_SERVER, run `make llama` (builds the pinned llama.cpp %s into bin/), or install llama-server on $PATH", LlamaPin)
+	return "", fmt.Errorf("E_BINARY: no llama-server binary found — set $SHARDR_LLAMA_SERVER, run `make llama` (builds the pinned llama.cpp %s into bin/), or install llama-server on $PATH", LlamaPin())
 }
 
 // freePort reserves an ephemeral loopback port (listen :0, close). The

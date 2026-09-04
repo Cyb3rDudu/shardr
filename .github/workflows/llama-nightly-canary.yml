@@ -1,0 +1,73 @@
+# Workflow D — weekly nightly canary. Tests the newest bNNNN upstream tag
+# through the SAME build+E2E matrix, but NEVER touches runtime/llama.lock
+# and NEVER creates a stable release. Prerelease channel is a later step.
+name: llama nightly canary
+
+on:
+  schedule:
+    - cron: "37 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      llama_ref:
+        description: "Exact bNNNN tag"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: llama-nightly-canary
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      ref: ${{ steps.pick.outputs.ref }}
+      commit: ${{ steps.pick.outputs.commit }}
+      sha256: ${{ steps.pick.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+      - name: Pick nightly ref (explicit bNNNN or newest upstream)
+        id: pick
+        run: |
+          if [ -n "${{ inputs.llama_ref }}" ]; then
+            json=$(go run ./cmd/llama-lock resolve "${{ inputs.llama_ref }}")
+          else
+            json=$(go run ./cmd/llama-lock latest-nightly)
+          fi
+          echo "$json"
+          {
+            echo "ref=$(printf '%s' "$json" | python3 -c 'import sys,json;print(json.load(sys.stdin)["ref"])')"
+            echo "commit=$(printf '%s' "$json" | python3 -c 'import sys,json;print(json.load(sys.stdin)["commit"])')"
+            echo "sha256=$(printf '%s' "$json" | python3 -c 'import sys,json;print(json.load(sys.stdin)["source_sha256"])')"
+          } >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: resolve
+    uses: ./.github/workflows/llama-build-e2e.yml
+    with:
+      llama_ref: ${{ needs.resolve.outputs.ref }}
+      llama_commit: ${{ needs.resolve.outputs.commit }}
+      llama_source_sha256: ${{ needs.resolve.outputs.sha256 }}
+
+  summary:
+    needs: [resolve, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Canary summary
+        run: |
+          {
+            echo "## llama nightly canary"
+            echo "- ref: \`${{ needs.resolve.outputs.ref }}\`"
+            echo "- commit: \`${{ needs.resolve.outputs.commit }}\`"
+            echo "- source sha256: \`${{ needs.resolve.outputs.sha256 }}\`"
+            echo "- matrix result: **${{ needs.test.result }}**"
+            echo "- lockfile untouched: yes (canary never writes runtime/llama.lock)"
+            echo "- stable release: none (canary channel only)"
+          } >> "$GITHUB_STEP_SUMMARY"
