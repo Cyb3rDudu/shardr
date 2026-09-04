@@ -164,6 +164,9 @@ provenance (tag → commit, release-API digests) with
 
 ## Specifications & documentation
 
+User and developer documentation lives in [`docs/user/`](docs/user/) and
+[`docs/dev/`](docs/dev/).
+
 Design contracts live in [`docs/specs/`](docs/specs/) — see the
 [spec index](docs/specs/README.md) for surface statuses. Reference scheme &
 URI grammar (000), artifact format (001), runtime & configuration (002),
