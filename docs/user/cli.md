@@ -1,8 +1,8 @@
 # shardhive CLI reference
 
 Everything the `shardhive` binary does today, derived from the code.
-All commands print errors to stderr; only the documented output goes to
-stdout.
+Usage/dispatch errors and warnings go to stderr; `cas verify` prints
+its per-digest outcome lines (including `FAIL …`) to stdout.
 
 ```
 usage: shardhive <command> [args]

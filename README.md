@@ -13,7 +13,7 @@ Models are addressed by location-transparent references (`shardr:///ns/name:quan
 
 ## Quickstart
 
-Requires Go ≥ 1.23.
+Requires Go ≥ 1.25.
 
 ```sh
 go build -o shardhive ./cmd/shardhive
@@ -23,7 +23,7 @@ go build -o shardhive ./cmd/shardhive
 In a second shell, import a local model directory and verify the store:
 
 ```sh
-S=${SHARDR_SOCKET:-${XDG_RUNTIME_DIR}/shardhive.sock}
+S=${SHARDR_SOCKET:-${XDG_RUNTIME_DIR:-/tmp/shardhive-$(id -u)}/shardhive.sock}
 curl -s --unix-socket "$S" -X POST http://localhost/v1/import/local \
   -d '{"paths":["/path/to/model-dir"],"as":"gold/my-model"}'
 # → {"id":"…","state":"waiting",…}   poll GET /v1/jobs/{id} until "done"

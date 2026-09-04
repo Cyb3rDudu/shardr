@@ -1,7 +1,7 @@
 # Error reference
 
-Every error — API responses and CLI-visible failures — uses stable
-`E_*` classes. API errors come in the envelope
+API responses and reference-grammar failures use stable `E_*`
+classes. API errors come in the envelope
 `{"error":{"code","message","candidates"?}}` (see
 [api.md](api.md#error-envelope)).
 
@@ -11,10 +11,9 @@ Every error — API responses and CLI-visible failures — uses stable
 | --- | --- | --- |
 | `E_LENGTH` | reference exceeds 512 bytes | over-long tag/quant → shorten |
 | `E_PARSE` | malformed reference (scheme, ns/name, selector syntax) | typo; short form at the API (`ns/name:q`) → use the canonical URI (`shardr:///ns/name:q`); the message names the canonical spelling when it can |
-| `E_NO_SELECTOR` | selector required but absent | API/Modelfile refs need `:quant` (or a tag) — interactive-CLI default selectors never apply here |
+| `E_NO_SELECTOR` | selector required but absent | API/Modelfile refs need a selector — `:quant` or `:tag+quant`; interactive-CLI default selectors never apply here |
 | `E_DIGEST_FORMAT` | `@sha256:<hex>` pin is not 64 lowercase hex | wrong digest → use the canonical form |
 | `E_TAG_BANNED` | tag uses reserved characters/space rules | rename the tag |
-| `E_UNKNOWN_TAG` | tag does not exist for this repository | `candidates` lists the repo's existing tags → pick one |
 | `E_AMBIGUOUS_SELECTOR` | selector matches several index members | be more specific (tag+quant) |
 | `E_NO_MEMBER` | no index member matches the selector | wrong quant for this model → check `/v1/models` for the members that exist |
 | `E_PIN_MISMATCH` | pinned digest does not match what the selector resolves to | stale pin → re-resolve and re-pin |
@@ -35,7 +34,7 @@ Every error — API responses and CLI-visible failures — uses stable
 | `E_SOURCE_UNAVAILABLE` | 502/503/job | source not reachable / not implemented | HF unreachable; manifest not local for ensure; swarm has no peers → check network/config/hints |
 | `E_SOURCE_FORBIDDEN` | 502/job | HF repo gated | set `SHARDR_HF_TOKEN` in the daemon's environment |
 | `E_RATE_LIMITED` | 502/job | HF rate limit | retry later / set a token |
-| `E_NOT_IMPORTABLE` | job | import fails the 001 §8 rule set or verification | no recognized weights (eligibility gate); swarm bytes ≠ pin; structurally invalid distribution record → fix the source or the pin |
+| `E_NOT_IMPORTABLE` | job | import fails the 001 §8 rule set or verification | no recognized weights (eligibility gate); swarm bytes ≠ pin (see importing.md's eligibility table for the class split); structurally invalid distribution record → fix the source or the pin |
 | `E_INTERNAL` | 500/job | daemon bug — never a user-input verdict | report it; `cas verify` rules out disk corruption |
 
 Notes:

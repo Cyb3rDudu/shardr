@@ -1,6 +1,6 @@
 # Code layout
 
-Module path: `github.com/Cyb3rDudu/shardr`. Go ≥ 1.23, no CGO.
+Module path: `github.com/Cyb3rDudu/shardr`. Go ≥ 1.25 (see go.mod), no CGO.
 
 ```
 cmd/
@@ -50,7 +50,7 @@ cmd/shardhive ─► api ─► importer ─► artifact ─► ref
     │             └► swarm ┴───────────┘
     └► cas ◄───────────────────────────── (api, importer, swarm all use cas)
 
-specvectors ─► ref / artifact / cas   (vectors run PRODUCTION code)
+specvectors ─► ref / artifact         (vectors run PRODUCTION code)
 ```
 
 Where behavior lives, by question:

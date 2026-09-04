@@ -26,16 +26,14 @@ Why the modes split:
 - **`-race -short`** runs the whole tree under the race detector with
   the long E2E tests skipped — race coverage for every package's
   concurrency (CAS handles, job publication, swarm listeners) without
-  paying the full E2E runtime twice. The swarm E2E tests that stay
-  race-relevant have their own race-covered unit companions
-  (`e2e_swarm_race_test.go` runs unconditionally).
+  paying the full E2E runtime twice.
 - **`go vet` / `gofmt`** are the hygiene gate; both must be clean.
 
 ## Spec vectors (`internal/specvectors`)
 
 The JSONL suites in `docs/specs/vectors/` (reference grammar 000,
-canonical artifact 001, CAS 003) run **against the production
-packages** — `internal/ref`, `internal/artifact`, `internal/cas` — not
+canonical artifact 001, torrent mapping 004) run **against the
+production packages** — `internal/ref`, `internal/artifact` — not
 against test-local re-implementations. Parser/validator and vectors
 cannot drift apart: a rule change fails the vectors until the vectors
 say it should pass. Golden files in `internal/importer/testdata`

@@ -4,7 +4,7 @@ HTTP/1.1 over a Unix domain socket (mode 0600 — the socket permission
 is the access boundary; no TCP in this build). JSON in, JSON out.
 
 ```sh
-S=${SHARDR_SOCKET:-${XDG_RUNTIME_DIR}/shardhive.sock}
+S=${SHARDR_SOCKET:-${XDG_RUNTIME_DIR:-/tmp/shardhive-$(id -u)}/shardhive.sock}
 curl -s --unix-socket "$S" http://localhost/v1/models
 ```
 
@@ -41,7 +41,7 @@ The API accepts **only the canonical URI form** (000 §2):
 
 ```
 shardr:///ns/name:quant          # namespace, name, quant selector
-shardr:///ns/name:tag:quant      # tag-pinned (tags are per-repository)
+shardr:///ns/name:tag+quant      # tag-pinned (tags are per-repository)
 shardr:///ns/name@sha256:<hex>   # manifest-addressing: digest pin, no selector
 ```
 
@@ -86,8 +86,9 @@ returns no `indexDigest`.
 Errors: `E_BAD_REQUEST` (missing `ref`), `E_PARSE`/`E_LENGTH`/…
 (reference grammar, with canonical-form hints), `E_UNKNOWN_REF` (no
 local index; message says network resolver fetch is not implemented in
-this build, `candidates` lists same-namespace repos), `E_UNKNOWN_TAG`
-(unknown tag; `candidates` lists the repo's existing tags),
+this build, `candidates` lists same-namespace repos), `E_UNKNOWN_REF` with
+tag-scoped message + `candidates` (an unknown tag is an unknown ref:
+"no tag <tag> for ns/name; tags are scoped per repository (000 §3.4)"),
 `E_NO_INDEX` (index blob not in CAS), `E_INVALID_INDEX` (index fails
 validation), `E_NO_MEMBER` (no index member matches the selector).
 
@@ -110,9 +111,11 @@ Success (200) — same fields as `/resolve`, plus `files` (present) and
 curl -s --unix-socket "$S" 'http://localhost/v1/open?ref=shardr:///gold/toy-qwen:q8_0'
 # { … "files":[
 #     {"digest":"sha256:206ada42…","path":"~/.local/share/shardr/cas/blobs/sha256/20/6ada42…","size":485},
-#     {"digest":"sha256:bca235eb…","path":"…/blobs/sha256/bc/a235eb…","size":602}],
-#   "missing":[]}
+#     {"digest":"sha256:bca235eb…","path":"…/blobs/sha256/bc/a235eb…","size":602}]}
 ```
+
+`missing` appears only when digests are absent (`omitempty` — an empty
+`missing` key is not emitted).
 
 Errors: identical to `/resolve` — the same resolution path runs first:
 

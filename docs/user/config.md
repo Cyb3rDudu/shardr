@@ -74,7 +74,7 @@ section is reserved and parsed harmlessly.
 ## `[runtimes.*]` and `[models.*]` — runner overlay (layer 2)
 
 These sections belong to the model runner (spec 002 §2, overlay layer
-2) and are being built on a separate branch. shardhive reads and
+2) and are not implemented in this build. shardhive reads and
 validates nothing here today — the sections are shown so the config
 file's shape is complete. Model keys use the scheme-less short form
 `ns/name:quant` (000 §2).
