@@ -25,10 +25,10 @@ convergence).
 
 | Upstream shape | Becomes |
 | --- | --- |
-| `*.gguf` (not `mmproj*`/`imatrix*`) | weights.gguf entry; split suffix `-00001-of-00003` → parts; filename quant token (dash-separated suffix run, e.g. `model-q8_0.gguf` → `q8_0`) |
+| `*.gguf` (not `mmproj*`/`imatrix*`) | weights.gguf entry; split suffix `-00001-of-00003` (also `_00001_of_00003`) → parts; filename quant token (dash-separated suffix run, e.g. `model-q8_0.gguf` → `q8_0`) |
 | `*.safetensors` | weights.safetensors entry; standard shard numbering → parts |
-| `*.imatrix`, `imatrix*.gguf` | weights.aux (imatrix) |
-| `mmproj*` (non-gguf) | weights.aux (vision-projector) |
+| any file with `imatrix` in the name (incl. `*.gguf`) | weights.aux (imatrix) |
+| any `mmproj*` file (incl. `*.gguf`) | weights.aux (vision-projector) |
 | `model.safetensors.index.json` | weights.aux (weights-index) |
 | `adapter_model.safetensors` + `adapter_config.json` | one adapter tar per directory (both required — incomplete pairs are skipped with a warning) |
 | `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`, `added_tokens.json`, `preprocessor_config.json`, `processor_config.json`, `vocab.*`, `merges.*`, `*.model` (sentencepiece) | one deterministic `tokenizer.tar` |
@@ -38,9 +38,12 @@ convergence).
 | license files (`LICENSE`, `COPYING`, …) | manifest annotations (SPDX detected where possible), not entries |
 
 Skipped and counted (001 §8.2): training artifacts (`checkpoint-*/`,
-`rng_state*.pth`, optimizer/scheduler state), nested `config.json`
-(anywhere but the import root), `non_lora_trainables.bin` (explicit
-warning), and everything unrecognized.
+`rng_state*.pth`, optimizer/scheduler state), repo housekeeping
+(`README*`, `.gitattributes`, `.pyc`, `wandb/`, `runs/`, `logs/`,
+`assets/`, `__pycache__/`, `benchmarks/`, `.eval_results`,
+`generation_config.json`), nested `config.json` (anywhere but the
+import root), `non_lora_trainables.bin` (explicit warning), and
+everything unrecognized.
 
 ## How the quant is derived
 
@@ -112,11 +115,13 @@ curl -s --unix-socket "$S" -X POST http://localhost/v1/import/bt \
   anchor — the swarm only decides *where* bytes come from, never *what*
   they are. Every fetched byte is verified against the pinned manifest
   on write; a mismatch fails the import (`E_NOT_IMPORTABLE`).
-- `magnet` and `infohash` are mutually exclusive; `trackers`,
-  `webseeds`, `peers` are optional discovery hints (recorded at import
-  time as untrusted operational data). Without hints, discovery is
-  DHT-only — for first contact with a fresh swarm, at least one
-  webseed or peer hint is the practical route.
+- `magnet` and `infohash` are mutually exclusive. Discovery hints:
+  **at least one `webseeds` entry is required for `/v1/import/bt` in
+  this build** (the piece layers are fetched over HTTP first; v1
+  bootstrap, 004 §5) — trackers and `peers` are additional hints,
+  recorded as untrusted operational data. DHT-only discovery applies
+  to `/v1/ensure` refills of already-known artifacts, not to first
+  contact.
 - The daemon's swarm client must be enabled (`[swarm] enabled = true`,
   the default) — else 501 `E_NOT_IMPLEMENTED`.
 - A BT import delivers the pinned artifact's blobs. It does **not**
@@ -135,7 +140,7 @@ The infohash to pin comes from the publisher's distribution record
 | Unreadable root `config.json` | import error (`E_INTERNAL` job) | a wrong config would silently skew the quant chain |
 | Corrupt current model-index at merge time | `E_INVALID_INDEX` | loud, state untouched — never silently rebuilt |
 | HF repo not found / gated without token / rate-limited | `E_UNKNOWN_REF` / `E_SOURCE_FORBIDDEN` / `E_RATE_LIMITED` | upstream verdicts, surfaced verbatim |
-| Swarm bytes ≠ pin | `E_NOT_IMPORTABLE` | verify-write rejected the fetched bytes |
+| Swarm bytes ≠ pin | `E_NOT_IMPORTABLE` / `E_SOURCE_UNAVAILABLE` | fetched blobs fail the verify-write or the torrent identity does not bind to the pin → `E_NOT_IMPORTABLE`; a manifest-pin mismatch during the fetch phase → `E_SOURCE_UNAVAILABLE` |
 
 Being **skipped** (unrecognized files, nested configs, training
 artifacts) is not an error — it is counted in `result.skipped` and, where
