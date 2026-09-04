@@ -20,9 +20,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Cyb3rDudu/shardr/internal/artifact"
 	"github.com/Cyb3rDudu/shardr/internal/cas"
 	"github.com/Cyb3rDudu/shardr/internal/importer"
 	"github.com/Cyb3rDudu/shardr/internal/ref"
+	"github.com/Cyb3rDudu/shardr/internal/swarm"
 )
 
 // harness spins up a real server on a Unix socket and hands out an HTTP
@@ -1354,5 +1356,79 @@ func TestImportBTBadPinIs400NoJob(t *testing.T) {
 	h.server.mu.Unlock()
 	if n != 0 {
 		t.Fatalf("no job may exist for a bad pin, got %d", n)
+	}
+}
+
+// A structurally invalid distribution record in the ensure path is a
+// VERIFICATION failure, not an unavailable source: the job must fail
+// E_NOT_IMPORTABLE (005 §3: "a distribution-record/identity binding
+// failure"), not E_SOURCE_UNAVAILABLE.
+func TestEnsureInvalidRecordMapsNotImportable(t *testing.T) {
+	h := newHarness(t)
+	// A swarm client on the harness CAS (idle engine — the fill dies at
+	// record validation before any torrent work).
+	swarmCfg := swarm.DefaultConfig()
+	swarmCfg.DataRoot = h.store.Root
+	swarmCfg.DHT = false
+	sw, err := swarm.New(swarmCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sw.Close()
+	h.server.Swarm = sw
+
+	// Minimal VALID manifest with one file (whose blob stays missing —
+	// that is what triggers the fill path).
+	sum := sha256.Sum256([]byte("weights-bytes"))
+	root := sha256.Sum256([]byte("root"))
+	fileDigest := "sha256:" + hex.EncodeToString(sum[:])
+	cfgSum := sha256.Sum256([]byte("{}"))
+	manifest := &artifact.Manifest{
+		SchemaVersion: 1, ArtifactType: "model",
+		Files: []artifact.File{{
+			Kind: "config", Digest: "sha256:" + hex.EncodeToString(cfgSum[:]), Size: 2, Name: "modelconfig.json",
+			BT: artifact.BT{MerkleRoot: "sha256:" + hex.EncodeToString(root[:])},
+		}, {
+			Kind: "weights.gguf", Digest: fileDigest, Size: 13, Name: "m.gguf",
+			BT: artifact.BT{MerkleRoot: "sha256:" + hex.EncodeToString(root[:])},
+		}},
+	}
+	mb, err := artifact.Canonical(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manDigest := artifact.Digest(mb)
+	if err := h.store.Put(strings.TrimPrefix(manDigest, "sha256:"), strings.NewReader(string(mb))); err != nil {
+		t.Fatal(err)
+	}
+	// Digest-consistent but structurally INVALID record, linked.
+	recBytes := []byte(`{"schemaVersion":1,"artifactType":"not-distribution","manifestDigest":"` + manDigest + `","torrent":{"infohash":"btmh:1220` + strings.Repeat("cd", 32) + `","pieceLength":1048576,"pieceLayersDigest":"sha256:` + strings.Repeat("ef", 32) + `"}}`)
+	recSum := sha256.Sum256(recBytes)
+	recDigest := "sha256:" + hex.EncodeToString(recSum[:])
+	if err := h.store.Put(strings.TrimPrefix(recDigest, "sha256:"), strings.NewReader(string(recBytes))); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SetDistributionLink(manDigest, recDigest); err != nil {
+		t.Fatal(err)
+	}
+
+	code, body := h.postJSON("/v1/ensure", map[string]string{"ref": "shardr:///ns/x@" + manDigest})
+	if code != http.StatusCreated {
+		t.Fatalf("ensure: %d %s", code, body)
+	}
+	var job Job
+	json.Unmarshal(body, &job)
+	if job.State != "fetching" {
+		t.Fatalf("async fill expected, got %+v", job)
+	}
+	term := waitJob(t, h, job.ID)
+	if term.State != "failed" || term.Error == nil {
+		t.Fatalf("terminal: %+v", term)
+	}
+	if term.Error.Code != "E_NOT_IMPORTABLE" {
+		t.Fatalf("error class must be E_NOT_IMPORTABLE, got %s (%s)", term.Error.Code, term.Error.Message)
+	}
+	if !strings.Contains(term.Error.Message, "fails validation") {
+		t.Fatalf("message must name the validation failure: %s", term.Error.Message)
 	}
 }

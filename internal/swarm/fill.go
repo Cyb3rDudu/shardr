@@ -89,7 +89,7 @@ func (c *Client) RecordForManifest(manifestDigest string) (*artifact.Distributio
 		return nil, nil, fmt.Errorf("swarm: record blob %s content hashes to %s (corruption; never silently rebuilt)", recDigest, got)
 	}
 	if verr := artifact.ValidateDistribution(&rec); verr != nil {
-		return nil, nil, fmt.Errorf("swarm: record %s fails validation: %s (corruption; never silently rebuilt)", recDigest, verr.Msg)
+		return nil, nil, fmt.Errorf("swarm: record %s fails validation: %w (corruption; never silently rebuilt)", recDigest, verr)
 	}
 	return &rec, b, nil
 }

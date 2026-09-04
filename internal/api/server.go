@@ -677,8 +677,15 @@ func (s *Server) startFillJob(w http.ResponseWriter, job *Job, m *artifact.Manif
 
 // mapSwarmError maps swarm failures to the 005 §3 inventory.
 func mapSwarmError(err error) *APIError {
+	var verr *artifact.ValidationError
 	switch {
 	case errors.Is(err, swarm.ErrBinding):
+		return &APIError{Code: "E_NOT_IMPORTABLE", Message: err.Error()}
+	case errors.As(err, &verr):
+		// A structurally invalid distribution record (or manifest) is a
+		// verification failure, not an unavailable source — the record is
+		// THERE and fails its rules (005 §3 E_NOT_IMPORTABLE: "a
+		// distribution-record/identity binding failure").
 		return &APIError{Code: "E_NOT_IMPORTABLE", Message: err.Error()}
 	case errors.Is(err, swarm.ErrLayersUnavailable):
 		return &APIError{Code: ErrSourceUnavail, Message: err.Error()}
