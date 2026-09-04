@@ -3,7 +3,9 @@ LLAMA_BUILD_DIR ?= .llama-build
 
 # llama.cpp version comes from runtime/llama.lock — the SINGLE version
 # truth (parsed fail-closed by internal/llamalock; no second pin here).
-LLAMA_VERSION := $(shell go run ./cmd/llama-lock ref)
+# Lazily expanded so targets that never use the version (clean, deploy)
+# don't compile Go on every make invocation.
+LLAMA_VERSION = $(shell go run ./cmd/llama-lock ref)
 LLAMA_SERVER := $(BIN)/llama-server
 
 .PHONY: all llama build-llama deploy-llama check-llama-deploy clean test

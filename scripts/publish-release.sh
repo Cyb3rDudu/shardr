@@ -6,6 +6,8 @@
 # Usage: publish-release.sh <distdir>   (expects *.tar.gz + SHA256SUMS in distdir)
 set -euo pipefail
 dist=$1
+# Absolutize dist against the CALLER's cwd before any internal cd.
+dist=$(cd "$dist" && pwd)
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 version=${SHARDR_VERSION:-$(git rev-parse --short HEAD)}
@@ -27,5 +29,5 @@ if gh release view "$rel" >/dev/null 2>&1; then
   exit 1
 fi
 
-gh release create "$rel" --title "$rel" --notes-preamble "Runner bundle: shardr $(git rev-parse --short HEAD), llama.cpp $llama_ref (commit pinned in runtime/llama.lock). Checksums in SHA256SUMS; provenance in each archive's BUILDINFO.json." ./*.tar.gz SHA256SUMS
+gh release create "$rel" --title "$rel" --notes "Runner bundle: shardr $(git rev-parse --short HEAD), llama.cpp $llama_ref (commit pinned in runtime/llama.lock). Checksums in SHA256SUMS; provenance in each archive's BUILDINFO.json." ./*.tar.gz SHA256SUMS
 echo ">> published $rel"

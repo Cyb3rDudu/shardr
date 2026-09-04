@@ -38,7 +38,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: llama-e2e-${{ github.ref }}
+  # Caller-scoped: canary (llama nightly canary) and release (release
+  # runner) share this workflow via workflow_call — keep their groups
+  # separate so a nightly run never cancels a release build.
+  group: llama-e2e-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 # Pinned test model (rule: no unversioned HF downloads).
@@ -94,7 +97,11 @@ jobs:
       - name: Fetch pinned E2E model
         run: |
           curl -sSL --fail --max-time 900 --retry 2 "$E2E_MODEL_URL" -o model.gguf
-          actual=$(sha256sum model.gguf 2>/dev/null | cut -d' ' -f1 || shasum -a 256 model.gguf | cut -d' ' -f1)
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum model.gguf | cut -d' ' -f1)
+          else
+            actual=$(shasum -a 256 model.gguf | cut -d' ' -f1)
+          fi
           [ "$actual" = "$E2E_MODEL_SHA256" ] || { echo "E_MODEL_DIGEST: $actual != $E2E_MODEL_SHA256" >&2; exit 1; }
 
       - name: Real runner E2E (shardr → llama-server)
