@@ -5,7 +5,7 @@ store verification. Everything shown here works in the current build.
 
 ## Installation
 
-From source (requires Go ≥ 1.23):
+From source (requires Go ≥ 1.25):
 
 ```sh
 git clone https://github.com/Cyb3rDudu/shardr
@@ -64,7 +64,7 @@ Point the import at a directory (or a set of files) and name the
 namespace it should land in — `as` is mandatory:
 
 ```sh
-S=${SHARDR_SOCKET:-${XDG_RUNTIME_DIR}/shardhive.sock}
+S=${SHARDR_SOCKET:-${XDG_RUNTIME_DIR:-/tmp/shardhive-$(id -u)}/shardhive.sock}
 curl -s --unix-socket "$S" -X POST http://localhost/v1/import/local \
   -d '{"paths":["/path/to/model-dir"],"as":"gold/my-model"}'
 # {"id":"c04e88d49859eabe","ref":"gold/my-model","state":"waiting",

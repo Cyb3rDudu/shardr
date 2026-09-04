@@ -10,8 +10,9 @@ shardhive embeds a BitTorrent v2 client (spec 004). It serves two roles:
   other shardhive nodes can pull its pieces from you — over both the
   peer protocol and a plain-HTTP webseed listener the daemon runs on
   `127.0.0.1:<ephemeral>`.
-- **Use is replication:** the moment you import or fetch a model, your
-  node becomes a mirror for everyone else who wants it. There is no
+- **Use is replication:** every complete artifact you hold is (or,
+  for imports made while the daemon is already running, becomes at the
+  next restart — see below) available for others to pull. There is no
   leech mode; that is the design (community mirror, 004 §5).
 - Upload can be bounded: `[swarm] upload_limit = <bytes/sec>` in
   `config.toml` (`0` = unlimited, the default). Seeding can be turned

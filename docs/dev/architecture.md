@@ -69,7 +69,7 @@ view.
    build**; resolution fails loudly (`E_UNKNOWN_REF`) instead of ever
    touching the network.
 3. The member selector resolves against the model-index blob
-   (`name:quant` / `tag:quant` → manifest digest). The `@sha256:<hex>`
+   (`name:quant` / `name:tag+quant` → manifest digest). The `@sha256:<hex>`
    form skips all of this: the digest is the answer.
 
 `/v1/ensure` then makes a resolved model complete: local presence
