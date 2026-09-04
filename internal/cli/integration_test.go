@@ -351,7 +351,6 @@ func TestSplitGGUFHardlinkNaming(t *testing.T) {
 	}
 	// Zero-copy: the hardlink shares bytes — every scratch entry must be
 	// a link (st_nlink > 1), never a copy.
-	Stop(context.Background(), c, "", true, io.Discard)
 	var mPath string
 	for i, a := range argv {
 		if a == "-m" && i+1 < len(argv) {
@@ -384,6 +383,7 @@ func TestSplitGGUFHardlinkNaming(t *testing.T) {
 			t.Fatalf("%s is neither link nor regular file", e.Name())
 		}
 	}
+	Stop(context.Background(), c, "", true, io.Discard)
 }
 
 // stop REFUSES to signal when the pid does not serve the registered ref
