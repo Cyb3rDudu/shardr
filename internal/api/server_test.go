@@ -424,33 +424,22 @@ func TestOpenListsPathsAndMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Present-but-corrupt manifest (q8 body is not JSON): /open fails
+	// LOUD with the corruption class — never 200 with a silently partial
+	// file list (issue #26 blocker 4; 005 §2.3).
 	code, body := h.get("/v1/open?ref=" + url.QueryEscape("shardr:///ns/models:q8_0"))
-	if code != http.StatusOK {
-		t.Fatalf("status %d body %s", code, body)
+	if code < 500 {
+		t.Fatalf("corrupt manifest must fail loud (5xx), got %d body %s", code, body)
 	}
-	var res resolveResult
-	json.Unmarshal(body, &res)
-	if len(res.Files) != 2 {
-		t.Fatalf("files %+v", res.Files)
+	if !strings.Contains(string(body), "corruption") {
+		t.Fatalf("error must name the corruption class: %s", body)
 	}
-	for _, f := range res.Files {
-		if !strings.HasPrefix(f.Path, h.store.Root) || !strings.Contains(f.Path, "blobs/sha256/") {
-			t.Fatalf("file path %s is not a CAS path", f.Path)
-		}
-		if f.Size == 0 {
-			t.Fatalf("file %s has no size", f.Digest)
-		}
-	}
-	// Both index and manifest present → nothing missing, nothing auto-filled.
-	if len(res.Missing) != 0 {
-		t.Fatalf("missing %+v", res.Missing)
-	}
-
 	// Absent manifest: listed as missing, never fetched.
 	code, body = h.get("/v1/open?ref=" + url.QueryEscape("shardr:///ns/models:q4_0"))
 	if code != http.StatusOK {
 		t.Fatalf("q4_0: status %d body %s", code, body)
 	}
+	var res resolveResult
 	json.Unmarshal(body, &res)
 	if len(res.Files) != 1 || res.Files[0].Digest != "sha256:"+indexD {
 		t.Fatalf("files %+v", res.Files)

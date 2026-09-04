@@ -148,7 +148,15 @@ func (r *Registry) Remove(id string) error {
 // withLock serializes registry mutations across processes via an flock
 // sidecar file (LOCK_EX blocking). ponytail: flock file instead of a
 // lock library — syscall.Flock is stdlib on every unix we ship.
+// preLockHook fires BEFORE lock acquisition (test seam: a barrier here
+// forces concurrent critical sections when the lock is broken, and mere
+// serialization when it works — deterministic red/green for the flock).
+var preLockHook func()
+
 func (r *Registry) withLock(fn func() error) error {
+	if preLockHook != nil {
+		preLockHook()
+	}
 	if err := os.MkdirAll(filepath.Dir(r.path), 0o700); err != nil {
 		return fmt.Errorf("E_STATE: %w", err)
 	}
