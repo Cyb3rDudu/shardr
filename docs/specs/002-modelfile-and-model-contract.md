@@ -213,3 +213,11 @@ Key allowlist v1 (overlay-validated; mapped to llama-server flags):
 
 Runtime ids are lowercase and dot-free — they survive as dot-key
 prefixes in overlay layers 2–4.
+
+**Bool key semantics (tri-state):** an absent bool key **inherits** the
+runtime built-in default; `true` passes the flag; `false` omits the flag —
+which means the runtime default applies, not "off". An overlay therefore
+cannot explicitly disable a runtime-default-ON flag in v1; explicit
+negative flag mappings (where llama-server exposes them) are a later-version
+extension. Overlays enable and tune; they do not fight the runtime's
+defaults.
