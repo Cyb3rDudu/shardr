@@ -41,11 +41,11 @@ var (
 
 // Lock is the parsed runtime/llama.lock.
 type Lock struct {
-	Ref          string
-	Commit       string
-	SourceURL    string
-	SourceSHA256 string
-	UpdatedAt    string
+	Ref          string `json:"ref"`
+	Commit       string `json:"commit"`
+	SourceURL    string `json:"source_url"`
+	SourceSHA256 string `json:"source_sha256"`
+	UpdatedAt    string `json:"updated_at"`
 }
 
 // SourceURLFor is the canonical archive URL for a commit.
@@ -324,8 +324,12 @@ func ArchiveSHA256(ctx context.Context, commit string) (string, error) {
 		return "", fmt.Errorf("download %s: HTTP %d", url, resp.StatusCode)
 	}
 	h := sha256.New()
-	if _, err := io.Copy(h, io.LimitReader(resp.Body, maxArchiveBytes+1)); err != nil {
+	n, err := io.Copy(h, io.LimitReader(resp.Body, maxArchiveBytes+1))
+	if err != nil {
 		return "", fmt.Errorf("download %s: %w", url, err)
+	}
+	if n > maxArchiveBytes {
+		return "", fmt.Errorf("download %s: archive exceeds %d bytes — refusing", url, maxArchiveBytes)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }

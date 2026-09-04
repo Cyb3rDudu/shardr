@@ -109,12 +109,19 @@ func TestSingleTruthLockfile(t *testing.T) {
 			}
 		}
 	}
-	// The lockfile itself must parse from the repo root.
+	// The committed lockfile itself must parse (fail-closed check on the
+	// real bytes, not just their existence).
 	root, err := FindRepoRoot()
 	if err != nil {
 		t.Skipf("not run from repo: %v", err)
 	}
-	readFileT(t, root+"/runtime/llama.lock")
+	lockBytes, err := os.ReadFile(root + "/runtime/llama.lock")
+	if err != nil {
+		t.Fatalf("read lockfile: %v", err)
+	}
+	if _, err := Parse(lockBytes); err != nil {
+		t.Fatalf("committed runtime/llama.lock is invalid: %v", err)
+	}
 }
 
 func readFileT(t *testing.T, p string) []byte {
