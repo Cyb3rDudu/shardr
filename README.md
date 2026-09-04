@@ -1,33 +1,131 @@
+<p align="center"><img src="assets/shardr-logo.png" alt="shardr logo" width="220"></p>
+
 # shardr
 
-shardr is a decentralized model storage and distribution stack for LLMs —
-"Napster for LLMs". Models are addressed by location-transparent
-references (`shardr:///ns/name:quant`), stored in a content-addressed
-store, filled from local files / Hugging Face / a BitTorrent v2 swarm,
-and served through an OpenAI-compatible runtime. Usage is meant to feel
-like `docker run`, for LLMs.
+shardr is a decentralized LLM repository with sync-based distribution. It
+keeps large language models available and digitally sovereign: artifacts
+live in content-addressed storage on your machines, synchronize over a
+BitTorrent-based peer network, and serve through an OpenAI-compatible
+runtime. A global system operated by its users — independent of any single
+provider, with availability that grows with every participating node.
+
+For the individual user this means a **local, runtime-independent model
+repository**: your entire collection lives in one content-addressed store,
+addressed by name and quantization, deduplicated by digest, and continuously
+integrity-verified. Artifacts carry their own metadata and runtime
+configuration — the same store serves llama-server today and other runtimes
+later, so a model you import once stays usable regardless of which runtime
+executes it. Managing a local collection becomes inventory management
+(`shardr models`, `shardr verify --all`) instead of directory archaeology —
+and because every artifact is content-addressed, nothing is ever downloaded
+or stored twice.
 
 ## Components
 
-| Component | Kind | Purpose |
+| Component | Kind | Status |
 | --- | --- | --- |
-| `shardr` | Model runner + CLI | Runs models (OpenAI-compatible endpoints) **and** is the CLI for shardhive (pull/import/models/verify) |
-| `shardhive` | Storage daemon | CAS + imports (local / HF / BT) + BitTorrent swarm client; exposes the standardized client interface |
-| `shardrbay` | Web index | Magnet-link discovery over the swarm (see `site/shardrbay/`) |
+| `shardhive` | Storage daemon — content-addressed store (CAS), imports (local / Hugging Face / BitTorrent), sync client, API v1 over a 0600-mode Unix socket | working |
+| `shardr` | Model runtime & CLI — run/serve/stop lifecycle, layered runtime configuration, zero-copy serving via llama-server | working |
+| `shardrbay` | Discovery index over the peer network | planned |
+| `shardr build` | Modelfile composition — adapters and templates into distributable model images | planned |
 
-## Quickstart
-
-Requires Go ≥ 1.23.
+## Setup
 
 ```sh
-go build ./...
-go build -o shardr ./cmd/shardr
-go build -o shardhive ./cmd/shardhive
-./shardr --version   # shardr 0.0.1-dev
+go build -o sh-bin/shardr ./cmd/shardr
+go build -o sh-bin/shardhive ./cmd/shardhive
+make llama        # builds the pinned llama-server (v0.3.0) into bin/
+                  # or: any llama-server in $PATH, or $SHARDR_LLAMA_SERVER
 ```
 
-## Specs
+Start the storage daemon (all clients communicate with it over a
+mode-0600 Unix socket; `$SHARDR_SOCKET` overrides the path):
 
-Design documents live in [`docs/specs/`](docs/specs/) — references & URI
-scheme (000), artifact format (001), runner & runtime config (002), CAS
-(003), swarm (004), shardhive interface (005).
+```sh
+shardhive serve
+```
+
+On start, shardhive begins sharing every complete artifact it holds
+(startup sync).
+
+## Adding models
+
+```sh
+# local files (regular files only — symlinks are refused; the quantization
+# is derived from the filename, the model family from the stem)
+shardr import local ~/Models/qwen3.5-9b-q8_0.gguf --as qwen/test
+
+# Hugging Face (the commit SHA is pinned as provenance; identical
+# classification rules apply)
+shardr import hf Qwen/Qwen3-4B-Instruct-GGUF
+
+# BitTorrent (the manifest pin is mandatory — a bare magnet link is never
+# accepted)
+shardr import bt "magnet:?xt=…" --manifest sha256:ab…
+
+shardr models          # inventory: namespaces, quants, sizes
+shardr status          # job progress / recent jobs
+```
+
+## Serving models
+
+```sh
+shardr run qwen/test:q8_0              # foreground, Ctrl-C = clean shutdown
+
+shardr serve qwen/test:q8_0 --id mainllm   # background instance
+curl http://127.0.0.1:<port>/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"shardr:///qwen/test:q8_0","messages":[{"role":"user","content":"Hi"}]}'
+shardr stop mainllm                    # SIGTERM within 30 s, then SIGKILL
+```
+
+The short reference is canonicalized, resolved and ensured against the
+daemon; llama-server then maps the weights **directly from the CAS** — no
+additional copies are written to disk. The served model id is the canonical
+reference.
+
+### Runtime configuration — four layers
+
+Lowest to highest precedence: advisory defaults from the artifact →
+`~/.config/shardr/config.toml` (`[runtimes.llama]`, per-model
+`[models."ns/name:quant"]`) → `--config file.toml` → `--set key=value`.
+
+```sh
+shardr run qwen/test:q8_0 --set llama.n_gpu_layers=40 --set llama.ctx_size=32768
+```
+
+Keys are validated against the 002 §7.1 allowlist (`n_gpu_layers`,
+`ctx_size`, `n_threads`, `flash_attn`, `mlock`, `kv_cache_type`,
+`batch_size`, `ubatch_size`, `n_parallel`, `jinja`, `mmproj_variant`).
+Unknown keys fail loudly, naming the layer they came from. Bool keys are
+tri-state: absent = inherit, `true` = pass flag, `false` = omit flag
+(the runtime default applies — not "off").
+
+## Synchronization & integrity
+
+Sharing is enabled by default: every complete artifact contributes to global
+availability. Configure `[swarm]` in `config.toml` (`seed`, `upload_limit`,
+`dht`). Missing content is filled automatically — CAS hit → import → peer
+network (`shardr pull <ref>` fills without serving).
+
+```sh
+shardr verify --all     # integrity re-hash (exit 0 clean, 1 mismatch, 2 missing)
+```
+
+Trust derives from digests, never from transports: every byte is verified
+against its content address on write, and BitTorrent imports require a
+pinned manifest digest.
+
+## Specifications & documentation
+
+Design contracts live in [`docs/specs/`](docs/specs/) — see the
+[spec index](docs/specs/README.md) for surface statuses. Reference scheme &
+URI grammar (000), artifact format (001), runtime & configuration (002),
+CAS (003), peer synchronization (004), interface & resolution (005).
+
+## Status
+
+Operational end-to-end: import → CAS → synchronization → `shardr run` with
+a real GGUF and a real llama-server (verified with a 7.7 GB model). Not yet
+built: `shardr build` (Modelfile composition), shardrbay, mlx/vllm
+runtimes, CAS garbage collection.
