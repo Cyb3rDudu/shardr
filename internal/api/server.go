@@ -94,7 +94,9 @@ type Job struct {
 
 	// Import jobs (001 §8). Jobs are immutable once published: every state
 	// transition publishes a fresh instance via publishJob (atomic swap).
-	Kind       string        `json:"kind,omitempty"` // import-local|import-hf|ensure
+	Kind       string        `json:"kind,omitempty"`   // import-local|import-hf|ensure|verify
+	Target     string        `json:"target,omitempty"` // verify: digest or "all"
+	Verify     *VerifyResult `json:"verify,omitempty"`
 	As         string        `json:"as,omitempty"`
 	FilesDone  int           `json:"filesDone,omitempty"`
 	FilesTotal int           `json:"filesTotal,omitempty"`
@@ -247,6 +249,8 @@ func (s *Server) router() http.Handler {
 	mux.HandleFunc("GET /v1/open", s.handleOpen)
 	mux.HandleFunc("POST /v1/ensure", s.handleEnsure)
 	mux.HandleFunc("GET /v1/jobs/{id}", s.handleJob)
+	mux.HandleFunc("GET /v1/jobs", s.handleJobsList)
+	mux.HandleFunc("POST /v1/verify", s.handleVerify)
 	mux.HandleFunc("GET /v1/blob/{digest}", s.handleBlob)
 	mux.HandleFunc("POST /v1/import/local", s.handleImportLocal)
 	mux.HandleFunc("POST /v1/import/hf", s.handleImportHF)
@@ -348,9 +352,14 @@ type resolveResult struct {
 }
 
 type fileRecord struct {
-	Digest string `json:"digest"`
-	Path   string `json:"path"`
-	Size   int64  `json:"size"`
+	Digest  string `json:"digest"`
+	Path    string `json:"path"`
+	Size    int64  `json:"size"`
+	Name    string `json:"name,omitempty"` // manifest file name (full-list mode)
+	Kind    string `json:"kind,omitempty"` // manifest kind (weights.gguf, config, …)
+	Role    string `json:"role,omitempty"` // weights.aux role (vision-projector, …)
+	Variant string `json:"variant,omitempty"`
+	Part    *int64 `json:"part,omitempty"` // split-GGUF part number (001 §3.1)
 }
 
 // resolveLocal resolves a parsed reference against local state only (005
@@ -495,8 +504,10 @@ func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleOpen: resolve + CAS paths for present files; missing listed, never
-// auto-filled (005 §3). In this slice the concretely known files are the
-// index and (if resolved) manifest blobs.
+// auto-filled (005 §3). With the manifest locally present the file list
+// covers ALL manifest files (weights included — the zero-copy handles the
+// runner mmaps); otherwise the concretely known files are the index and
+// manifest blobs.
 func (s *Server) handleOpen(w http.ResponseWriter, r *http.Request) {
 	p, he := parseRefParam(r)
 	if he != nil {
@@ -521,6 +532,28 @@ func (s *Server) handleOpen(w http.ResponseWriter, r *http.Request) {
 			res.Files = append(res.Files, fileRecord{Digest: d, Path: path, Size: fi.Size()})
 		} else {
 			res.Missing = append(res.Missing, d)
+		}
+	}
+	// Manifest present → the full file list with CAS paths (runner/zero-copy
+	// surface, 005 §3 "file list with CAS paths").
+	if res.ManifestDigest != "" {
+		hex := strings.TrimPrefix(res.ManifestDigest, ref.DigestSchemePrefix)
+		if s.store.Has(hex) {
+			if m, _, herr := s.loadManifest(hex); herr == nil {
+				for _, f := range m.Files {
+					fhex := strings.TrimPrefix(f.Digest, ref.DigestSchemePrefix)
+					path, err := s.store.BlobPath(fhex)
+					if err != nil || !s.store.Has(fhex) {
+						res.Missing = append(res.Missing, f.Digest)
+						continue
+					}
+					var size int64
+					if fi, err := os.Stat(path); err == nil {
+						size = fi.Size()
+					}
+					res.Files = append(res.Files, fileRecord{Digest: f.Digest, Path: path, Size: size, Name: f.Name, Kind: f.Kind, Role: f.Role, Variant: f.Variant, Part: f.Part})
+				}
+			}
 		}
 	}
 	writeJSON(w, http.StatusOK, res)
@@ -815,6 +848,136 @@ func (e *envelopeWriter) Write(p []byte) (int, error) {
 		return len(p), err // report the original write length to the caller
 	}
 	return e.ResponseWriter.Write(p)
+}
+
+// handleVerify: POST {target} where target = ref | digest | "all" —
+// integrity re-hash (003 §4) as an async job (005 §4: `shardr verify`).
+// Closes the 005 §4→§3 gap (the CLI table maps verify to a job; §3 had
+// no endpoint) — filed as a spec note in the runner PR.
+func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Target string `json:"target"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, ErrBadRequest, "body must be JSON {\"target\": …}: "+err.Error())
+		return
+	}
+	if body.Target == "" {
+		writeErr(w, http.StatusBadRequest, ErrBadRequest, "missing required field: target (ref, digest, or \"all\")")
+		return
+	}
+	job := &Job{ID: newJobID(), State: "waiting", Kind: "verify"}
+	// Resolve the target to a digest set first (loud on unknown refs).
+	switch {
+	case body.Target == "all":
+		job.Ref = "all"
+		job.Target = "all"
+	default:
+		var target string
+		if ref.IsDigest(body.Target) || strings.HasPrefix(body.Target, "sha256:") {
+			d, derr := ref.NormalizeDigest(body.Target)
+			if derr != nil {
+				writeErr(w, http.StatusBadRequest, derr.Class, derr.Message)
+				return
+			}
+			target = d
+			job.Manifest = d
+		} else {
+			p, rerr := ref.Parse(body.Target) // canonical form only (parseRefParam rule)
+			if rerr != nil {
+				writeErr(w, http.StatusBadRequest, rerr.Class, shortRefHint(body.Target, rerr), rerr.Candidates...)
+				return
+			}
+			res, he := s.resolveLocal(p)
+			if he != nil {
+				writeHTTPError(w, he)
+				return
+			}
+			target = res.ManifestDigest
+			job.Ref = p.Canonical
+			job.Manifest = res.ManifestDigest
+		}
+		job.Target = target
+	}
+	s.mu.Lock()
+	s.jobs[job.ID] = job
+	s.mu.Unlock()
+	next := *job
+	next.State = "fetching"
+	s.publishJob(&next)
+	go func() {
+		base := next
+		term := base
+		var digests []string
+		if base.Target == "all" {
+			res, err := s.store.VerifyAll()
+			if err != nil {
+				term.State = "failed"
+				term.Error = &APIError{Code: ErrInternal, Message: err.Error()}
+				s.publishJob(&term)
+				return
+			}
+			if len(res.Missing) > 0 || len(res.StateErrors) > 0 {
+				term.State = "failed"
+				term.Error = &APIError{Code: "E_VERIFY_FAILED",
+					Message: fmt.Sprintf("verify: %d missing, %d state errors: %v %v", len(res.Missing), len(res.StateErrors), res.Missing, res.StateErrors)}
+			} else {
+				term.State = "done"
+			}
+			term.Verify = &VerifyResult{Missing: res.Missing, StateErrors: res.StateErrors}
+			s.publishJob(&term)
+			return
+		}
+		digests = []string{strings.TrimPrefix(base.Target, ref.DigestSchemePrefix)}
+		// A manifest target verifies the manifest blob and every file blob.
+		if s.store.Has(digests[0]) {
+			if m, _, herr := s.loadManifest(digests[0]); herr == nil {
+				for _, f := range m.Files {
+					digests = append(digests, strings.TrimPrefix(f.Digest, ref.DigestSchemePrefix))
+				}
+			}
+		}
+		var bad []string
+		for _, d := range digests {
+			if err := s.store.Verify(d); err != nil {
+				bad = append(bad, d+" ("+err.Error()+")")
+			}
+		}
+		term.FilesTotal = len(digests)
+		if len(bad) > 0 {
+			term.State = "failed"
+			term.Error = &APIError{Code: "E_VERIFY_FAILED", Message: "digest mismatch or missing blob: " + strings.Join(bad, "; ")}
+			term.Verify = &VerifyResult{Missing: bad}
+		} else {
+			term.State = "done"
+			term.FilesDone = len(digests)
+		}
+		s.publishJob(&term)
+	}()
+	writeJSON(w, http.StatusCreated, &next)
+}
+
+// VerifyResult is the terminal payload of a verify job.
+type VerifyResult struct {
+	Missing     []string `json:"missing,omitempty"`
+	StateErrors []string `json:"stateErrors,omitempty"`
+}
+
+// handleJobsList lists jobs newest-first (005 §4 `shardr status` without
+// an id; additive to the §3 table — filed as a spec note in the runner PR).
+func (s *Server) handleJobsList(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	ids := make([]string, 0, len(s.jobs))
+	for id := range s.jobs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	jobs := make([]*Job, 0, len(ids))
+	for _, id := range ids {
+		jobs = append(jobs, s.jobs[id])
+	}
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
 }
 
 // handleBlob serves blob bytes read-through (005 §3): zero-copy, range

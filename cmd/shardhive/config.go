@@ -3,48 +3,21 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
-	"strconv"
-	"strings"
 
+	"github.com/Cyb3rDudu/shardr/internal/config"
 	"github.com/Cyb3rDudu/shardr/internal/swarm"
 )
 
-// config.toml loading (004 §7): a documented minimal subset parser —
-// sections, key = value (bool/int/string), # comments on their own line
-// or inline after a value (outside quoted strings, TOML semantics — the
-// 004 §7 example config uses inline comments). No arrays, no nested
-// tables beyond dotted section names (the config surface is local-node
-// knobs only; protocol-affecting knobs do not exist). Anything the parser
-// does not understand is a LOUD error, never silently ignored — a typo
-// must not quietly disable seeding.
-//
-// ponytail: hand-rolled subset instead of a TOML dependency — the dep
-// budget for this slice is anacrolix/torrent + transitive only.
+// [swarm] extraction (004 §7) on the shared parser (internal/config).
+// Keys outside [swarm] belong to other components and are not ours to
+// validate ([references], [runtimes.*], [models.*] — the runner owns
+// those). Unknown [swarm] keys are a loud error (fail closed).
 
 const swarmSection = "swarm"
 
-// swarmKeys are the known [swarm] keys. Keys outside [swarm] are ignored
-// (other components own them: [references], [runtimes.*], [models.*]).
 var swarmKeys = map[string]bool{
 	"enabled": true, "seed": true, "upload_limit": true, "dht": true,
 	"no_seed_verify": true, "webseed_addr": true,
-}
-
-// configPath resolves the config file location: $SHARDR_CONFIG if set,
-// else $XDG_CONFIG_HOME/shardr/config.toml, else ~/.config/shardr/config.toml.
-func configPath() (string, error) {
-	if p := os.Getenv("SHARDR_CONFIG"); p != "" {
-		return p, nil
-	}
-	if x := os.Getenv("XDG_CONFIG_HOME"); x != "" {
-		return filepath.Join(x, "shardr", "config.toml"), nil
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".config", "shardr", "config.toml"), nil
 }
 
 // loadSwarmConfig reads config.toml and returns the [swarm] config, or
@@ -53,61 +26,38 @@ func configPath() (string, error) {
 func loadSwarmConfig() (swarm.Config, error) {
 	cfg := swarm.DefaultConfig()
 	cfg.NoSeedVerify = false
-	path, err := configPath()
+	f, err := config.Load()
 	if err != nil {
 		return cfg, err
 	}
-	data, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return cfg, nil // no config = documented defaults
+	sec, ok := f[swarmSection]
+	if !ok {
+		return cfg, nil
 	}
-	if err != nil {
-		return cfg, err
-	}
-	section := ""
-	for ln, raw := range strings.Split(string(data), "\n") {
-		line := strings.TrimSpace(raw)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section = strings.TrimSpace(line[1 : len(line)-1])
-			if section == swarmSection {
-				continue
-			}
-			// Other sections belong to other components; keys inside them
-			// are not ours to validate.
-			continue
-		}
-		if section != swarmSection {
-			continue
-		}
-		key, val, ok := strings.Cut(line, "=")
-		if !ok {
-			return cfg, fmt.Errorf("config %s:%d: expected key = value, got %q", path, ln+1, line)
-		}
-		key = strings.TrimSpace(key)
-		val = stripComment(strings.TrimSpace(val))
+	// Report unknown keys in file order for stable messages.
+	for _, key := range sortedKeys(sec) {
 		if !swarmKeys[key] {
-			return cfg, fmt.Errorf("config %s:%d: unknown [swarm] key %q (known: enabled, seed, upload_limit, dht, no_seed_verify, webseed_addr)", path, ln+1, key)
+			return cfg, fmt.Errorf("config %s: unknown [swarm] key %q (known: enabled, seed, upload_limit, dht, no_seed_verify, webseed_addr)", configPathForError(), key)
 		}
-		unq := strings.Trim(val, `"`)
+	}
+	for key, v := range sec {
+		var err error
 		switch key {
 		case "enabled":
-			cfg.Enabled, err = parseBool(path, ln, unq)
+			cfg.Enabled, err = wantBool(key, v)
 		case "seed":
-			cfg.Seed, err = parseBool(path, ln, unq)
+			cfg.Seed, err = wantBool(key, v)
 		case "dht":
-			cfg.DHT, err = parseBool(path, ln, unq)
+			cfg.DHT, err = wantBool(key, v)
 		case "no_seed_verify":
-			cfg.NoSeedVerify, err = parseBool(path, ln, unq)
+			cfg.NoSeedVerify, err = wantBool(key, v)
 		case "upload_limit":
-			cfg.UploadLimit, err = parseInt(path, ln, unq)
+			cfg.UploadLimit, err = wantInt(key, v)
 			if err == nil && cfg.UploadLimit < 0 {
-				return cfg, fmt.Errorf("config %s:%d: upload_limit must be >= 0", path, ln+1)
+				return cfg, fmt.Errorf("config: upload_limit must be >= 0")
 			}
 		case "webseed_addr":
-			cfg.WebseedAddr = unq
+			cfg.WebseedAddr = v.Str
 		}
 		if err != nil {
 			return cfg, err
@@ -116,38 +66,39 @@ func loadSwarmConfig() (swarm.Config, error) {
 	return cfg, nil
 }
 
-// stripComment removes a TOML inline comment (# to end of line) from a
-// value, honoring double-quoted strings: a # inside quotes does not
-// start a comment.
-func stripComment(v string) string {
-	inQuote := false
-	for i, r := range v {
-		switch r {
-		case '"':
-			inQuote = !inQuote
-		case '#':
-			if !inQuote {
-				return strings.TrimSpace(v[:i])
+func sortedKeys(sec map[string]config.Value) []string {
+	keys := make([]string, 0, len(sec))
+	for k := range sec {
+		keys = append(keys, k)
+	}
+	// insertion order is lost by the map; sort for determinism
+	for i := 0; i < len(keys); i++ {
+		for j := i + 1; j < len(keys); j++ {
+			if keys[j] < keys[i] {
+				keys[i], keys[j] = keys[j], keys[i]
 			}
 		}
 	}
-	return v
+	return keys
 }
 
-func parseBool(path string, ln int, v string) (bool, error) {
-	switch v {
-	case "true":
-		return true, nil
-	case "false":
-		return false, nil
+func wantBool(key string, v config.Value) (bool, error) {
+	if v.Kind != config.KindBool {
+		return false, fmt.Errorf("config: [swarm] %s must be true/false", key)
 	}
-	return false, fmt.Errorf("config %s:%d: want true/false, got %q", path, ln+1, v)
+	return v.Bool, nil
 }
 
-func parseInt(path string, ln int, v string) (int64, error) {
-	n, err := strconv.ParseInt(v, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("config %s:%d: want integer, got %q", path, ln+1, v)
+func wantInt(key string, v config.Value) (int64, error) {
+	if v.Kind != config.KindInt {
+		return 0, fmt.Errorf("config: [swarm] %s must be an integer", key)
 	}
-	return n, nil
+	return v.Int, nil
+}
+
+func configPathForError() string {
+	if p := os.Getenv("SHARDR_CONFIG"); p != "" {
+		return p
+	}
+	return "config.toml"
 }
