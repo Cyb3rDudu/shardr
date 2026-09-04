@@ -119,11 +119,18 @@ func Stop(ctx context.Context, c *Client, id string, all bool, out io.Writer) er
 		if err != nil {
 			return err
 		}
-		// PID-reuse guard: a stale registry entry after a crash/reboot
-		// could name an unrelated recycled PID — SIGTERM (+SIGKILL after
-		// 30 s) would kill it. Verify identity first: the instance's
-		// /v1/models must serve id == the registered ref (--alias makes
-		// the real runtime do exactly that).
+		// PID-reuse guard, TWO factors: a stale registry entry after a
+		// crash/reboot could name an unrelated recycled PID — SIGTERM
+		// (+SIGKILL after 30 s) would kill it. (1) Start token: the live
+		// process's start identity must match the recorded one (a
+		// recycled pid never does). (2) Endpoint: /v1/models must serve
+		// the registered ref (--alias makes the real runtime do exactly
+		// that). Either mismatch → refuse and instruct manual cleanup.
+		liveToken, terr := runner.ProcessStartToken(in.PID)
+		if terr != nil || in.StartToken == "" || liveToken != in.StartToken {
+			return fmt.Errorf("E_STATE: refusing to stop %s: pid %d start identity %q does not match the recorded %q (stale entry or pid reuse?) — verify and clean %s manually",
+				in.ID, in.PID, liveToken, in.StartToken, reg.Path())
+		}
 		if id, ok := probeModelID(ctx, in.Endpoint); !ok || id != in.Ref {
 			return fmt.Errorf("E_STATE: refusing to stop %s: pid %d does not serve %s on %s (stale entry or pid reuse?) — verify and clean %s manually",
 				in.ID, in.PID, in.Ref, in.Endpoint, reg.Path())
@@ -131,6 +138,22 @@ func Stop(ctx context.Context, c *Client, id string, all bool, out io.Writer) er
 		fmt.Fprintf(out, "stopping %s (pid %d)…\n", in.ID, in.PID)
 		if err := runner.TerminatePID(in.PID); err != nil {
 			return err
+		}
+		// Split-scratch cleanup: drop the manifest's link dir when no
+		// other instance still serves from it (hardlinks/symlinks die with
+		// the dir; the CAS blobs are untouched).
+		if in.SplitDir != "" {
+			others := false
+			if rest, lerr := reg.List(); lerr == nil {
+				for _, e := range rest {
+					if e.ID != tid && e.SplitDir == in.SplitDir {
+						others = true
+					}
+				}
+			}
+			if !others {
+				os.RemoveAll(in.SplitDir)
+			}
 		}
 		if err := reg.Remove(tid); err != nil {
 			return err
@@ -179,8 +202,9 @@ func idsOf(list []runner.Instance) string {
 // launched is the outcome of a successful launch.
 type launched struct {
 	*runner.Runtime
-	Ref string
-	ID  string
+	Ref      string
+	ID       string
+	SplitDir string
 }
 
 func launch(ctx context.Context, c *Client, arg string, opts RunOptions, out io.Writer) (*launched, error) {
@@ -204,6 +228,14 @@ func launchDetached(ctx context.Context, c *Client, arg string, opts RunOptions,
 		l.Runtime.Terminate()
 		return nil, err
 	}
+	// Start token at serve time: pid-reuse identity for every later stop
+	// (the endpoint probe alone cannot distinguish a recycled pid that
+	// happens to serve the same ref).
+	token, terr := runner.ProcessStartToken(l.Runtime.PID())
+	if terr != nil {
+		l.Runtime.Terminate()
+		return nil, terr
+	}
 	// Register only after readiness — a dead instance never lands in the
 	// registry.
 	reg, err := runner.OpenRegistry()
@@ -214,6 +246,7 @@ func launchDetached(ctx context.Context, c *Client, arg string, opts RunOptions,
 	if err := reg.Add(runner.Instance{
 		ID: l.ID, Ref: l.Ref, Endpoint: l.Runtime.Endpoint(),
 		PID: l.Runtime.PID(), Started: time.Now().UTC().Format(time.RFC3339),
+		StartToken: token, SplitDir: l.SplitDir,
 	}); err != nil {
 		l.Runtime.Terminate()
 		return nil, err
@@ -233,29 +266,40 @@ func prepare(ctx context.Context, c *Client, arg string, opts RunOptions, out io
 	}
 	fmt.Fprintf(out, "resolve %s\n", canonical)
 
-	// Ensure: CAS hit or fill job; then open for the file list.
+	// Ensure: CAS hit or fill job; then open for the file list. Terminal
+	// states resolve HERE — a synchronous failed surfaces its job error
+	// immediately (never masked by a confusing /open failure), done
+	// proceeds; every non-terminal state (waiting/fetching/seeding, 005
+	// §3) is polled to its terminal state.
 	var job Job
 	if err := c.DoJSON(ctx, http.MethodPost, "/v1/ensure", map[string]string{"ref": canonical}, &job); err != nil {
 		return nil, err
 	}
-	if job.State == "waiting" || job.State == "fetching" {
+	term := &job
+	switch job.State {
+	case "failed":
+		return nil, job.Error
+	case "done":
+	default: // waiting | fetching | seeding | anything future non-terminal
 		fmt.Fprintf(out, "filling %s\n", canonical)
 		last := ""
-		term, err := c.WaitJob(ctx, job.ID, func(j Job) {
+		var werr error
+		term, werr = c.WaitJob(ctx, job.ID, func(j Job) {
 			bar := fmt.Sprintf("%d/%d", j.FilesDone, j.FilesTotal)
 			if bar != last {
 				fmt.Fprintf(out, "\r  %s %s", j.State, bar)
 				last = bar
 			}
 		})
-		if err != nil {
-			return nil, err
+		if werr != nil {
+			return nil, werr
 		}
 		fmt.Fprintln(out)
 		if term.State == "failed" {
 			return nil, term.Error
 		}
 	}
+	_ = term
 	var open openResult
 	if err := c.DoJSON(ctx, http.MethodGet, "/v1/open?ref="+urlEscape(canonical), nil, &open); err != nil {
 		return nil, err
@@ -290,6 +334,7 @@ func prepare(ctx context.Context, c *Client, arg string, opts RunOptions, out io
 	if err != nil {
 		return nil, fmt.Errorf("E_CONFIG: %w", err)
 	}
+	splitDirUsed := ""                      // set when a split scratch dir was linked
 	variant := merged["mmproj_variant"].Str // "" → f16 default (002 §5.7)
 	weights, parts, mmproj, warns, err := pickWeights(open.Files, variant)
 	for _, w := range warns {
@@ -316,19 +361,29 @@ func prepare(ctx context.Context, c *Client, arg string, opts RunOptions, out io
 			// source restores the shared-bytes state.
 			os.Remove(dst)
 			if err := os.Link(p.Path, dst); err != nil {
-				if !errors.Is(err, syscall.EXDEV) {
+				switch {
+				case errors.Is(err, syscall.EEXIST):
+					// Our Remove just ran — EEXIST means a CONCURRENT
+					// serve linked the same part microseconds ago. Same
+					// manifest digest, same immutable CAS source: the
+					// existing link is exactly what we would have built.
+					// (A stale leftover cannot surface here: we removed
+					// it ourselves first.)
+				case errors.Is(err, syscall.EXDEV):
+					// Cross-device (CAS and runtime dir on different
+					// filesystems): a symlink carries zero bytes just the
+					// same — the runtime opens and mmaps THROUGH it into
+					// the CAS blob (zero-copy law intact, 002 §4).
+					if err := os.Symlink(p.Path, dst); err != nil {
+						return nil, fmt.Errorf("E_RUNTIME: link split part %s: %w", p.Name, err)
+					}
+				default:
 					return nil, fmt.Errorf("E_RUNTIME: hardlink split part %s: %w", p.Name, err)
-				}
-				// Cross-device (CAS and runtime dir on different
-				// filesystems): a symlink carries zero bytes just the
-				// same — the runtime opens and mmaps THROUGH it into the
-				// CAS blob (zero-copy law intact, 002 §4).
-				if err := os.Symlink(p.Path, dst); err != nil {
-					return nil, fmt.Errorf("E_RUNTIME: link split part %s: %w", p.Name, err)
 				}
 			}
 		}
 		weights.Path = filepath.Join(splitDir, parts[0].Name)
+		splitDirUsed = splitDir
 	}
 
 	bin, err := runner.ResolveBinary()
@@ -336,6 +391,7 @@ func prepare(ctx context.Context, c *Client, arg string, opts RunOptions, out io
 		return nil, err
 	}
 	fmt.Fprintf(out, "spawn %s\n  weights %s (zero-copy mmap)\n", bin, weights.Path)
+	_ = splitDirUsed
 	var stdout, stderr *os.File
 	if detached {
 		// Detached instances keep logs next to the registry state.
@@ -357,7 +413,7 @@ func prepare(ctx context.Context, c *Client, arg string, opts RunOptions, out io
 	if err != nil {
 		return nil, err
 	}
-	return &launched{Runtime: rt, Ref: canonical, ID: idFor(opts.ID, p)}, nil
+	return &launched{Runtime: rt, Ref: canonical, ID: idFor(opts.ID, p), SplitDir: splitDirUsed}, nil
 }
 
 // pickWeights selects the weights.gguf file and the vision-projector aux

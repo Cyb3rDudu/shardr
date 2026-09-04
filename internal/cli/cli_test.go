@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -40,6 +41,10 @@ func newMockDaemon(t *testing.T, handler http.HandlerFunc) *mockDaemon {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
+		// Fresh map per request: json.Unmarshal MERGES into an existing
+		// map, which would leak keys from earlier requests into later
+		// assertions.
+		m.lastBody = map[string]any{}
 		json.Unmarshal(b, &m.lastBody)
 		m.lastPath = r.URL.Path + "?" + r.URL.RawQuery
 		handler(w, r)
@@ -199,4 +204,90 @@ func writeCfg(t *testing.T, content string) string {
 		t.Fatal(err)
 	}
 	return p
+}
+
+// B1: a SYNCHRONOUS failed ensure surfaces the job error immediately —
+// never masked by a subsequent /open failure (which would hide the
+// cause behind a confusing 404/envelope error).
+func TestEnsureSyncFailedSurfacesJobError(t *testing.T) {
+	newMockDaemon(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/ensure":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"id": "j1", "state": "failed",
+				"error": map[string]any{"code": "E_UNKNOWN_REF", "message": "no local index for ns/none"},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	c, _ := NewClient()
+	err := Serve(context.Background(), c, "ns/none:q8_0", RunOptions{}, io.Discard)
+	if err == nil {
+		t.Fatal("failed ensure must error")
+	}
+	apiErr, ok := err.(*APIError)
+	if !ok || apiErr.Code != "E_UNKNOWN_REF" || !strings.Contains(apiErr.Message, "no local index") {
+		t.Fatalf("the JOB error must surface verbatim, got: %T %v", err, err)
+	}
+}
+
+// Further: import bt sends magnet URIs in the magnet FIELD and bare
+// infohashes in the infohash field (005 §3: {magnet | infohash}).
+func TestImportBTFieldSelection(t *testing.T) {
+	var got map[string]any
+	var m *mockDaemon
+	m = newMockDaemon(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/import/bt" {
+			got = m.lastBody
+			jobAnswer(w, "j1", "done")
+			return
+		}
+		if r.URL.Path == "/v1/jobs/j1" {
+			jobAnswer(w, "j1", "done")
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+	c, _ := NewClient()
+	pin := "sha256:" + strings.Repeat("aa", 32)
+	magnet := "magnet:?xt=urn:btmh:1220" + strings.Repeat("bb", 32)
+	if err := ImportBT(context.Background(), c, magnet, pin, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if got["magnet"] != magnet || got["infohash"] != nil {
+		t.Fatalf("magnet must use the magnet field: %+v", got)
+	}
+	if err := ImportBT(context.Background(), c, "btmh:1220"+strings.Repeat("cc", 32), pin, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if got["infohash"] == nil || got["magnet"] != nil {
+		t.Fatalf("bare infohash must use the infohash field: %+v", got)
+	}
+}
+
+// Status shows the newest job FIRST (server sorts by createdAt — the
+// CLI must not reverse it back to oldest-first).
+func TestStatusNewestFirst(t *testing.T) {
+	newMockDaemon(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/jobs" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"jobs": []map[string]any{
+				{"id": "newest", "kind": "ensure", "state": "done", "createdAt": "2026-09-04T12:00:02Z"},
+				{"id": "oldest", "kind": "ensure", "state": "done", "createdAt": "2026-09-04T12:00:01Z"},
+			}})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+	c, _ := NewClient()
+	out := &bytes.Buffer{}
+	if err := Status(context.Background(), c, "", out); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) < 2 || !strings.Contains(lines[0], "newest") || !strings.Contains(lines[len(lines)-1], "oldest") {
+		t.Fatalf("newest must be first:\n%s", out.String())
+	}
 }

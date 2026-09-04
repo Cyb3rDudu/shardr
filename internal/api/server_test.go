@@ -1634,3 +1634,40 @@ func TestVerifyAllDetectsMismatch(t *testing.T) {
 		t.Fatalf("mismatch must be surfaced: %+v", term.Verify)
 	}
 }
+
+// B4: /open fails LOUD on a present-but-corrupt manifest blob — never
+// 200 with a silently partial (index/manifest-only) file list. The
+// runner's zero-copy surface must not degrade quietly (005 §2.3).
+func TestOpenFailsLoudOnCorruptManifest(t *testing.T) {
+	h := newHarness(t)
+	sources, err := importer.LocalSources([]string{"../../internal/importer/testdata/gold"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lres, err := importer.Import(context.Background(), h.store, sources, importer.ImportOptions{As: "gold/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := "shardr:///gold/repo:" + lres.Members[0].Quant
+	// Corrupt the manifest blob in place (valid path, garbage content).
+	hexDigest := strings.TrimPrefix(lres.Members[0].Manifest, "sha256:")
+	p, err := h.store.BlobPath(hexDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Chmod(p, 0o644)
+	if err := os.WriteFile(p, []byte("{corrupt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, body := h.do(http.MethodGet, "/v1/open?ref="+ref, nil)
+	if code < 500 {
+		t.Fatalf("corrupt manifest must be a loud 5xx corruption error, got %d %s", code, body)
+	}
+	var e struct {
+		Error APIError `json:"error"`
+	}
+	json.Unmarshal(body, &e)
+	if !strings.Contains(e.Error.Message, "corruption") {
+		t.Fatalf("error must name the corruption class: %+v", e.Error)
+	}
+}

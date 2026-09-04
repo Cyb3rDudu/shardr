@@ -85,9 +85,9 @@ func TestRealBinaryE2E(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, c, shortRef, RunOptions{}, out) }()
 	endpoint := ""
-	deadline := time.Now().Add(3 * time.Minute)
+	deadline := time.Now().Add(4 * time.Minute)
 	for time.Now().Before(deadline) {
-		if e := serveEndpoint(out.String()); e != "" {
+		if e := runEndpoint(out.String()); e != "" {
 			endpoint = e
 			break
 		}
@@ -141,12 +141,29 @@ func TestRealBinaryE2E(t *testing.T) {
 				ReasoningContent string `json:"reasoning_content"`
 			} `json:"message"`
 		} `json:"choices"`
+		Timings struct {
+			PromptPerSecond    float64 `json:"prompt_per_second"`
+			PredictedPerSecond float64 `json:"predicted_per_second"`
+		} `json:"timings"`
+		Model string `json:"model"`
 	}
 	json.NewDecoder(cresp.Body).Decode(&chat)
 	if len(chat.Choices) == 0 || (chat.Choices[0].Message.Content == "" && chat.Choices[0].Message.ReasoningContent == "") {
 		t.Fatal("empty completion")
 	}
-	fmt.Printf("chat answered: %.80s…\n", strings.TrimSpace(chat.Choices[0].Message.Content+chat.Choices[0].Message.ReasoningContent))
+	answer := strings.TrimSpace(chat.Choices[0].Message.Content + chat.Choices[0].Message.ReasoningContent)
+	fmt.Printf("chat answered: %.80s…\n", answer)
+
+	// Proof artifact: EVERYTHING the test asserts must be visible in the
+	// artifact (chat status, served model id, response, tok/s) — a green
+	// check without recorded evidence is unfalsifiable.
+	if p := os.Getenv("SHARDR_E2E_PROOF"); p != "" {
+		proof := fmt.Sprintf("e2e real-binary proof (TestRealBinaryE2E)\nref:        %s\nendpoint:   %s\nmodel id:   %s\nchat:       HTTP %d\nanswer:     %.120s\ntok/s:      prompt %.1f / predicted %.1f\nexit:       ",
+			shortRef, endpoint, models.Models[0].ID, cresp.StatusCode, answer, chat.Timings.PromptPerSecond, chat.Timings.PredictedPerSecond)
+		_ = proof
+		os.WriteFile(p+".partial", []byte(proof), 0o644)
+		t.Cleanup(func() { os.Remove(p + ".partial") })
+	}
 
 	// Clean SIGTERM exit (ctx cancel = the runner's signal path).
 	start := time.Now()
@@ -160,4 +177,24 @@ func TestRealBinaryE2E(t *testing.T) {
 		t.Fatal("no clean exit within the 30 s grace")
 	}
 	fmt.Printf("clean exit after %s\n", time.Since(start).Round(time.Millisecond))
+	if p := os.Getenv("SHARDR_E2E_PROOF"); p != "" {
+		if b, err := os.ReadFile(p + ".partial"); err == nil {
+			os.WriteFile(p, append(b, []byte(fmt.Sprintf("clean after %s\n", time.Since(start).Round(time.Millisecond)))...), 0o644)
+		}
+	}
+}
+
+// runEndpoint extracts the endpoint from the FOREGROUND run output
+// ("ready: http://127.0.0.1:N (model id …) — Ctrl-C to stop") — the
+// serve format ("  endpoint http://…") is serveEndpoint's job.
+func runEndpoint(runOut string) string {
+	for _, ln := range strings.Split(runOut, "\n") {
+		e := strings.TrimSpace(ln)
+		if rest, ok := strings.CutPrefix(e, "ready: "); ok {
+			if url, _, found := strings.Cut(rest, " "); found && strings.HasPrefix(url, "http://127.0.0.1:") {
+				return url
+			}
+		}
+	}
+	return ""
 }

@@ -1,0 +1,12 @@
+e2e real-binary proof (TestRealBinaryE2E)
+ref:        e2e/real:raw
+endpoint:   http://127.0.0.1:62322
+model id:   shardr:///e2e/real:raw
+chat:       HTTP 200
+answer:     Thinking Process:
+
+1.  **Analyze the Request:**
+    *   Input: "Say OK."
+    *   Intent: The user wants me to output the
+tok/s:      prompt 54.6 / predicted 38.2
+exit:       clean after 303ms

@@ -54,7 +54,7 @@ func run(args []string) int {
 	case "pull":
 		return withClient(func(c *cli.Client) error {
 			if len(args) != 2 {
-				return fmt.Errorf("E_BAD_REQUEST: pull needs exactly one ref")
+				return fmt.Errorf("E_BAD_REQUEST: pull needs exactly one ref, got %d arguments", len(args)-1)
 			}
 			return cli.Pull(ctx, c, args[1], os.Stdout)
 		})
@@ -65,11 +65,14 @@ func run(args []string) int {
 	case "verify":
 		return withClient(func(c *cli.Client) error {
 			if len(args) != 2 {
-				return fmt.Errorf("E_BAD_REQUEST: verify needs a ref, a digest, or --all")
+				return fmt.Errorf("E_BAD_REQUEST: verify needs exactly one target (ref, digest, or --all)")
 			}
 			return cli.Verify(ctx, c, args[1], os.Stdout)
 		})
 	case "status":
+		if len(args) > 2 {
+			return fail(fmt.Errorf("E_BAD_REQUEST: status takes at most one job id, got %d extra arguments", len(args)-2))
+		}
 		return withClient(func(c *cli.Client) error {
 			job := ""
 			if len(args) == 2 {
@@ -133,13 +136,19 @@ func cmdImport(ctx context.Context, args []string) int {
 		var repo, rev string
 		positional := args[1:]
 		for i := 0; i < len(positional); i++ {
-			if positional[i] == "--rev" && i+1 < len(positional) {
+			if positional[i] == "--rev" {
+				if i+1 >= len(positional) {
+					return fail(fmt.Errorf("E_BAD_REQUEST: --rev needs a value (it is the last argument)"))
+				}
 				rev = positional[i+1]
-				positional = append(positional[:i], positional[i+1:]...)
+				positional = append(append([]string{}, positional[:i]...), positional[i+2:]...)
 				break
 			}
 		}
-		if len(positional) > 0 {
+		if len(positional) > 1 {
+			return fail(fmt.Errorf("E_BAD_REQUEST: import hf takes exactly one repo, got %d extra arguments", len(positional)-1))
+		}
+		if len(positional) == 1 {
 			repo = positional[0]
 		}
 		return withClient(func(c *cli.Client) error { return cli.ImportHF(ctx, c, repo, rev, os.Stdout) })
