@@ -285,7 +285,7 @@ func launchDetached(ctx context.Context, c *Client, arg string, opts RunOptions,
 }
 
 // prepare does resolve → ensure → open → overlay → spawn.
-func prepare(ctx context.Context, c *Client, arg string, opts RunOptions, out io.Writer, detached bool) (*launched, error) {
+func prepare(ctx context.Context, c *Client, arg string, opts RunOptions, out io.Writer, detached bool) (l *launched, err error) {
 	canonical, userCfgFile, layer3File, err := canonicalizeWithConfig(arg, opts.ConfigFile)
 	if err != nil {
 		return nil, err
@@ -365,12 +365,17 @@ func prepare(ctx context.Context, c *Client, arg string, opts RunOptions, out io
 		return nil, fmt.Errorf("E_CONFIG: %w", err)
 	}
 	splitDirUsed := "" // set when a split scratch dir was linked
-	// Ownership model (round-3 blocker 1): prepare() owns the scratch
-	// until it returns SUCCESS; every failure path — linking,
-	// ResolveBinary, serve log, Spawn — runs through exactly this defer.
+	// Ownership model (round 3+4): prepare() owns the scratch from
+	// CREATION until the SUCCESS return; every failure path — mid-loop
+	// linking, ResolveBinary, serve log, Spawn — runs through exactly
+	// this defer, which CHAINS cleanup failures into the returned error
+	// and names the path on stderr (round-4 blocker 3: never silent).
 	defer func() {
 		if splitDirUsed != "" {
-			os.RemoveAll(splitDirUsed)
+			if rerr := removeSplitDir(splitDirUsed); rerr != nil {
+				fmt.Fprintf(os.Stderr, "shardr: E_RUNTIME: scratch cleanup failed for %s: %v\n", splitDirUsed, rerr)
+				err = errors.Join(err, rerr)
+			}
 		}
 	}()
 	variant := merged["mmproj_variant"].Str // "" → f16 default (002 §5.7)
@@ -391,7 +396,17 @@ func prepare(ctx context.Context, c *Client, arg string, opts RunOptions, out io
 		if serr != nil {
 			return nil, serr
 		}
-		for _, p := range parts {
+		// Ownership from CREATION (round-4 blocker 1): a mid-loop
+		// MkdirAll/linkPart failure must find the dir already owned by
+		// the function-scope defer — assigning after the loop leaked
+		// exactly there.
+		splitDirUsed = splitDir
+		for i, p := range parts {
+			if linkFailHook != nil {
+				if herr := linkFailHook(i); herr != nil {
+					return nil, herr
+				}
+			}
 			dst := filepath.Join(splitDir, p.Name)
 			// Manifest names may be nested ("dir/part.gguf") — the
 			// parent must exist before linking.
@@ -403,7 +418,6 @@ func prepare(ctx context.Context, c *Client, arg string, opts RunOptions, out io
 			}
 		}
 		weights.Path = filepath.Join(splitDir, parts[0].Name)
-		splitDirUsed = splitDir // the function-scope defer owns it now
 	}
 
 	bin, err := runner.ResolveBinary()
@@ -518,67 +532,106 @@ func splitScratchDir(manifestDigest string) (string, error) {
 	return dir, nil
 }
 
-// validSplitDir recomputes the scratch root and validates a STORED
-// SplitDir from the persistent registry before anything removes it: it
-// must be a relative descendant of the root with the exact expected
-// shape <root>/<64-hex>/<non-empty-launch>. A corrupted or tampered
-// registry entry then names an unremovable path — never a recursive
-// delete of an arbitrary directory.
-func validSplitDir(stored string) bool {
-	if stored == "" {
-		return false
+// canonicalizeWithConfig canonicalizes the ref (default_selector
+// comfort) and loads the merged layer-2/3 config file: user config ∪
+// --config (per-key, --config wins — it is the more specific layer 3).
+func canonicalizeWithConfig(arg, configFile string) (string, config.File, config.File, error) {
+	userCfg, err := config.Load()
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("E_CONFIG: %w", err)
 	}
-	root := splitRoot()
-	rel, err := filepath.Rel(root, stored)
-	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
-		return false
-	}
-	segs := strings.Split(rel, string(filepath.Separator))
-	if len(segs) != 2 || !isHex64(segs[0]) || segs[1] == "" {
-		return false
-	}
-	// EVERY component below the root must be a real directory — a
-	// symlink anywhere in the path (root/manifesthex → elsewhere)
-	// escapes the boundary no matter how correct the final shape looks
-	// (round-3 warning 2).
-	partial := root
-	if fi, err := os.Lstat(partial); err != nil || !fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
-		return false
-	}
-	for _, seg := range segs {
-		partial = filepath.Join(partial, seg)
-		fi, err := os.Lstat(partial)
-		if err != nil || !fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
-			return false
+	sel := ""
+	if sec, ok := userCfg["references"]; ok {
+		if v, ok := sec["default_selector"]; ok {
+			sel = v.Str
 		}
 	}
-	return true
+	canonical, err := Canonicalize(arg, sel)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	if configFile == "" {
+		return canonical, userCfg, config.File{}, nil
+	}
+	b, err := os.ReadFile(configFile)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("E_CONFIG: read --config: %w", err)
+	}
+	layer3, err := config.Parse(configFile, string(b))
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("E_CONFIG: %w", err)
+	}
+	return canonical, userCfg, layer3, nil
 }
 
-func isHex64(s string) bool {
-	if len(s) != 64 {
-		return false
-	}
+func urlEscape(s string) string {
+	var sb strings.Builder
 	for _, r := range s {
-		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
-			return false
+		if r == ':' || r == '/' || r == '+' || r == '@' {
+			sb.WriteString(fmt.Sprintf("%%%02X", r))
+			continue
 		}
+		sb.WriteRune(r)
 	}
-	return true
+	return sb.String()
 }
 
-// removeSplitDir removes a stored split dir after validation. An
-// invalid/foreign path is left untouched and reported as an error; a
-// failing RemoveAll is returned, never swallowed.
-func removeSplitDir(stored string) error {
-	if !validSplitDir(stored) {
-		return fmt.Errorf("E_STATE: split dir %q failed validation — left in place, remove manually if stale", stored)
+func shortRefOf(p *ref.Ref) string {
+	s := p.NS + "/" + p.Name + ":" + p.Quant
+	if p.Tag != "" {
+		s = p.NS + "/" + p.Name + ":" + p.Tag + "+" + p.Quant
 	}
-	if err := os.RemoveAll(stored); err != nil {
-		return fmt.Errorf("E_STATE: remove split dir %s: %w", stored, err)
-	}
-	return nil
+	return s
 }
+
+func idFor(want string, p *ref.Ref) string {
+	if want != "" {
+		return want
+	}
+	base := p.NS + "-" + p.Name + "-" + p.Quant
+	return idSanitize.ReplaceAllString(strings.ToLower(base), "-")
+}
+
+func mustRegistryPath() string {
+	p, err := runner.RegistryPath()
+	if err != nil {
+		return "."
+	}
+	return p
+}
+
+func advisory(ctx context.Context, c *Client, files []openFile) (map[string]config.Value, error) {
+	out := map[string]config.Value{}
+	for _, f := range files {
+		// Only THIS runtime's advisory entries (001 §3.1 Runtime id): a
+		// foreign runtime's neutral keys must not leak into the llama
+		// layer, and all matching entries merge.
+		if f.Kind != "runtime-config" || f.Runtime != "llama" {
+			continue
+		}
+		resp, err := c.Do(ctx, http.MethodGet, "/v1/blob/"+strings.TrimPrefix(f.Digest, "sha256:"), nil)
+		if err != nil {
+			return nil, err
+		}
+		b, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("E_INTERNAL: read advisory blob: %w", err)
+		}
+		scalars, err := runner.ParseScalars(b)
+		if err != nil {
+			return nil, fmt.Errorf("E_CONFIG: advisory runtime-config %s: %w", f.Name, err)
+		}
+		for k, v := range scalars {
+			out[k] = v
+		}
+	}
+	return out, nil
+}
+
+// linkFailHook is a test seam (mid-loop failure injection); nil in
+// production.
+var linkFailHook func(i int) error
 
 // linkPart places one split part under its original name: hardlink
 // preferred (shared bytes), symlink on EXDEV (CAS and scratch on
@@ -618,101 +671,18 @@ func linkPart(srcPath, dst string) error {
 	return nil
 }
 
-func advisory(ctx context.Context, c *Client, files []openFile) (map[string]config.Value, error) {
-	out := map[string]config.Value{}
-	for _, f := range files {
-		// Only THIS runtime's advisory entries (001 §3.1 Runtime id): a
-		// foreign runtime's neutral keys must not leak into the llama
-		// layer, and all matching entries merge.
-		if f.Kind != "runtime-config" || f.Runtime != "llama" {
-			continue
-		}
-		resp, err := c.Do(ctx, http.MethodGet, "/v1/blob/"+strings.TrimPrefix(f.Digest, "sha256:"), nil)
-		if err != nil {
-			return nil, err
-		}
-		b, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			return nil, fmt.Errorf("E_INTERNAL: read advisory blob: %w", err)
-		}
-		scalars, err := runner.ParseScalars(b)
-		if err != nil {
-			return nil, fmt.Errorf("E_CONFIG: advisory runtime-config %s: %w", f.Name, err)
-		}
-		for k, v := range scalars {
-			out[k] = v
-		}
+var idSanitize = regexp.MustCompile("[^a-z0-9._-]+")
+
+// isHex64 validates a 64-char lowercase hex component (shape half of
+// the fused removal gate in rmrf_unix.go).
+func isHex64(s string) bool {
+	if len(s) != 64 {
+		return false
 	}
-	return out, nil
-}
-
-func shortRefOf(p *ref.Ref) string {
-	s := p.NS + "/" + p.Name + ":" + p.Quant
-	if p.Tag != "" {
-		s = p.NS + "/" + p.Name + ":" + p.Tag + "+" + p.Quant
-	}
-	return s
-}
-
-var idSanitize = regexp.MustCompile(`[^a-z0-9._-]+`)
-
-func idFor(want string, p *ref.Ref) string {
-	if want != "" {
-		return want
-	}
-	base := p.NS + "-" + p.Name + "-" + p.Quant
-	return idSanitize.ReplaceAllString(strings.ToLower(base), "-")
-}
-
-func mustRegistryPath() string {
-	p, err := runner.RegistryPath()
-	if err != nil {
-		return "."
-	}
-	return p
-}
-
-func urlEscape(s string) string {
-	var sb strings.Builder
 	for _, r := range s {
-		if r == ':' || r == '/' || r == '+' || r == '@' {
-			sb.WriteString(fmt.Sprintf("%%%02X", r))
-			continue
-		}
-		sb.WriteRune(r)
-	}
-	return sb.String()
-}
-
-// canonicalizeWithConfig canonicalizes the ref (default_selector
-// comfort) and loads the merged layer-2/3 config file: user config ∪
-// --config (per-key, --config wins — it is the more specific layer 3).
-func canonicalizeWithConfig(arg, configFile string) (string, config.File, config.File, error) {
-	userCfg, err := config.Load()
-	if err != nil {
-		return "", nil, nil, fmt.Errorf("E_CONFIG: %w", err)
-	}
-	sel := ""
-	if sec, ok := userCfg["references"]; ok {
-		if v, ok := sec["default_selector"]; ok {
-			sel = v.Str
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
 		}
 	}
-	canonical, err := Canonicalize(arg, sel)
-	if err != nil {
-		return "", nil, nil, err
-	}
-	if configFile == "" {
-		return canonical, userCfg, config.File{}, nil
-	}
-	b, err := os.ReadFile(configFile)
-	if err != nil {
-		return "", nil, nil, fmt.Errorf("E_CONFIG: read --config: %w", err)
-	}
-	layer3, err := config.Parse(configFile, string(b))
-	if err != nil {
-		return "", nil, nil, fmt.Errorf("E_CONFIG: %w", err)
-	}
-	return canonical, userCfg, layer3, nil
+	return true
 }
