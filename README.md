@@ -9,16 +9,26 @@ BitTorrent-based peer network, and serve through an OpenAI-compatible
 runtime. A global system operated by its users — independent of any single
 provider, with availability that grows with every participating node.
 
-For the individual user this means a **local, runtime-independent model
-repository**: your entire collection lives in one content-addressed store,
-addressed by name and quantization, deduplicated by digest, and continuously
-integrity-verified. Artifacts carry their own metadata and runtime
-configuration — the same store serves llama-server today and other runtimes
-later, so a model you import once stays usable regardless of which runtime
-executes it. Managing a local collection becomes inventory management
-(`shardr models`, `shardr verify --all`) instead of directory archaeology —
-and because every artifact is content-addressed, nothing is ever downloaded
-or stored twice.
+## What shardr provides
+
+**A local content-addressed model repository.** All models on a machine
+live in a single store and are addressed by reference (`ns/name:quant`).
+Identical files are stored once; every write is verified against its
+digest.
+
+**Runtime-independent artifacts.** An artifact contains weights, tokenizer,
+chat template, and metadata. Runtime configuration is applied separately at
+serve time and is not part of the stored model — so the repository is not
+tied to a specific inference runtime. llama-server is supported today;
+further runtimes can be added without re-importing existing models.
+
+**Collection management.** `shardr models` lists the inventory with sizes
+and quants, `shardr verify --all` re-hashes the store on demand, and
+`shardr pull` retrieves missing artifacts when needed.
+
+**Distribution.** Artifacts synchronize between shardhive instances over a
+BitTorrent-based peer network; availability grows with every participating
+node (see [Synchronization & integrity](#synchronization--integrity)).
 
 ## Components
 
