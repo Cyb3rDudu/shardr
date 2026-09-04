@@ -610,3 +610,197 @@ func TestSplitDirCleanedAfterLastStop(t *testing.T) {
 		t.Fatalf("split dir must be cleaned after the last stop: %v", err)
 	}
 }
+
+// C1: per-LAUNCH scratch — two serves of the SAME model never share
+// link state: stopping one leaves the other's split files intact.
+// (With the old per-manifest dir, the first stop deleted the second
+// serve's parts — live-reproduced cross-process hole.)
+func TestPerLaunchScratchIsolation(t *testing.T) {
+	if stubBinary == "" {
+		t.Skip("stub not built")
+	}
+	root := t.TempDir()
+	t.Setenv("SHARDR_CAS", root)
+	store, _ := cas.Open(root)
+	sockDir, _ := os.MkdirTemp(os.TempDir(), "sx")
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "hive.sock")
+	srv, err := api.New(store, sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	go srv.Serve()
+	t.Cleanup(func() { srv.Close() })
+	t.Setenv("SHARDR_SOCKET", sock)
+	t.Setenv("SHARDR_LLAMA_SERVER", stubBinary)
+	t.Setenv("SHARDR_CONFIG", writeCfg(t, ""))
+	state := filepath.Join(t.TempDir(), "instances.json")
+	t.Setenv("SHARDR_RUNNER_STATE", state)
+
+	sources, _ := importer.LocalSources([]string{"../../internal/importer/testdata/gold"})
+	res, err := importer.Import(context.Background(), store, sources, importer.ImportOptions{As: "gold/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _ := NewClient()
+	ref := "gold/repo:" + res.Members[0].Quant
+	for _, id := range []string{"iso-a", "iso-b"} {
+		if err := Serve(context.Background(), c, ref, RunOptions{ID: id}, io.Discard); err != nil {
+			t.Fatalf("serve %s: %v", id, err)
+		}
+	}
+	reg := runner.OpenRegistryAt(state)
+	list, _ := reg.List()
+	if len(list) != 2 {
+		t.Fatalf("two serves: %+v", list)
+	}
+	if list[0].SplitDir == "" || list[1].SplitDir == "" || list[0].SplitDir == list[1].SplitDir {
+		t.Fatalf("split dirs must be per-launch and distinct: %q vs %q", list[0].SplitDir, list[1].SplitDir)
+	}
+	// Both dirs populated.
+	for _, in := range list {
+		entries, err := os.ReadDir(in.SplitDir)
+		if err != nil || len(entries) != 2 {
+			t.Fatalf("split dir %s must hold both parts: %v %v", in.SplitDir, entries, err)
+		}
+	}
+	// Stop ONE: the other's files must survive untouched.
+	if err := Stop(context.Background(), c, "iso-a", false, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(list[1].SplitDir); err != nil || len(entries) != 2 {
+		t.Fatalf("second serve's split parts must survive the first stop: %v %v", entries, err)
+	}
+	Stop(context.Background(), c, "iso-b", false, io.Discard)
+}
+
+// C2: a tampered registry SplitDir is NEVER removed — paths outside the
+// recomputed scratch root, traversal, and wrong shapes all refuse.
+func TestCleanupRefusesTamperedSplitDir(t *testing.T) {
+	if stubBinary == "" {
+		t.Skip("stub not built")
+	}
+	root := t.TempDir()
+	t.Setenv("SHARDR_CAS", root)
+	store, _ := cas.Open(root)
+	sockDir, _ := os.MkdirTemp(os.TempDir(), "sx")
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "hive.sock")
+	srv, _ := api.New(store, sock)
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	go srv.Serve()
+	t.Cleanup(func() { srv.Close() })
+	t.Setenv("SHARDR_SOCKET", sock)
+	t.Setenv("SHARDR_LLAMA_SERVER", stubBinary)
+	t.Setenv("SHARDR_CONFIG", writeCfg(t, ""))
+	state := filepath.Join(t.TempDir(), "instances.json")
+	t.Setenv("SHARDR_RUNNER_STATE", state)
+
+	sources, _ := importer.LocalSources([]string{"../../internal/importer/testdata/gold"})
+	res, err := importer.Import(context.Background(), store, sources, importer.ImportOptions{As: "gold/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _ := NewClient()
+	if err := Serve(context.Background(), c, "gold/repo:"+res.Members[0].Quant, RunOptions{ID: "tamper"}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	reg := runner.OpenRegistryAt(state)
+	list, _ := reg.List()
+
+	// Victim directories that must NOT be deleted.
+	victimDir := t.TempDir()
+	victimFile := filepath.Join(victimDir, "precious.txt")
+	os.WriteFile(victimFile, []byte("keep me"), 0o644)
+
+	// Tamper the registry: SplitDir points at the victim.
+	list[0].SplitDir = victimDir
+	if err := writeInstances(state, list); err != nil {
+		t.Fatal(err)
+	}
+	out := &bytes.Buffer{}
+	err = Stop(context.Background(), c, "tamper", false, out)
+	if err != nil {
+		t.Fatalf("stop with tampered dir must still stop the process: %v", err)
+	}
+	if !strings.Contains(out.String(), "failed validation") {
+		t.Fatalf("warning must name the refused cleanup:\n%s", out.String())
+	}
+	if b, err := os.ReadFile(victimFile); err != nil || string(b) != "keep me" {
+		t.Fatalf("victim directory was deleted: %v %q", err, b)
+	}
+}
+
+// Cross-Process registry proof: TWO REAL PROCESSES hammer Add on one
+// registry file, synchronized via ready-files, 20 rounds. The flock
+// keeps every registration; with the lock broken, concurrent
+// read-modify-write provably drops entries.
+func TestRegistryCrossProcessAdd(t *testing.T) {
+	if os.Getenv("SHARDR_REG_CHILD") == "1" {
+		// Helper mode: wait for the sibling's ready file, then Add.
+		state := os.Getenv("SHARDR_REG_STATE")
+		actor := os.Getenv("SHARDR_REG_ACTOR")
+		readyDir := os.Getenv("SHARDR_REG_READY_DIR")
+		reg := runner.OpenRegistryAt(state)
+		mine := filepath.Join(readyDir, actor)
+		other := filepath.Join(readyDir, map[string]string{"a": "b", "b": "a"}[actor])
+		os.WriteFile(mine, []byte("1"), 0o600)
+		for i := 0; i < 500; i++ {
+			if _, err := os.Stat(other); err == nil {
+				break
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		if err := reg.Add(runner.Instance{ID: "cp-" + actor, Endpoint: "http://127.0.0.1:1", PID: os.Getpid()}); err != nil {
+			os.Exit(3)
+		}
+		os.Exit(0)
+	}
+	state := filepath.Join(t.TempDir(), "instances.json")
+	readyDir := t.TempDir()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for round := 0; round < 20; round++ {
+		os.Remove(state)
+		for _, f := range []string{filepath.Join(readyDir, "a"), filepath.Join(readyDir, "b")} {
+			os.Remove(f)
+		}
+		var wg sync.WaitGroup
+		errs := make([]error, 2)
+		for i, actor := range []string{"a", "b"} {
+			wg.Add(1)
+			go func(i int, actor string) {
+				defer wg.Done()
+				cmd := exec.Command(exe, "-test.run=TestRegistryCrossProcessAdd")
+				cmd.Env = append(os.Environ(),
+					"SHARDR_REG_CHILD=1", "SHARDR_REG_STATE="+state,
+					"SHARDR_REG_ACTOR="+actor, "SHARDR_REG_READY_DIR="+readyDir)
+				out, err := cmd.CombinedOutput()
+				if err != nil {
+					errs[i] = fmt.Errorf("child %s: %v: %s", actor, err, out)
+				}
+			}(i, actor)
+		}
+		wg.Wait()
+		for _, err := range errs {
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		reg := runner.OpenRegistryAt(state)
+		list, err := reg.List()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(list) != 2 {
+			t.Fatalf("round %d: both cross-process registrations must survive the flock (got %d: %+v)", round, len(list), list)
+		}
+	}
+}

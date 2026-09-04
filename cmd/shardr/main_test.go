@@ -27,6 +27,10 @@ func TestArgParsingFailLoud(t *testing.T) {
 		{"config-value-last", []string{"run", "ns/name:q8_0", "--config"}, "--config needs a value"},
 		{"set-value-last", []string{"run", "ns/name:q8_0", "--set"}, "--set needs a value"},
 		{"as-value-last", []string{"import", "local", "x.gguf", "--as"}, "--as needs a value"},
+		{"bt-two-positionals", []string{"import", "bt", "magnet:?xt=x", "magnet:?xt=y", "--manifest", "sha256:aa"}, "exactly one magnet/infohash"},
+		{"stop-two-ids", []string{"stop", "a", "b"}, "at most one id"},
+		{"stop-all-with-id", []string{"stop", "--all", "a"}, "--all takes no id"},
+		{"run-serve-only-id", []string{"run", "ns/name:q8_0", "--id", "foo"}, "--id is serve-only"},
 	}
 	for _, tc := range cases {
 		// The command must fail BEFORE touching the socket: SHARDR_SOCKET

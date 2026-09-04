@@ -58,6 +58,12 @@ func Run(ctx context.Context, c *Client, arg string, opts RunOptions, out io.Wri
 	if err != nil {
 		return err
 	}
+	// Per-launch scratch cleanup on every foreground exit path.
+	defer func() {
+		if rt.SplitDir != "" {
+			removeSplitDir(rt.SplitDir)
+		}
+	}()
 	defer rt.Terminate() // one terminate path: signal or ctx, never both fire twice
 	fmt.Fprintf(out, "ready: %s (model id %s) — Ctrl-C to stop\n", rt.Endpoint(), rt.Ref)
 
@@ -126,34 +132,23 @@ func Stop(ctx context.Context, c *Client, id string, all bool, out io.Writer) er
 		// recycled pid never does). (2) Endpoint: /v1/models must serve
 		// the registered ref (--alias makes the real runtime do exactly
 		// that). Either mismatch → refuse and instruct manual cleanup.
-		liveToken, terr := runner.ProcessStartToken(in.PID)
-		if terr != nil || in.StartToken == "" || liveToken != in.StartToken {
-			return fmt.Errorf("E_STATE: refusing to stop %s: pid %d start identity %q does not match the recorded %q (stale entry or pid reuse?) — verify and clean %s manually",
-				in.ID, in.PID, liveToken, in.StartToken, reg.Path())
-		}
-		if id, ok := probeModelID(ctx, in.Endpoint); !ok || id != in.Ref {
-			return fmt.Errorf("E_STATE: refusing to stop %s: pid %d does not serve %s on %s (stale entry or pid reuse?) — verify and clean %s manually",
-				in.ID, in.PID, in.Ref, in.Endpoint, reg.Path())
+		if !identityOK(ctx, *in) {
+			return fmt.Errorf("E_STATE: refusing to stop %s: pid %d fails identity verification (start token or served ref mismatch — stale entry or pid reuse?) — verify and clean %s manually",
+				in.ID, in.PID, reg.Path())
 		}
 		fmt.Fprintf(out, "stopping %s (pid %d)…\n", in.ID, in.PID)
-		if err := runner.TerminatePID(in.PID); err != nil {
+		// TerminateVerified re-checks identity immediately before SIGTERM
+		// AND before SIGKILL (the 30 s window can recycle a dead pid).
+		if err := runner.TerminateVerified(in.PID, func() bool { return identityOK(ctx, *in) }); err != nil {
 			return err
 		}
-		// Split-scratch cleanup: drop the manifest's link dir when no
-		// other instance still serves from it (hardlinks/symlinks die with
-		// the dir; the CAS blobs are untouched).
-		if in.SplitDir != "" {
-			others := false
-			if rest, lerr := reg.List(); lerr == nil {
-				for _, e := range rest {
-					if e.ID != tid && e.SplitDir == in.SplitDir {
-						others = true
-					}
-				}
-			}
-			if !others {
-				os.RemoveAll(in.SplitDir)
-			}
+		// Split-scratch cleanup (per-launch dir — only THIS instance's
+		// links live there). The stored path is VALIDATED against the
+		// recomputed scratch root and expected shape before any removal:
+		// a corrupted or tampered registry must never turn stop into a
+		// recursive delete of an arbitrary directory.
+		if in.SplitDir != "" && !removeSplitDir(in.SplitDir) {
+			fmt.Fprintf(out, "warning: split dir %q failed validation — left in place, remove manually if stale\n", in.SplitDir)
 		}
 		if err := reg.Remove(tid); err != nil {
 			return err
@@ -161,6 +156,17 @@ func Stop(ctx context.Context, c *Client, id string, all bool, out io.Writer) er
 		fmt.Fprintf(out, "stopped %s\n", tid)
 	}
 	return nil
+}
+
+// identityOK is the two-factor guard (start token + served ref),
+// evaluated LIVE — used before stop and re-checked before every signal.
+func identityOK(ctx context.Context, in runner.Instance) bool {
+	liveToken, terr := runner.ProcessStartToken(in.PID)
+	if terr != nil || in.StartToken == "" || liveToken != in.StartToken {
+		return false
+	}
+	id, ok := probeModelID(ctx, in.Endpoint)
+	return ok && id == in.Ref
 }
 
 // probeModelID asks a serve endpoint for its model id (identity check
@@ -226,6 +232,9 @@ func launchDetached(ctx context.Context, c *Client, arg string, opts RunOptions,
 	}
 	if err := l.Runtime.WaitReady(ctx); err != nil {
 		l.Runtime.Terminate()
+		if l.SplitDir != "" {
+			removeSplitDir(l.SplitDir)
+		}
 		return nil, err
 	}
 	// Start token at serve time: pid-reuse identity for every later stop
@@ -234,6 +243,9 @@ func launchDetached(ctx context.Context, c *Client, arg string, opts RunOptions,
 	token, terr := runner.ProcessStartToken(l.Runtime.PID())
 	if terr != nil {
 		l.Runtime.Terminate()
+		if l.SplitDir != "" {
+			removeSplitDir(l.SplitDir)
+		}
 		return nil, terr
 	}
 	// Register only after readiness — a dead instance never lands in the
@@ -249,6 +261,9 @@ func launchDetached(ctx context.Context, c *Client, arg string, opts RunOptions,
 		StartToken: token, SplitDir: l.SplitDir,
 	}); err != nil {
 		l.Runtime.Terminate()
+		if l.SplitDir != "" {
+			removeSplitDir(l.SplitDir)
+		}
 		return nil, err
 	}
 	return l, nil
@@ -346,44 +361,34 @@ func prepare(ctx context.Context, c *Client, arg string, opts RunOptions, out io
 	if len(parts) > 1 {
 		// Split GGUFs: llama.cpp discovers siblings by the
 		// <prefix>-0000N-of-0000M.gguf naming pattern — content-addressed
-		// CAS names never match. Hardlink the parts under their ORIGINAL
-		// manifest names into a per-manifest scratch dir: a hardlink
-		// copies zero bytes (zero-copy law intact, 002 §4).
+		// CAS names never match. Link the parts under their ORIGINAL
+		// manifest names into a PER-LAUNCH scratch dir: a hardlink or
+		// symlink copies zero bytes (zero-copy law intact, 002 §4).
 		splitDir, serr := splitScratchDir(open.ManifestDigest)
 		if serr != nil {
 			return nil, serr
 		}
+		// Error paths from here on must not leak the scratch dir.
+		ok := false
+		defer func() {
+			if !ok {
+				os.RemoveAll(splitDir)
+			}
+		}()
 		for _, p := range parts {
 			dst := filepath.Join(splitDir, p.Name)
-			// Self-healing link: remove-then-link. A leftover from an
-			// earlier process whose CAS root died has nlink 1 (its
-			// original was unlinked); relinking against the live CAS
-			// source restores the shared-bytes state.
-			os.Remove(dst)
-			if err := os.Link(p.Path, dst); err != nil {
-				switch {
-				case errors.Is(err, syscall.EEXIST):
-					// Our Remove just ran — EEXIST means a CONCURRENT
-					// serve linked the same part microseconds ago. Same
-					// manifest digest, same immutable CAS source: the
-					// existing link is exactly what we would have built.
-					// (A stale leftover cannot surface here: we removed
-					// it ourselves first.)
-				case errors.Is(err, syscall.EXDEV):
-					// Cross-device (CAS and runtime dir on different
-					// filesystems): a symlink carries zero bytes just the
-					// same — the runtime opens and mmaps THROUGH it into
-					// the CAS blob (zero-copy law intact, 002 §4).
-					if err := os.Symlink(p.Path, dst); err != nil {
-						return nil, fmt.Errorf("E_RUNTIME: link split part %s: %w", p.Name, err)
-					}
-				default:
-					return nil, fmt.Errorf("E_RUNTIME: hardlink split part %s: %w", p.Name, err)
-				}
+			// Manifest names may be nested ("dir/part.gguf") — the
+			// parent must exist before linking.
+			if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+				return nil, fmt.Errorf("E_RUNTIME: split part dir %s: %w", p.Name, err)
+			}
+			if err := linkPart(p.Path, dst); err != nil {
+				return nil, fmt.Errorf("E_RUNTIME: link split part %s: %w", p.Name, err)
 			}
 		}
 		weights.Path = filepath.Join(splitDir, parts[0].Name)
 		splitDirUsed = splitDir
+		ok = true
 	}
 
 	bin, err := runner.ResolveBinary()
@@ -467,9 +472,10 @@ func pickWeights(files []openFile, variant string) (weights openFile, parts []op
 	return weights, parts, mmproj, warns, nil
 }
 
-// splitScratchDir is the per-manifest hardlink home for split GGUFs
-// ($XDG_RUNTIME_DIR or the per-uid tmp fallback, mirroring the registry).
-func splitScratchDir(manifestDigest string) (string, error) {
+// splitRoot resolves the scratch ROOT ($XDG_RUNTIME_DIR or the per-uid
+// tmp fallback, mirroring the registry rules). All scratch state lives
+// under <root>/shardr-split/ — the ONLY tree stop ever removes.
+func splitRoot() string {
 	base := os.Getenv("XDG_RUNTIME_DIR")
 	if base == "" {
 		uid := "0"
@@ -478,11 +484,104 @@ func splitScratchDir(manifestDigest string) (string, error) {
 		}
 		base = filepath.Join(os.TempDir(), "shardr-"+uid)
 	}
-	dir := filepath.Join(base, "shardr-split", strings.TrimPrefix(manifestDigest, "sha256:"))
+	return filepath.Join(base, "shardr-split")
+}
+
+// splitScratchDir is the PER-LAUNCH hardlink home for split GGUFs:
+// <root>/shardr-split/<manifest-hex>/<launch-id>. Every spawn gets its
+// own directory — two processes serving the same model never share
+// link state, so cleanup of one launch cannot touch another (the
+// shared per-manifest dir was a live-reproduced cross-process hole).
+func splitScratchDir(manifestDigest string) (string, error) {
+	launch := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+	dir := filepath.Join(splitRoot(), strings.TrimPrefix(manifestDigest, "sha256:"), launch)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("E_STATE: split scratch dir: %w", err)
 	}
 	return dir, nil
+}
+
+// validSplitDir recomputes the scratch root and validates a STORED
+// SplitDir from the persistent registry before anything removes it: it
+// must be a relative descendant of the root with the exact expected
+// shape <root>/<64-hex>/<non-empty-launch>. A corrupted or tampered
+// registry entry then names an unremovable path — never a recursive
+// delete of an arbitrary directory.
+func validSplitDir(stored string) bool {
+	if stored == "" {
+		return false
+	}
+	rel, err := filepath.Rel(splitRoot(), stored)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return false
+	}
+	segs := strings.Split(rel, string(filepath.Separator))
+	if len(segs) != 2 || !isHex64(segs[0]) || segs[1] == "" || strings.Contains(segs[1], string(filepath.Separator)) {
+		return false
+	}
+	fi, err := os.Lstat(stored)
+	return err == nil && fi.IsDir()
+}
+
+func isHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// removeSplitDir removes a stored split dir after validation; returns
+// whether removal happened (invalid/foreign paths are left untouched
+// and reported).
+func removeSplitDir(stored string) bool {
+	if !validSplitDir(stored) {
+		return false
+	}
+	os.RemoveAll(stored)
+	return true
+}
+
+// linkPart places one split part under its original name: hardlink
+// preferred (shared bytes), symlink on EXDEV (CAS and scratch on
+// different filesystems — zero bytes either way). An existing entry is
+// only accepted when it verifiably points at the SAME CAS source
+// (hardlink: same inode via os.SameFile; symlink: exact target) —
+// anything else is replaced.
+func linkPart(srcPath, dst string) error {
+	os.Remove(dst)
+	if err := os.Link(srcPath, dst); err == nil {
+		return nil
+	} else if !errors.Is(err, syscall.EEXIST) && !errors.Is(err, syscall.EXDEV) {
+		return err
+	} else if errors.Is(err, syscall.EXDEV) {
+		return os.Symlink(srcPath, dst)
+	}
+	// EEXIST (raced re-creation between our Remove and Link): accept the
+	// existing entry only with proven identity.
+	if fi, err := os.Lstat(dst); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			if target, rerr := os.Readlink(dst); rerr == nil && target == srcPath {
+				return nil
+			}
+		} else if sfi, serr := os.Stat(srcPath); serr == nil {
+			if dfi, derr := os.Stat(dst); derr == nil && os.SameFile(dfi, sfi) {
+				return nil
+			}
+		}
+	}
+	os.Remove(dst)
+	if err := os.Link(srcPath, dst); err != nil {
+		if errors.Is(err, syscall.EXDEV) {
+			return os.Symlink(srcPath, dst)
+		}
+		return err
+	}
+	return nil
 }
 
 func advisory(ctx context.Context, c *Client, files []openFile) (map[string]config.Value, error) {

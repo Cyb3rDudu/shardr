@@ -170,9 +170,26 @@ func (rt *Runtime) Terminate() error {
 // to disappear, then SIGKILLs. This is the stop/stop --all path for
 // detached serve instances and the exit path for foreground runs.
 func TerminatePID(pid int) error {
+	return terminateVerified(pid, nil)
+}
+
+// TerminateVerified is the guarded discipline (002 §4): the caller's
+// verify callback is checked IMMEDIATELY BEFORE SIGTERM and — after the
+// grace window expires — IMMEDIATELY BEFORE SIGKILL. The pid can die
+// and be recycled inside the 30 s window; without the second check the
+// SIGKILL would land on an unrelated process. A failing verification
+// aborts WITHOUT any signal: false means "not provably ours anymore".
+func TerminateVerified(pid int, verify func() bool) error {
+	return terminateVerified(pid, verify)
+}
+
+func terminateVerified(pid int, verify func() bool) error {
 	p, err := os.FindProcess(pid)
 	if err != nil {
 		return nil // already gone (macOS FindProcess always succeeds; kill below is the real check)
+	}
+	if verify != nil && !verify() {
+		return fmt.Errorf("E_STATE: refusing to signal pid %d — identity verification failed before SIGTERM", pid)
 	}
 	if err := p.Signal(syscall.SIGTERM); err != nil {
 		if isGone(err) {
@@ -186,6 +203,11 @@ func TerminatePID(pid int) error {
 			return nil
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+	// Grace expired: re-verify identity before the kill. A pid that
+	// died mid-window and was reused must never receive SIGKILL.
+	if verify != nil && !verify() {
+		return fmt.Errorf("E_STATE: refusing to SIGKILL pid %d — identity changed during the %s grace window (pid reuse?)", pid, TerminateGrace)
 	}
 	if err := p.Kill(); err != nil && !isGone(err) {
 		return fmt.Errorf("E_RUNTIME: SIGKILL %d: %w", pid, err)

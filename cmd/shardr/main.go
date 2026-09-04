@@ -154,16 +154,24 @@ func cmdImport(ctx context.Context, args []string) int {
 		return withClient(func(c *cli.Client) error { return cli.ImportHF(ctx, c, repo, rev, os.Stdout) })
 	case "bt":
 		var src, manifest string
+		var positionals []string
 		for i := 1; i < len(args); i++ {
 			switch args[i] {
 			case "--manifest":
-				i++
-				if i < len(args) {
-					manifest = args[i]
+				if i+1 >= len(args) {
+					return fail(fmt.Errorf("E_BAD_REQUEST: --manifest needs a value (it is the last argument)"))
 				}
+				i++
+				manifest = args[i]
 			default:
-				src = args[i]
+				positionals = append(positionals, args[i])
 			}
+		}
+		if len(positionals) > 1 {
+			return fail(fmt.Errorf("E_BAD_REQUEST: import bt takes exactly one magnet/infohash, got %d", len(positionals)))
+		}
+		if len(positionals) == 1 {
+			src = positionals[0]
 		}
 		return withClient(func(c *cli.Client) error { return cli.ImportBT(ctx, c, src, manifest, os.Stdout) })
 	default:
@@ -183,6 +191,9 @@ func cmdLifecycle(ctx context.Context, args []string, serve bool) int {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--id":
+			if !serve {
+				return fail(fmt.Errorf("E_BAD_REQUEST: --id is serve-only (foreground run has no stable id)"))
+			}
 			v, err := flagValue(args[i], i)
 			if err != nil {
 				return fail(err)
@@ -222,14 +233,24 @@ func cmdLifecycle(ctx context.Context, args []string, serve bool) int {
 }
 
 func cmdStop(ctx context.Context, args []string) int {
-	var id string
+	var ids []string
 	all := false
 	for _, a := range args {
 		if a == "--all" {
 			all = true
 			continue
 		}
-		id = a
+		ids = append(ids, a)
+	}
+	if all && len(ids) > 0 {
+		return fail(fmt.Errorf("E_BAD_REQUEST: stop --all takes no id (got %q)", ids[0]))
+	}
+	if len(ids) > 1 {
+		return fail(fmt.Errorf("E_BAD_REQUEST: stop takes at most one id, got %d", len(ids)))
+	}
+	id := ""
+	if len(ids) == 1 {
+		id = ids[0]
 	}
 	if !all && id == "" {
 		// No argument: list running instances (comfort, not error).
