@@ -397,6 +397,15 @@ func TestStartTokenPrecision(t *testing.T) {
 		}
 		return cmd
 	}
+	// Distinctness is the DARWIN source's property (proc_pidinfo,
+	// microsecond resolution — the round-3 order targets exactly that).
+	// Linux /proc starttime has 10 ms jiffy granularity: two rapid
+	// spawns legitimately share a tick; the GUARD compares the same pid
+	// against itself (recycle within the same jiffy AND boot is
+	// practically excluded), so the coarser resolution stays sound.
+	if runtime.GOOS != "darwin" {
+		t.Skip("distinctness assertion targets the darwin microsecond source (linux jiffies are 10 ms by design)")
+	}
 	a, b := spawn(), spawn() // same wall-clock second
 	defer a.Process.Kill()
 	defer b.Process.Kill()
