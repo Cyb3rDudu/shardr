@@ -44,7 +44,7 @@ node (see [Synchronization & integrity](#synchronization--integrity)).
 ```sh
 go build -o sh-bin/shardr ./cmd/shardr
 go build -o sh-bin/shardhive ./cmd/shardhive
-make llama        # builds the pinned llama-server (v0.3.0) into bin/
+make llama        # builds the llama-server pinned in runtime/llama.lock into bin/
                   # or: any llama-server in $PATH, or $SHARDR_LLAMA_SERVER
 ```
 
@@ -125,6 +125,33 @@ shardr verify --all     # integrity re-hash (exit 0 clean, 1 mismatch, 2 missing
 Trust derives from digests, never from transports: every byte is verified
 against its content address on write, and BitTorrent imports require a
 pinned manifest digest.
+
+## llama.cpp versioning & runner releases
+
+The llama.cpp version shardr builds and ships is pinned in
+[`runtime/llama.lock`](runtime/llama.lock) — the single version truth
+(ref + full commit SHA + source-archive SHA-256, parsed fail-closed by
+`internal/llamalock`; no second pin in Makefile or Go constants).
+
+Two strictly separated channels:
+
+- **Release channel** — a daily check (workflow
+  `llama-upstream-check`) detects new exact `vX.Y.Z` tags and opens a
+  lockfile update PR (old/new ref, both SHAs, upstream compare link,
+  archive digest). Merging that PR — after the build/E2E matrix
+  (Ubuntu x86-64 CPU, macOS Apple Silicon Metal) ran on it — triggers
+  `release-runner`, which publishes
+  `shardr-runner-<shardr-version>-llama-<ref>` bundles with SHA256SUMS,
+  BUILDINFO.json and licenses. Existing releases are never overwritten;
+  same identity with different bytes is a hard error. A moving `latest`
+  is never published.
+- **Canary channel** — `llama-nightly-canary` tests the newest `bNNNN`
+  nightly once a week through the same matrix, never touches the stable
+  lockfile and never publishes a release.
+
+Manual update: `go run ./cmd/llama-lock check-update --write --ref vX.Y.Z`
+(exact tags only), then open a PR against `main`. Verify a lockfile with
+`go run ./cmd/llama-lock validate`.
 
 ## Specifications & documentation
 
