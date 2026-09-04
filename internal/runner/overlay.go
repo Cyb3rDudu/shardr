@@ -217,8 +217,10 @@ func kindName(k config.Kind) string {
 // Argv builds the llama-server flag arguments from the merged config
 // (002 §5.3: argv derives ONLY from the merged config via the §7.1
 // mapping — weights and mmproj are appended by the spawner, not here).
-// Boolean keys pass their flag when true and are omitted when false
-// (llama-server default-off); mmproj_variant is runner-consumed.
+// Boolean keys pass their flag when true and are omitted when false or
+// absent — omitted means the runtime built-in applies, never an
+// explicit off (002 §7.1 tri-state ruling R8); mmproj_variant is
+// runner-consumed.
 func Argv(merged map[string]config.Value) []string {
 	// Deterministic order: allowlist order, not map iteration.
 	var argv []string
