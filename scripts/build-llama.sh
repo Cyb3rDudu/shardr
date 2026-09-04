@@ -16,9 +16,9 @@ if [ -n "${LLAMA_REF:-}" ] && [ -n "${LLAMA_COMMIT:-}" ] && [ -n "${LLAMA_SOURCE
   : # canary override: explicit pin, lock untouched
 else
   lock=$(go run ./cmd/llama-lock validate) || { echo "E_LOCK: runtime/llama.lock failed validation" >&2; exit 1; }
-  LLAMA_REF=$(printf '%s' "$lock" | python3 -c 'import sys,json;print(json.load(sys.stdin)["Ref"])')
-  LLAMA_COMMIT=$(printf '%s' "$lock" | python3 -c 'import sys,json;print(json.load(sys.stdin)["Commit"])')
-  LLAMA_SOURCE_SHA256=$(printf '%s' "$lock" | python3 -c 'import sys,json;print(json.load(sys.stdin)["SourceSHA256"])')
+  LLAMA_REF=$(printf '%s' "$lock" | python3 -c 'import sys,json;print(json.load(sys.stdin)["ref"])')
+  LLAMA_COMMIT=$(printf '%s' "$lock" | python3 -c 'import sys,json;print(json.load(sys.stdin)["commit"])')
+  LLAMA_SOURCE_SHA256=$(printf '%s' "$lock" | python3 -c 'import sys,json;print(json.load(sys.stdin)["source_sha256"])')
 fi
 
 url="https://github.com/ggml-org/llama.cpp/archive/${LLAMA_COMMIT}.tar.gz"

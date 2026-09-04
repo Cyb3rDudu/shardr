@@ -9,9 +9,9 @@ cd "$(cd "$(dirname "$0")/.." && pwd)"
 platform=$1; bindir=$2; outdir=$3; version=${4:-$(git rev-parse --short HEAD)}
 
 lock=$(go run ./cmd/llama-lock validate)
-llama_ref=$(printf '%s' "$lock" | python3 -c 'import sys,json;print(json.load(sys.stdin)["Ref"])')
-llama_commit=$(printf '%s' "$lock" | python3 -c 'import sys,json;print(json.load(sys.stdin)["Commit"])')
-llama_sha=$(printf '%s' "$lock" | python3 -c 'import sys,json;print(json.load(sys.stdin)["SourceSHA256"])')
+llama_ref=$(printf '%s' "$lock" | python3 -c 'import sys,json;print(json.load(sys.stdin)["ref"])')
+llama_commit=$(printf '%s' "$lock" | python3 -c 'import sys,json;print(json.load(sys.stdin)["commit"])')
+llama_sha=$(printf '%s' "$lock" | python3 -c 'import sys,json;print(json.load(sys.stdin)["source_sha256"])')
 
 stage=$(mktemp -d); trap 'rm -rf "$stage"' EXIT
 mkdir -p "$stage/shardr-runner/LICENSES"

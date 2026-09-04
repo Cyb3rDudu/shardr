@@ -44,6 +44,10 @@ func TestPublishReleaseNoOverwrite(t *testing.T) {
 	tarball := filepath.Join(dir, "shardr-runner_test_darwin_arm64.tar.gz")
 	os.WriteFile(tarball, []byte("bundle-bytes-v1"), 0o644)
 
+	// Fake gh must shadow any ambient gh for BOTH cases.
+	path := os.Getenv("PATH")
+	t.Setenv("PATH", bin+":"+path)
+
 	// Case 1: release exists + different bytes → exit 1.
 	os.WriteFile(filepath.Join(bin, "gh"), []byte("#!/bin/sh\ncase \"$1 $2\" in \"release view\") exit 0;; \"release download\") echo old > \"$7\"; exit 0;; *) exit 0;; esac\n"), 0o755)
 	if out, err := sh(t, dir, repoRoot(t)+"/scripts/publish-release.sh", "."); err == nil {
@@ -53,8 +57,6 @@ func TestPublishReleaseNoOverwrite(t *testing.T) {
 	// Case 2: release exists + identical bytes → idempotent noop (exit 0).
 	// The fake gh serves back exactly the freshly generated SHA256SUMS.
 	os.WriteFile(filepath.Join(bin, "gh"), []byte("#!/bin/sh\ncase \"$1 $2\" in \"release view\") exit 0;; \"release download\") cp ./SHA256SUMS \"$7\"; exit 0;; *) exit 0;; esac\n"), 0o755)
-	path := os.Getenv("PATH")
-	t.Setenv("PATH", bin+":"+path)
 	if out, err := sh(t, dir, repoRoot(t)+"/scripts/publish-release.sh", "."); err != nil {
 		t.Fatalf("identical bytes must be an idempotent noop, got: %v\n%s", err, out)
 	}

@@ -46,15 +46,15 @@ jobs:
           esac
 
       - name: Open lockfile update PR
+        id: pr
         if: steps.decide.outputs.decision == 'update'
         env:
           GH_TOKEN: ${{ github.token }}
-          NEW_REF: ${{ steps.decide.outputs.new_ref }}
         run: |
           old_lock=$(git show HEAD:runtime/llama.lock)
           new_ref=$(go run ./cmd/llama-lock ref)
-          new_commit=$(go run ./cmd/llama-lock validate | python3 -c 'import sys,json;print(json.load(sys.stdin)["Commit"])')
-          new_sha=$(go run ./cmd/llama-lock validate | python3 -c 'import sys,json;print(json.load(sys.stdin)["SourceSHA256"])')
+          new_commit=$(go run ./cmd/llama-lock validate | python3 -c 'import sys,json;print(json.load(sys.stdin)["commit"])')
+          new_sha=$(go run ./cmd/llama-lock validate | python3 -c 'import sys,json;print(json.load(sys.stdin)["source_sha256"])')
           old_ref=$(printf '%s\n' "$old_lock" | sed -n 's/^ref = "\(.*\)"$/\1/p')
           old_commit=$(printf '%s\n' "$old_lock" | sed -n 's/^commit = "\(.*\)"$/\1/p')
 
@@ -64,6 +64,9 @@ jobs:
           git checkout -B "$branch"
           git add runtime/llama.lock
           git commit -m "chore(llama): pin ${new_ref} (source-verified lockfile update)"
+          # Day-2 re-run: the bot branch may already exist upstream — fetch
+          # it so --force-with-lease has remote-tracking info to check.
+          git fetch origin "$branch" || true
           git push --force-with-lease origin "$branch"
 
           cat > /tmp/pr-body.md <<EOF
@@ -87,6 +90,18 @@ jobs:
             gh pr edit "$branch" --body-file /tmp/pr-body.md
             echo "existing PR for $branch updated"
           fi
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch E2E matrix on the bot branch
+        if: steps.decide.outputs.decision == 'update'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.pr.outputs.branch }}
+        run: |
+          # PRs opened with GITHUB_TOKEN do not fire pull_request events —
+          # dispatch the matrix on the bot branch explicitly.
+          gh workflow run llama-build-e2e.yml --ref "$BRANCH"
+          echo "E2E matrix dispatched on bot branch \`$BRANCH\` (bot PRs opened with GITHUB_TOKEN do not trigger pull_request events)." >> "$GITHUB_STEP_SUMMARY"
 
       - name: No-op summary
         if: steps.decide.outputs.decision != 'update'
