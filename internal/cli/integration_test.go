@@ -969,3 +969,158 @@ func runnerSplitRoot() string {
 	}
 	return filepath.Join(base, "shardr-split")
 }
+
+// B1 (round 4): a failure MID-LINKING (part 2 of 2) leaves zero scratch
+// remains — ownership starts at creation, not after the loop.
+func TestMidLinkFailLeavesNoScratch(t *testing.T) {
+	if stubBinary == "" {
+		t.Skip("stub not built")
+	}
+	root := t.TempDir()
+	t.Setenv("SHARDR_CAS", root)
+	store, _ := cas.Open(root)
+	sockDir, _ := os.MkdirTemp(os.TempDir(), "sx")
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "hive.sock")
+	srv, _ := api.New(store, sock)
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	go srv.Serve()
+	t.Cleanup(func() { srv.Close() })
+	t.Setenv("SHARDR_SOCKET", sock)
+	t.Setenv("SHARDR_LLAMA_SERVER", stubBinary)
+	t.Setenv("SHARDR_CONFIG", writeCfg(t, ""))
+
+	sources, _ := importer.LocalSources([]string{"../../internal/importer/testdata/gold"})
+	res, err := importer.Import(context.Background(), store, sources, importer.ImportOptions{As: "gold/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _ := NewClient()
+	before := countLaunchDirs(t)
+	linkFailHook = func(i int) error {
+		if i == 1 { // second part (of two)
+			return fmt.Errorf("injected link failure")
+		}
+		return nil
+	}
+	defer func() { linkFailHook = nil }()
+	err = Serve(context.Background(), c, "gold/repo:"+res.Members[0].Quant, RunOptions{}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "injected link failure") {
+		t.Fatalf("mid-link failure must surface: %v", err)
+	}
+	after := countLaunchDirs(t)
+	if after != before {
+		t.Fatalf("mid-link failure leaked scratch (%d → %d dirs)", before, after)
+	}
+}
+
+// B3 (round 4): a cleanup failure AFTER a prepare failure is AUDIBLE —
+// chained into the returned error AND on stderr with the path.
+func TestCleanupFailureAfterPrepareFailureIsAudible(t *testing.T) {
+	if stubBinary == "" {
+		t.Skip("stub not built")
+	}
+	root := t.TempDir()
+	t.Setenv("SHARDR_CAS", root)
+	store, _ := cas.Open(root)
+	sockDir, _ := os.MkdirTemp(os.TempDir(), "sx")
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "hive.sock")
+	srv, _ := api.New(store, sock)
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	go srv.Serve()
+	t.Cleanup(func() { srv.Close() })
+	t.Setenv("SHARDR_SOCKET", sock)
+	t.Setenv("SHARDR_LLAMA_SERVER", "/nonexistent/llama-server") // prepare fails AFTER linking
+	t.Setenv("SHARDR_CONFIG", writeCfg(t, ""))
+
+	sources, _ := importer.LocalSources([]string{"../../internal/importer/testdata/gold"})
+	res, err := importer.Import(context.Background(), store, sources, importer.ImportOptions{As: "gold/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _ := NewClient()
+	var sabotaged string
+	linkFailHook = func(i int) error {
+		if i == 1 {
+			// Sabotage the deletion: the hex parent of OUR launch dir
+			// (the one just created — newest mtime) becomes read-only,
+			// so the defer's rmdir of the launch dir fails.
+			our := newestLaunchDir(t)
+			if our != "" {
+				sabotaged = filepath.Dir(our)
+				os.Chmod(sabotaged, 0o500)
+			}
+		}
+		return nil // linking itself succeeds; the binary failure ends prepare
+	}
+	defer func() {
+		linkFailHook = nil
+		if sabotaged != "" {
+			os.Chmod(sabotaged, 0o700) // restore for cleanup
+		}
+	}()
+	err = Serve(context.Background(), c, "gold/repo:"+res.Members[0].Quant, RunOptions{}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "E_BINARY") {
+		t.Fatalf("prepare failure expected: %v", err)
+	}
+	if !strings.Contains(err.Error(), "scratch cleanup failed") && !strings.Contains(err.Error(), "E_STATE") {
+		t.Fatalf("cleanup failure must be chained into the returned error: %v", err)
+	}
+}
+
+// newestLaunchDir finds the most recently created launch dir under the
+// scratch root (within this test's own lifetime).
+func newestLaunchDir(t *testing.T) string {
+	t.Helper()
+	var best string
+	var bestT time.Time
+	hexes, _ := os.ReadDir(runnerSplitRoot())
+	for _, h := range hexes {
+		if !h.IsDir() {
+			continue
+		}
+		launches, _ := os.ReadDir(filepath.Join(runnerSplitRoot(), h.Name()))
+		for _, l := range launches {
+			fi, err := l.Info()
+			if err != nil || !fi.IsDir() {
+				continue
+			}
+			if fi.ModTime().After(bestT) {
+				bestT = fi.ModTime()
+				best = filepath.Join(runnerSplitRoot(), h.Name(), l.Name())
+			}
+		}
+	}
+	return best
+}
+
+// B2 (round 4): the fused FD-anchored removal — normal structure fully
+// deleted (including nested names and their parents).
+func TestFusedRemovalDeletesNested(t *testing.T) {
+	root := runnerSplitRoot()
+	nameSum := sha256.Sum256([]byte(t.Name() + time.Now().Format(time.StampNano)))
+	hex := hex.EncodeToString(nameSum[:])
+	launch := "111-222"
+	dir := filepath.Join(root, hex, launch)
+	nested := filepath.Join(dir, "sub", "deep")
+	if err := os.MkdirAll(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	os.WriteFile(filepath.Join(nested, "part.gguf"), []byte("x"), 0o644)
+	os.WriteFile(filepath.Join(dir, "top.gguf"), []byte("y"), 0o644)
+	if err := removeSplitDir(dir); err != nil {
+		t.Fatalf("normal structure must delete cleanly: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatal("launch dir still present")
+	}
+	if _, err := os.Stat(filepath.Join(root, hex)); !os.IsNotExist(err) {
+		t.Fatal("empty hex parent must not linger either")
+	}
+}
