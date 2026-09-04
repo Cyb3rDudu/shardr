@@ -364,15 +364,24 @@ func TestSplitGGUFHardlinkNaming(t *testing.T) {
 		t.Fatalf("split dir must hold both parts: %v %v", entries, err)
 	}
 	for _, e := range entries {
-		fi, err := os.Lstat(filepath.Join(splitDir, e.Name()))
+		p := filepath.Join(splitDir, e.Name())
+		fi, err := os.Lstat(p)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !fi.Mode().IsRegular() {
-			t.Fatalf("%s must be a regular file (hardlink)", e.Name())
-		}
-		if nlink := fi.Sys().(*syscall.Stat_t).Nlink; nlink < 2 {
-			t.Fatalf("%s is a COPY, not a hardlink (nlink=%d)", e.Name(), nlink)
+		switch {
+		case fi.Mode()&os.ModeSymlink != 0:
+			// Cross-device fallback: must point INTO the CAS, not elsewhere.
+			target, err := os.Readlink(p)
+			if err != nil || !strings.Contains(target, "blobs") {
+				t.Fatalf("%s symlink must target the CAS blob: %v", e.Name(), err)
+			}
+		case fi.Mode().IsRegular():
+			if nlink := fi.Sys().(*syscall.Stat_t).Nlink; nlink < 2 {
+				t.Fatalf("%s is a COPY, not a hardlink (nlink=%d)", e.Name(), nlink)
+			}
+		default:
+			t.Fatalf("%s is neither link nor regular file", e.Name())
 		}
 	}
 }

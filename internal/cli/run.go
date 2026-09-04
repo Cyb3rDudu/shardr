@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -315,7 +316,16 @@ func prepare(ctx context.Context, c *Client, arg string, opts RunOptions, out io
 			// source restores the shared-bytes state.
 			os.Remove(dst)
 			if err := os.Link(p.Path, dst); err != nil {
-				return nil, fmt.Errorf("E_RUNTIME: hardlink split part %s: %w", p.Name, err)
+				if !errors.Is(err, syscall.EXDEV) {
+					return nil, fmt.Errorf("E_RUNTIME: hardlink split part %s: %w", p.Name, err)
+				}
+				// Cross-device (CAS and runtime dir on different
+				// filesystems): a symlink carries zero bytes just the
+				// same — the runtime opens and mmaps THROUGH it into the
+				// CAS blob (zero-copy law intact, 002 §4).
+				if err := os.Symlink(p.Path, dst); err != nil {
+					return nil, fmt.Errorf("E_RUNTIME: link split part %s: %w", p.Name, err)
+				}
 			}
 		}
 		weights.Path = filepath.Join(splitDir, parts[0].Name)
