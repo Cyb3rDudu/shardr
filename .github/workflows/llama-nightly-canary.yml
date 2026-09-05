@@ -37,6 +37,7 @@ jobs:
       - name: Pick nightly ref (explicit bNNNN or newest upstream)
         id: pick
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           CANARY_REF: ${{ inputs.llama_ref }}
         run: |
           if [ -n "$CANARY_REF" ]; then

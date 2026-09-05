@@ -57,12 +57,15 @@ jobs:
 
       - name: Validate lockfile + provenance proof (stable channel only)
         if: inputs.llama_ref == ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # release API without token = 403 rate limit
         run: |
           go run ./cmd/llama-lock validate
           go run ./cmd/llama-lock verify
 
       - name: Fetch pinned prebuilt llama-server (digest-verified)
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           CANARY_REF: ${{ inputs.llama_ref }}
         run: |
           if [ -n "$CANARY_REF" ]; then
