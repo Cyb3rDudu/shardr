@@ -79,6 +79,8 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Provenance proof (tag -> commit, API digests == pin)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: go run ./cmd/llama-lock verify
       - name: Publish (idempotent, no overwrite)
         env:

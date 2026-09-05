@@ -32,6 +32,8 @@ jobs:
 
       - name: Check upstream for a newer pinnable b-release
         id: decide
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           args=(check-update --write)
           if [ -n "${{ inputs.llama_ref }}" ]; then args+=(--ref "${{ inputs.llama_ref }}"); fi
