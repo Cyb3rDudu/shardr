@@ -1,38 +1,42 @@
 BIN ?= bin
-LLAMA_BUILD_DIR ?= .llama-build
 
-# Pinned llama.cpp release (002 strand design: managed subprocess, no cgo).
-LLAMA_VERSION := v0.3.0
+# llama.cpp version comes from runtime/llama.lock — the SINGLE version
+# truth (parsed fail-closed by internal/llamalock; no second pin here).
+# Lazily expanded so targets that never use the version (clean, deploy)
+# don't compile Go on every make invocation.
+LLAMA_VERSION = $(shell go run ./cmd/llama-lock ref)
 LLAMA_SERVER := $(BIN)/llama-server
 
 .PHONY: all llama build-llama deploy-llama check-llama-deploy clean test
 
 all: llama
 
-# llama builds the pinned llama.cpp llama-server into BIN (adjacent to
-# where `go build -o $(BIN)/ ./cmd/shardr` puts shardr — ResolveBinary
-# finds it next to the executable, SHARDR_LLAMA_SERVER overrides
-# everything). Recursive make keeps build → deploy strictly ordered even
-# under -j. BIN and LLAMA_BUILD_DIR are env-overridable so tests never
-# touch a user's real build tree.
+# llama fetches the PINNED prebuilt llama.cpp release binaries
+# (runtime/llama.lock — single truth; owner ruling: never self-build)
+# into BIN. The whole extract dir is kept: llama-server loads its dylibs
+# via @loader_path, a lone binary is useless on macOS.
+LLAMA_VERSION = $(shell go run ./cmd/llama-lock ref)
+LLAMA_SERVER := $(BIN)/llama-server
+LLAMA_PLATFORM := $(shell uname -s | tr '[:upper:]' '[:lower:]')_$(shell uname -m | tr '[:upper:]' '[:lower:]')
+
+.PHONY: all llama fetch-llama deploy-llama check-llama-deploy clean test
+
+all: llama
+
 llama:
-	@$(MAKE) --no-print-directory build-llama
+	@$(MAKE) --no-print-directory fetch-llama
 	@$(MAKE) --no-print-directory deploy-llama
 
-build-llama:
-	@echo ">> building llama.cpp $(LLAMA_VERSION) (this downloads and compiles ~1 GB)"
-	rm -rf $(LLAMA_BUILD_DIR)
-	git clone --depth 1 --branch $(LLAMA_VERSION) https://github.com/ggml-org/llama.cpp $(LLAMA_BUILD_DIR)
-	cmake -S $(LLAMA_BUILD_DIR) -B $(LLAMA_BUILD_DIR)/build -DLLAMA_SERVER=ON -DBUILD_SHARED_LIBS=OFF
-	cmake --build $(LLAMA_BUILD_DIR)/build --config Release -j --target llama-server
+fetch-llama:
+	@echo ">> fetching prebuilt llama.cpp $(LLAMA_VERSION) ($(LLAMA_PLATFORM))"
+	go run ./cmd/llama-lock fetch $(LLAMA_PLATFORM) $(BIN)
 
-# deploy-llama copies the built binary into BIN — its own target so the
-# fresh-checkout mechanics test can exercise the copy WITHOUT the ~1 GB
-# clone+build. mkdir -p first: a fresh clone has no BIN and cp alone
-# fails (issue #26, blocker 5).
+# deploy-llama links the fetched llama-server into BIN root (ResolveBinary
+# finds it next to the shardr executable). Its own target so the
+# fresh-checkout mechanics test can exercise the link WITHOUT the download.
 deploy-llama:
-	@mkdir -p $(dir $(LLAMA_SERVER))
-	cp $(LLAMA_BUILD_DIR)/build/bin/llama-server $(LLAMA_SERVER)
+	@mkdir -p $(BIN)
+	ln -sf $$(basename $$(dirname $$(ls -d $(BIN)/llama-b*/llama-server | head -1)))/llama-server $(LLAMA_SERVER)
 	@echo ">> $(LLAMA_SERVER) ready (pin: $(LLAMA_VERSION))"
 
 # check-llama-deploy: fresh-checkout mechanics in a TEMP tree (never
@@ -44,4 +48,4 @@ test:
 	go test ./...
 
 clean:
-	rm -rf $(LLAMA_BUILD_DIR) $(BIN)
+	rm -rf $(BIN)

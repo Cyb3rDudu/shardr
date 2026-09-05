@@ -8,20 +8,18 @@
 #   3. the repo's build trees are byte-identical before/after.
 set -eu
 cd "$(git rev-parse --show-toplevel)"
-repo_before="$(find bin .llama-build -type f -exec shasum {} + 2>/dev/null | sort | sha256sum || true)"
+repo_before="$(find bin .llama-bin -type f -exec shasum {} + 2>/dev/null | sort | sha256sum || true)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-mkdir -p "$TMP/build/build/bin"
-printf '#!/bin/sh\nfake-llama-server\n' > "$TMP/build/build/bin/llama-server"
-chmod +x "$TMP/build/build/bin/llama-server"
-BIN="$TMP/bin" LLAMA_BUILD_DIR="$TMP/build" make deploy-llama >/dev/null
+mkdir -p "$TMP/bin/llama-bTEST"
+printf '#!/bin/sh\nfake-llama-server\n' > "$TMP/bin/llama-bTEST/llama-server"
+chmod +x "$TMP/bin/llama-bTEST/llama-server"
+BIN="$TMP/bin" make deploy-llama >/dev/null
 test -x "$TMP/bin/llama-server"
-grep -q fake-llama-server "$TMP/bin/llama-server"
-if [ -d bin ] && [ -n "$(ls -A bin 2>/dev/null)" ]; then
-  echo "repo bin/ is not empty after the temp-isolated check — isolation broken" >&2
-  exit 1
-fi
-repo_after="$(find bin .llama-build -type f -exec shasum {} + 2>/dev/null | sort | sha256sum || true)"
+grep -q fake-llama-server "$TMP/bin/llama-server/" 2>/dev/null || grep -q fake-llama-server "$(readlink -f "$TMP/bin/llama-server" 2>/dev/null || readlink "$TMP/bin/llama-server")"
+# (isolation is proven by the byte-identical before/after check below —
+# a developer-run `make llama` may legitimately populate bin/)
+repo_after="$(find bin .llama-bin -type f -exec shasum {} + 2>/dev/null | sort | sha256sum || true)"
 if [ "$repo_before" != "$repo_after" ]; then
   echo "repo build artifacts changed during the check — isolation broken" >&2
   exit 1

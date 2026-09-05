@@ -44,7 +44,7 @@ node (see [Synchronization & integrity](#synchronization--integrity)).
 ```sh
 go build -o sh-bin/shardr ./cmd/shardr
 go build -o sh-bin/shardhive ./cmd/shardhive
-make llama        # builds the pinned llama-server (v0.3.0) into bin/
+make llama        # builds the llama-server pinned in runtime/llama.lock into bin/
                   # or: any llama-server in $PATH, or $SHARDR_LLAMA_SERVER
 ```
 
@@ -125,6 +125,40 @@ shardr verify --all     # integrity re-hash (exit 0 clean, 1 mismatch, 2 missing
 Trust derives from digests, never from transports: every byte is verified
 against its content address on write, and BitTorrent imports require a
 pinned manifest digest.
+
+## llama.cpp versioning & runner releases
+
+The llama.cpp runtime shardr ships is pinned in
+[`runtime/llama.lock`](runtime/llama.lock) — the single version truth:
+an upstream **prebuilt b-release** (`bNNNN`) with the full commit SHA and
+per-platform binary-archive SHA-256s, parsed fail-closed by
+`internal/llamalock`. shardr never compiles llama.cpp (owner ruling
+2026-09-05): `make llama` fetches the digest-verified prebuilt binaries.
+
+Two strictly separated channels:
+
+- **Pin/release channel** — a daily check (workflow
+  `llama-upstream-check`) detects newer b-releases that are **at least 7
+  days old** (community soak filter) and carry the full platform asset
+  matrix, then opens a lockfile update PR (old/new pin, both SHAs,
+  upstream compare link, per-platform digests). Merging that PR — after
+  the digest-verified fetch + real runner E2E matrix (Ubuntu x86-64,
+  macOS Apple Silicon) ran on it — triggers `release-runner`, which
+  publishes `shardr-runner-<shardr-version>-llama-<ref>` bundles: the
+  whole prebuilt runtime dir (dylibs are rpath-relative), SHA256SUMS,
+  BUILDINFO.json and licenses. Bundles are reproducible; existing
+  releases are never overwritten — same identity with different bytes is
+  a hard error. A moving `latest` is never published.
+- **Canary channel** — `llama-nightly-canary` tests the **newest**
+  b-release weekly through the same matrix (no age filter — canary
+  catches breakage before the soak ends), never touches the stable
+  lockfile and never publishes a release.
+
+Manual update: `go run ./cmd/llama-lock check-update --write --ref bNNNN`
+(exact b-releases, ≥ 7 days old, only), then open a PR against `main`.
+Verify a lockfile with `go run ./cmd/llama-lock validate` and prove its
+provenance (tag → commit, release-API digests) with
+`go run ./cmd/llama-lock verify`.
 
 ## Specifications & documentation
 

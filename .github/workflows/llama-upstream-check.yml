@@ -1,0 +1,109 @@
+# Workflow A — detect newer pinnable llama.cpp b-releases (>= 7 days
+# soak time, complete prebuilt asset matrix) and open a lockfile update
+# PR. Never merges, never releases. Bleeding-edge testing = workflow D.
+name: llama upstream check
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      llama_ref:
+        description: "Optional exact bNNNN release (>= 7 days old)"
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: llama-upstream-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+
+      - name: Check upstream for a newer pinnable b-release
+        id: decide
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          args=(check-update --write)
+          if [ -n "${{ inputs.llama_ref }}" ]; then args+=(--ref "${{ inputs.llama_ref }}"); fi
+          out=$(go run ./cmd/llama-lock "${args[@]}")
+          echo "$out"
+          case "$out" in
+            noop*)  echo "decision=noop"  >> "$GITHUB_OUTPUT" ;;
+            update*) echo "decision=update" >> "$GITHUB_OUTPUT"
+                     echo "$out" | awk '{print "new_ref=" $3}' >> "$GITHUB_OUTPUT" ;;
+            *) echo "unexpected output" >&2; exit 1 ;;
+          esac
+
+      - name: Open lockfile update PR
+        id: pr
+        if: steps.decide.outputs.decision == 'update'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          old_lock=$(git show HEAD:runtime/llama.lock)
+          new_ref=$(go run ./cmd/llama-lock ref)
+          new_commit=$(go run ./cmd/llama-lock validate | python3 -c 'import sys,json;print(json.load(sys.stdin)["commit"])')
+          old_ref=$(printf '%s\n' "$old_lock" | sed -n 's/^ref = "\(.*\)"$/\1/p')
+          old_commit=$(printf '%s\n' "$old_lock" | sed -n 's/^commit = "\(.*\)"$/\1/p')
+
+          branch="bot/llama-${new_ref}"
+          git config user.name "shardr-llama-bot"
+          git config user.email "noreply@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add runtime/llama.lock
+          git commit -m "chore(llama): pin ${new_ref} (digest-pinned prebuilt runtime)"
+          # Day-2 re-run: the bot branch may already exist upstream — fetch
+          # it so --force-with-lease has remote-tracking info to check.
+          git fetch origin "$branch" || true
+          git push --force-with-lease origin "$branch"
+
+          cat > /tmp/pr-body.md <<EOF
+          Automated llama.cpp pin update (workflow A). No auto-merge.
+
+          - old pin: \`${old_ref}\` (\`${old_commit}\`)
+          - new pin: \`${new_ref}\` (\`${new_commit}\`) — upstream prebuilt
+            release, at least 7 days old (community soak filter)
+          - upstream compare: https://github.com/ggml-org/llama.cpp/compare/${old_commit}...${new_commit}
+          - asset digests: pinned per platform in runtime/llama.lock
+            (verified against the GitHub release API by \`llama-lock verify\`)
+          - compatibility matrix: dispatched on this branch (\`llama build +
+            E2E\`: Ubuntu x86-64, macOS Apple Silicon) — check its status
+            before merging. Release happens only after merge (workflow C).
+          EOF
+          # One PR per target ref: reuse the existing one if present.
+          if ! gh pr view "$branch" --json url >/dev/null 2>&1; then
+            gh pr create --base main --head "$branch" \
+              --title "chore(llama): pin ${new_ref}" \
+              --body-file /tmp/pr-body.md
+          else
+            gh pr edit "$branch" --body-file /tmp/pr-body.md
+            echo "existing PR for $branch updated"
+          fi
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch E2E matrix on the bot branch
+        if: steps.decide.outputs.decision == 'update'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.pr.outputs.branch }}
+        run: |
+          # PRs opened with GITHUB_TOKEN do not fire pull_request events —
+          # dispatch the matrix on the bot branch explicitly.
+          gh workflow run llama-build-e2e.yml --ref "$BRANCH"
+          echo "E2E matrix dispatched on bot branch \`$BRANCH\` (bot PRs opened with GITHUB_TOKEN do not trigger pull_request events)." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: No-op summary
+        if: steps.decide.outputs.decision != 'update'
+        run: echo "No newer pinnable b-release (>= 7 days soak) — no PR (noop run)." >> "$GITHUB_STEP_SUMMARY"

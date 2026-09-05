@@ -1,0 +1,148 @@
+# Workflow B — pinned prebuilt llama-server + real runner E2E.
+# Reusable (workflow_call) so the release pipeline and the nightly canary
+# run the EXACT same matrix the lockfile PR is gated on.
+#
+# Owner ruling 2026-09-05: shardr NEVER compiles llama.cpp. The runtime is
+# consumed as upstream prebuilt release binaries, digest-pinned per
+# platform in runtime/llama.lock. No CMake, no compilers: minutes, not
+# hours.
+#
+# Platform note: GitHub-hosted macos-latest images ARE native Apple
+# Silicon (arm64) — a real Metal runtime test, no crossbuild.
+name: llama build + E2E
+
+on:
+  workflow_call:
+    inputs:
+      llama_ref:
+        description: "Canary override: exact bNNNN release (stable uses runtime/llama.lock)"
+        type: string
+        required: false
+  workflow_dispatch:
+    inputs:
+      llama_ref:
+        description: "Optional canary override: exact bNNNN release"
+        required: false
+  pull_request:
+    paths:
+      - runtime/llama.lock
+      - .github/workflows/llama-build-e2e.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: llama-e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Pinned test model (rule: no unversioned HF downloads).
+env:
+  E2E_MODEL_URL: https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF/resolve/9e6855bc4be717fca1ef21360a1db4b29d5c559a/SmolLM2-135M-Instruct-Q4_K_M.gguf
+  E2E_MODEL_SHA256: ed5fa30c487b282ec156c29062f1222e5c20875a944ac98289dbd242e947f747
+
+jobs:
+  matrix:
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [darwin_arm64, linux_amd64]
+    runs-on: ${{ matrix.platform == 'darwin_arm64' && 'macos-latest' || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+
+      - name: Validate lockfile + provenance proof (stable channel only)
+        if: inputs.llama_ref == ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # release API without token = 403 rate limit
+        run: |
+          go run ./cmd/llama-lock validate
+          go run ./cmd/llama-lock verify
+
+      - name: Fetch pinned prebuilt llama-server (digest-verified)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CANARY_REF: ${{ inputs.llama_ref }}
+        run: |
+          if [ -n "$CANARY_REF" ]; then
+            go run ./cmd/llama-lock fetch "${{ matrix.platform }}" .llama-bin --ref "$CANARY_REF"
+          else
+            go run ./cmd/llama-lock fetch "${{ matrix.platform }}" .llama-bin
+          fi
+
+      - name: Record runtime version
+        run: |
+          BIN="$(ls -d "$PWD"/.llama-bin/llama-b*/llama-server)"
+          "$BIN" --version | tee llama-version.txt
+
+      # CLI contract per spec 002 §5.7: probe-start llama-server with each
+      # argv flag the runner maps (§7.1). An "invalid argument" /
+      # "unrecognized" exit is red. No --help text parsing — that is
+      # upstream-internal and version-dependent.
+      - name: Argv contract probes (002 §5.7)
+        run: |
+          BIN="$(ls -d "$PWD"/.llama-bin/llama-b*/llama-server)"
+          probe() {
+            out="$(timeout 15 "$BIN" "$@" 2>&1 || true)"
+            if grep -qiE 'invalid argument|unrecognized' <<<"$out"; then
+              echo "E_CONTRACT: llama-server rejected $*: $out" >&2
+              exit 1
+            fi
+          }
+          probe --host 127.0.0.1
+          probe --port 47000
+          probe -m /dev/null
+          probe --alias probe-model
+          probe --mmproj /dev/null
+          echo "Argv contract OK (--host --port -m --alias --mmproj)"
+
+      - name: Build + test shardr
+        run: |
+          go build ./...
+          go vet ./...
+          go test ./...
+
+      - name: Cache pinned E2E model
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: model.gguf
+          key: e2e-model-${{ env.E2E_MODEL_SHA256 }}
+
+      - name: Fetch pinned E2E model (digest check)
+        run: |
+          if [ -f model.gguf ] && [ "$(shasum -a 256 model.gguf | cut -d' ' -f1)" = "$E2E_MODEL_SHA256" ]; then
+            echo "model from cache (digest OK)"
+            exit 0
+          fi
+          curl -sSL --fail --max-time 900 --retry 2 "$E2E_MODEL_URL" -o model.gguf
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum model.gguf | cut -d' ' -f1)
+          else
+            actual=$(shasum -a 256 model.gguf | cut -d' ' -f1)
+          fi
+          [ "$actual" = "$E2E_MODEL_SHA256" ] || { echo "E_MODEL_DIGEST: $actual != $E2E_MODEL_SHA256" >&2; exit 1; }
+
+      - name: Real runner E2E (shardr → llama-server)
+        run: |
+          SHARDR_E2E_REAL=1 \
+          SHARDR_LLAMA_SERVER="$(ls -d "$PWD"/.llama-bin/llama-b*/llama-server)" \
+          SHARDR_E2E_MODEL="$PWD/model.gguf" \
+          go test ./internal/cli -run TestRealBinaryE2E -v -timeout 15m
+
+      - name: Stage prebuilt runtime + shardr (short-lived CI artifacts)
+        run: |
+          mkdir -p dist
+          cp -R .llama-bin/llama-b*/ dist/llama-dist/
+          cp llama-version.txt dist/
+          go build -o dist/shardr ./cmd/shardr
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: runner-bin-${{ matrix.platform }}
+          retention-days: 7
+          path: dist/
+          if-no-files-found: error
