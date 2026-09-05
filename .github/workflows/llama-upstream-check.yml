@@ -1,7 +1,6 @@
-# Workflow A — detect new exact llama.cpp vX.Y.Z releases and open a
-# lockfile update PR. Never merges, never releases: upstream change →
-# lockfile PR → build/E2E → review/merge → release (workflow C).
-# Nightly bNNNN tags are rejected here (canary = workflow D).
+# Workflow A — detect newer pinnable llama.cpp b-releases (>= 7 days
+# soak time, complete prebuilt asset matrix) and open a lockfile update
+# PR. Never merges, never releases. Bleeding-edge testing = workflow D.
 name: llama upstream check
 
 on:
@@ -10,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       llama_ref:
-        description: "Optional exact vX.Y.Z tag"
+        description: "Optional exact bNNNN release (>= 7 days old)"
         required: false
 
 permissions:
@@ -31,7 +30,7 @@ jobs:
         with:
           go-version: "1.25"
 
-      - name: Check upstream for a new stable tag
+      - name: Check upstream for a newer pinnable b-release
         id: decide
         run: |
           args=(check-update --write)
@@ -54,7 +53,6 @@ jobs:
           old_lock=$(git show HEAD:runtime/llama.lock)
           new_ref=$(go run ./cmd/llama-lock ref)
           new_commit=$(go run ./cmd/llama-lock validate | python3 -c 'import sys,json;print(json.load(sys.stdin)["commit"])')
-          new_sha=$(go run ./cmd/llama-lock validate | python3 -c 'import sys,json;print(json.load(sys.stdin)["source_sha256"])')
           old_ref=$(printf '%s\n' "$old_lock" | sed -n 's/^ref = "\(.*\)"$/\1/p')
           old_commit=$(printf '%s\n' "$old_lock" | sed -n 's/^commit = "\(.*\)"$/\1/p')
 
@@ -63,23 +61,24 @@ jobs:
           git config user.email "noreply@users.noreply.github.com"
           git checkout -B "$branch"
           git add runtime/llama.lock
-          git commit -m "chore(llama): pin ${new_ref} (source-verified lockfile update)"
+          git commit -m "chore(llama): pin ${new_ref} (digest-pinned prebuilt runtime)"
           # Day-2 re-run: the bot branch may already exist upstream — fetch
           # it so --force-with-lease has remote-tracking info to check.
           git fetch origin "$branch" || true
           git push --force-with-lease origin "$branch"
 
           cat > /tmp/pr-body.md <<EOF
-          Automated llama.cpp lockfile update (workflow A). No auto-merge.
+          Automated llama.cpp pin update (workflow A). No auto-merge.
 
-          - old ref: \`${old_ref}\` (\`${old_commit}\`)
-          - new ref: \`${new_ref}\` (\`${new_commit}\`)
+          - old pin: \`${old_ref}\` (\`${old_commit}\`)
+          - new pin: \`${new_ref}\` (\`${new_commit}\`) — upstream prebuilt
+            release, at least 7 days old (community soak filter)
           - upstream compare: https://github.com/ggml-org/llama.cpp/compare/${old_commit}...${new_commit}
-          - source archive sha256: \`${new_sha}\`
-          - compatibility matrix: this PR triggers \`llama build + E2E\`
-            (Ubuntu x86-64 CPU, macOS Apple Silicon Metal) — check its
-            status below before merging. Release happens only after merge
-            (workflow C), never from this branch.
+          - asset digests: pinned per platform in runtime/llama.lock
+            (verified against the GitHub release API by \`llama-lock verify\`)
+          - compatibility matrix: dispatched on this branch (\`llama build +
+            E2E\`: Ubuntu x86-64, macOS Apple Silicon) — check its status
+            before merging. Release happens only after merge (workflow C).
           EOF
           # One PR per target ref: reuse the existing one if present.
           if ! gh pr view "$branch" --json url >/dev/null 2>&1; then
@@ -105,4 +104,4 @@ jobs:
 
       - name: No-op summary
         if: steps.decide.outputs.decision != 'update'
-        run: echo "No new upstream vX.Y.Z — no PR (noop run)." >> "$GITHUB_STEP_SUMMARY"
+        run: echo "No newer pinnable b-release (>= 7 days soak) — no PR (noop run)." >> "$GITHUB_STEP_SUMMARY"

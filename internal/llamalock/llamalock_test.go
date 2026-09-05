@@ -1,17 +1,32 @@
 package llamalock
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
 func validLock() string {
-	return `ref = "v0.3.0"
-commit = "c1d0e7a004015f23bc0233470b747b596f29b264"
-source_url = "https://github.com/ggml-org/llama.cpp/archive/c1d0e7a004015f23bc0233470b747b596f29b264.tar.gz"
-source_sha256 = "e381b23a9aba7e1615ef8d4713bc2f8d4777255a5b1124d633f0af280a2d5415"
-updated_at = "2026-09-04T18:30:00Z"
+	return `ref = "b10684"
+commit = "cc83d7b4824f73cfdda4dfbb47ee39804f71b328"
+updated_at = "2026-09-05T15:58:13Z"
+
+[assets.darwin_arm64]
+url = "https://github.com/ggml-org/llama.cpp/releases/download/b10684/llama-b10684-bin-macos-arm64.tar.gz"
+sha256 = "8310138372444cbeb5c1123c88d27aa9bc78dd14a549c5654733eb339f665c07"
+
+[assets.linux_amd64]
+url = "https://github.com/ggml-org/llama.cpp/releases/download/b10684/llama-b10684-bin-ubuntu-x64.tar.gz"
+sha256 = "2eb35b197e220511456dfb011c118f74707735457c4d09927ae0382c6b29e7ee"
 `
 }
 
@@ -20,7 +35,7 @@ func TestParseValid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lk.Ref != "v0.3.0" || lk.Commit != "c1d0e7a004015f23bc0233470b747b596f29b264" {
+	if lk.Ref != "b10684" || len(lk.Assets) != 2 {
 		t.Fatalf("parsed %+v", lk)
 	}
 	// Format round-trip is byte-identical (canonical output).
@@ -30,28 +45,38 @@ func TestParseValid(t *testing.T) {
 }
 
 func TestParseRejectsInvalid(t *testing.T) {
+	darwinURL := "https://github.com/ggml-org/llama.cpp/releases/download/b10684/llama-b10684-bin-macos-arm64.tar.gz"
 	cases := map[string]func(string) string{
-		"short sha": func(s string) string {
-			return strings.Replace(s, "c1d0e7a004015f23bc0233470b747b596f29b264", "c1d0e7a", 1)
+		"vX.Y.Z ref (stable carries no binaries)": func(s string) string { return strings.Replace(s, `ref = "b10684"`, `ref = "v0.4.0"`, 1) },
+		"short commit": func(s string) string {
+			return strings.Replace(s, "cc83d7b4824f73cfdda4dfbb47ee39804f71b328", "cc83d7b4", 1)
 		},
-		"uppercase sha": func(s string) string {
-			return strings.Replace(s, "c1d0e7a004015f23bc0233470b747b596f29b264", strings.ToUpper("c1d0e7a004015f23bc0233470b747b596f29b264"), 1)
+		"uppercase commit": func(s string) string {
+			return strings.Replace(s, "cc83d7b4824f73cfdda4dfbb47ee39804f71b328", strings.ToUpper("cc83d7b4824f73cfdda4dfbb47ee39804f71b328"), 1)
 		},
 		"wrong digest": func(s string) string {
-			return strings.Replace(s, "e381b23a9aba7e1615ef8d4713bc2f8d4777255a5b1124d633f0af280a2d5415", "deadbeef", 1)
+			return strings.Replace(s, "8310138372444cbeb5c1123c88d27aa9bc78dd14a549c5654733eb339f665c07", "deadbeef", 1)
 		},
-		"nightly ref":    func(s string) string { return strings.Replace(s, `ref = "v0.3.0"`, `ref = "b9999"`, 1) },
-		"ref not semver": func(s string) string { return strings.Replace(s, `ref = "v0.3.0"`, `ref = "latest"`, 1) },
-		"missing field":  func(s string) string { return strings.Replace(s, `updated_at = "2026-09-04T18:30:00Z"`, ``, 1) },
-		"duplicate key":  func(s string) string { return s + `ref = "v0.4.0"` + "\n" },
-		"unknown key":    func(s string) string { return s + `extra = "x"` + "\n" },
+		"moving ref":       func(s string) string { return strings.Replace(s, `ref = "b10684"`, `ref = "master"`, 1) },
+		"missing field":    func(s string) string { return strings.Replace(s, `updated_at = "2026-09-05T15:58:13Z"`, ``, 1) },
+		"missing platform": func(s string) string { return s[:strings.Index(s, "[assets.linux_amd64]")] },
+		"unknown platform": func(s string) string { return strings.Replace(s, "[assets.linux_amd64]", "[assets.windows_x64]", 1) },
+		"duplicate key":    func(s string) string { return s + `ref = "b1"` + "\n" },
+		"unknown asset key": func(s string) string {
+			return strings.Replace(s, `[assets.linux_amd64]`, "[assets.linux_amd64]", 1) + "extra = \"x\"\n"
+		},
 		"http url": func(s string) string {
 			return strings.Replace(s, "https://github.com/ggml-org", "http://github.com/ggml-org", 1)
 		},
-		"foreign org":    func(s string) string { return strings.Replace(s, "ggml-org/llama.cpp", "evil/llama.cpp", 1) },
-		"url not commit": func(s string) string { return strings.Replace(s, "/archive/c1d0e7a0", "/archive/ffffe7a0", 1) },
+		"foreign org": func(s string) string { return strings.Replace(s, "ggml-org/llama.cpp", "evil/llama.cpp", 1) },
+		"url not canonical": func(s string) string {
+			return strings.Replace(s, darwinURL, "https://github.com/ggml-org/llama.cpp/releases/download/b10684/llama-b10684-bin-macos-x64.tar.gz", 1)
+		},
+		"asset url other ref": func(s string) string {
+			return strings.Replace(s, darwinURL, "https://github.com/ggml-org/llama.cpp/releases/download/b10685/llama-b10684-bin-macos-arm64.tar.gz", 1)
+		},
 		"bad timestamp": func(s string) string {
-			return strings.Replace(s, `updated_at = "2026-09-04T18:30:00Z"`, `updated_at = "yesterday"`, 1)
+			return strings.Replace(s, `updated_at = "2026-09-05T15:58:13Z"`, `updated_at = "yesterday"`, 1)
 		},
 		"garbage line": func(s string) string { return s + "totally not a lock line\n" },
 		"empty":        func(string) string { return "" },
@@ -63,72 +88,138 @@ func TestParseRejectsInvalid(t *testing.T) {
 	}
 }
 
-func TestDecideStableChannel(t *testing.T) {
-	if up, err := Decide("v0.3.0", "v0.3.0"); err != nil || up {
+func TestDecidePinChannel(t *testing.T) {
+	if up, err := Decide("b10684", "b10684"); err != nil || up {
 		t.Errorf("unchanged upstream must be a noop, got up=%v err=%v", up, err)
 	}
-	if up, err := Decide("v0.3.0", "v0.4.0"); err != nil || !up {
-		t.Errorf("newer stable must update, got up=%v err=%v", up, err)
+	if up, err := Decide("b10684", "b10700"); err != nil || !up {
+		t.Errorf("newer b-release must update, got up=%v err=%v", up, err)
 	}
-	// bNNNN may never update the stable lock (canary channel is separate).
-	if _, err := Decide("v0.3.0", "b9999"); err == nil {
-		t.Error("bNNNN must be rejected for the stable lock")
+	// vX.Y.Z may never become the pin: stable releases attach no binaries.
+	if _, err := Decide("b10684", "v0.4.0"); err == nil {
+		t.Error("vX.Y.Z must be rejected for the pin")
 	}
-	if _, err := Decide("v0.3.0", "main"); err == nil {
+	if _, err := Decide("b10684", "master"); err == nil {
 		t.Error("moving ref must be rejected")
 	}
 }
 
-func TestTagClassificationAndOrder(t *testing.T) {
-	for _, ok := range []string{"v0.0.1", "v10.20.30"} {
-		if !IsStable(ok) {
-			t.Errorf("%s should be stable", ok)
-		}
-	}
-	for _, no := range []string{"v0.3", "v0.3.0-rc1", "b4711", "latest", "V0.3.0"} {
-		if IsStable(no) {
-			t.Errorf("%s should not be stable", no)
-		}
-	}
-	if !tagLess("v0.9.0", "v0.10.0") {
-		t.Error("numeric comparison broken: v0.10.0 > v0.9.0")
-	}
-	if !IsNightly("b9999") || IsNightly("b9999x") {
+func TestRefClassification(t *testing.T) {
+	if !IsNightly("b10684") || IsNightly("b9999x") || IsNightly("v0.4.0") {
 		t.Error("nightly classification broken")
+	}
+	if !IsStable("v0.4.0") || IsStable("b10684") {
+		t.Error("stable classification broken")
+	}
+	if MinAge != 7*24*60*60*1e9 { // 7 days, nanoseconds
+		t.Errorf("soak window drifted: %v", MinAge)
+	}
+}
+
+// TestDownloadAssetDigestRefusal: a tampered asset (server bytes do not
+// match the pinned digest) must be refused — no file on disk, hard error.
+func TestDownloadAssetDigestRefusal(t *testing.T) {
+	payload := []byte("tampered asset bytes")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(payload)
+	}))
+	defer srv.Close()
+	lk := Lock{Assets: map[string]Asset{
+		"darwin_arm64": {Platform: "darwin_arm64", URL: srv.URL + "/asset.tar.gz", SHA256: "0000000000000000000000000000000000000000000000000000000000000000"},
+	}}
+	dest := filepath.Join(t.TempDir(), "asset.tar.gz")
+	err := DownloadAsset(context.Background(), lk, "darwin_arm64", dest)
+	if err == nil {
+		t.Fatal("digest mismatch must fail")
+	}
+	if !strings.Contains(err.Error(), "E_DIGEST") {
+		t.Fatalf("expected E_DIGEST failure, got %v", err)
+	}
+	if _, statErr := os.Stat(dest); statErr == nil {
+		t.Error("refused asset must not remain on disk")
+	}
+	// positive control: matching digest passes
+	h := sha256.Sum256(payload)
+	a := lk.Assets["darwin_arm64"]
+	a.SHA256 = hex.EncodeToString(h[:])
+	lk.Assets["darwin_arm64"] = a
+	if err := DownloadAsset(context.Background(), lk, "darwin_arm64", dest); err != nil {
+		t.Fatal(err)
 	}
 }
 
 // TestSingleTruthLockfile: no second version pin may creep back into the
-// Makefile or Go sources — runtime/llama.lock is the only truth.
+// Makefile or Go sources — runtime/llama.lock is the only truth, and the
+// committed lockfile itself must parse.
 func TestSingleTruthLockfile(t *testing.T) {
 	for _, src := range []string{"../../Makefile", "../../internal/runner/llama.go"} {
-		data := readFileT(t, src)
-		for _, bad := range []string{"LLAMA_VERSION := v", "LLAMA_VERSION ?= v", `LlamaPin = "v`} {
+		data, err := os.ReadFile(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, bad := range []string{"LLAMA_VERSION := v", "LLAMA_VERSION ?= v", "LLAMA_VERSION := b", `LlamaPin = "v`, `LlamaPin = "b`} {
 			if strings.Contains(string(data), bad) {
 				t.Errorf("%s contains a second version pin (%q)", src, bad)
 			}
 		}
+		if strings.Contains(string(data), "cmake ") || strings.Contains(string(data), "LLAMA_BUILD_") {
+			t.Errorf("%s still self-builds llama.cpp (owner ruling: prebuilt only)", src)
+		}
 	}
-	// The committed lockfile itself must parse (fail-closed check on the
-	// real bytes, not just their existence).
 	root, err := FindRepoRoot()
 	if err != nil {
 		t.Skipf("not run from repo: %v", err)
 	}
-	lockBytes, err := os.ReadFile(root + "/runtime/llama.lock")
+	data, err := os.ReadFile(filepath.Join(root, "runtime/llama.lock"))
 	if err != nil {
-		t.Fatalf("read lockfile: %v", err)
+		t.Fatal(err)
 	}
-	if _, err := Parse(lockBytes); err != nil {
-		t.Fatalf("committed runtime/llama.lock is invalid: %v", err)
+	if _, err := Parse(data); err != nil {
+		t.Fatalf("committed lockfile does not parse: %v", err)
 	}
 }
 
-func readFileT(t *testing.T, p string) []byte {
-	t.Helper()
-	data, err := os.ReadFile(p)
-	if err != nil {
-		t.Skipf("cannot read %s: %v", p, err)
+// TestExtractAssetTraversalSafe: archives with absolute paths, "..",
+// or escaping symlinks must be rejected before anything lands outside
+// the extract dir.
+func TestExtractAssetTraversalSafe(t *testing.T) {
+	build := func(entries map[string]string) string {
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		tw := tar.NewWriter(gz)
+		for name, link := range entries {
+			if link != "" {
+				hdr := &tar.Header{Name: name, Typeflag: tar.TypeSymlink, Linkname: link, Mode: 0o777}
+				tw.WriteHeader(hdr)
+			} else {
+				hdr := &tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0o755, Size: int64(len("x"))}
+				tw.WriteHeader(hdr)
+				tw.Write([]byte("x"))
+			}
+		}
+		tw.Close()
+		gz.Close()
+		path := filepath.Join(t.TempDir(), "a.tar.gz")
+		os.WriteFile(path, buf.Bytes(), 0o644)
+		return path
 	}
-	return data
+	dest := t.TempDir()
+	for name, entries := range map[string]map[string]string{
+		"absolute path": {"llama-x/../../evil": ""},
+		"parent escape": {"llama-x/ok": "", "../evil": ""},
+		"abs symlink":   {"llama-x/link": "/etc/passwd"},
+		"two top dirs":  {"a/f": "", "b/f": ""},
+	} {
+		if _, err := ExtractAsset(build(entries), dest); err == nil {
+			t.Errorf("%s: extract accepted unsafe archive", name)
+		}
+	}
+	// sane archive extracts and reports its root
+	root, err := ExtractAsset(build(map[string]string{"llama-b1/llama-server": "", "llama-b1/LICENSE": ""}), dest)
+	if err != nil || root != "llama-b1" {
+		t.Fatalf("sane archive failed: root=%q err=%v", root, err)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "llama-b1", "llama-server")); err != nil {
+		t.Fatal(err)
+	}
 }
