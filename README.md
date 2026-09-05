@@ -128,30 +128,37 @@ pinned manifest digest.
 
 ## llama.cpp versioning & runner releases
 
-The llama.cpp version shardr builds and ships is pinned in
-[`runtime/llama.lock`](runtime/llama.lock) — the single version truth
-(ref + full commit SHA + source-archive SHA-256, parsed fail-closed by
-`internal/llamalock`; no second pin in Makefile or Go constants).
+The llama.cpp runtime shardr ships is pinned in
+[`runtime/llama.lock`](runtime/llama.lock) — the single version truth:
+an upstream **prebuilt b-release** (`bNNNN`) with the full commit SHA and
+per-platform binary-archive SHA-256s, parsed fail-closed by
+`internal/llamalock`. shardr never compiles llama.cpp (owner ruling
+2026-09-05): `make llama` fetches the digest-verified prebuilt binaries.
 
 Two strictly separated channels:
 
-- **Release channel** — a daily check (workflow
-  `llama-upstream-check`) detects new exact `vX.Y.Z` tags and opens a
-  lockfile update PR (old/new ref, both SHAs, upstream compare link,
-  archive digest). Merging that PR — after the build/E2E matrix
-  (Ubuntu x86-64 CPU, macOS Apple Silicon Metal) ran on it — triggers
-  `release-runner`, which publishes
-  `shardr-runner-<shardr-version>-llama-<ref>` bundles with SHA256SUMS,
-  BUILDINFO.json and licenses. Existing releases are never overwritten;
-  same identity with different bytes is a hard error. A moving `latest`
-  is never published.
-- **Canary channel** — `llama-nightly-canary` tests the newest `bNNNN`
-  nightly once a week through the same matrix, never touches the stable
+- **Pin/release channel** — a daily check (workflow
+  `llama-upstream-check`) detects newer b-releases that are **at least 7
+  days old** (community soak filter) and carry the full platform asset
+  matrix, then opens a lockfile update PR (old/new pin, both SHAs,
+  upstream compare link, per-platform digests). Merging that PR — after
+  the digest-verified fetch + real runner E2E matrix (Ubuntu x86-64,
+  macOS Apple Silicon) ran on it — triggers `release-runner`, which
+  publishes `shardr-runner-<shardr-version>-llama-<ref>` bundles: the
+  whole prebuilt runtime dir (dylibs are rpath-relative), SHA256SUMS,
+  BUILDINFO.json and licenses. Bundles are reproducible; existing
+  releases are never overwritten — same identity with different bytes is
+  a hard error. A moving `latest` is never published.
+- **Canary channel** — `llama-nightly-canary` tests the **newest**
+  b-release weekly through the same matrix (no age filter — canary
+  catches breakage before the soak ends), never touches the stable
   lockfile and never publishes a release.
 
-Manual update: `go run ./cmd/llama-lock check-update --write --ref vX.Y.Z`
-(exact tags only), then open a PR against `main`. Verify a lockfile with
-`go run ./cmd/llama-lock validate`.
+Manual update: `go run ./cmd/llama-lock check-update --write --ref bNNNN`
+(exact b-releases, ≥ 7 days old, only), then open a PR against `main`.
+Verify a lockfile with `go run ./cmd/llama-lock validate` and prove its
+provenance (tag → commit, release-API digests) with
+`go run ./cmd/llama-lock verify`.
 
 ## Specifications & documentation
 

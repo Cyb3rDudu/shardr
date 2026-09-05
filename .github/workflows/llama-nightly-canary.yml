@@ -1,6 +1,8 @@
-# Workflow D — weekly nightly canary. Tests the newest bNNNN upstream tag
-# through the SAME build+E2E matrix, but NEVER touches runtime/llama.lock
-# and NEVER creates a stable release. Prerelease channel is a later step.
+# Workflow D — weekly nightly canary. Tests the newest bNNNN upstream
+# release through the SAME digest-verified fetch + E2E matrix, but NEVER
+# touches runtime/llama.lock and NEVER creates a stable release. No age
+# filter here: canary exists to catch breakage BEFORE the 7-day soak
+# ends. Prerelease channel is a later step.
 name: llama nightly canary
 
 on:
@@ -22,11 +24,11 @@ concurrency:
 jobs:
   resolve:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     outputs:
       ref: ${{ steps.pick.outputs.ref }}
       commit: ${{ steps.pick.outputs.commit }}
-      sha256: ${{ steps.pick.outputs.sha256 }}
+      digests: ${{ steps.pick.outputs.digests }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -34,9 +36,15 @@ jobs:
           go-version: "1.25"
       - name: Pick nightly ref (explicit bNNNN or newest upstream)
         id: pick
+        env:
+          CANARY_REF: ${{ inputs.llama_ref }}
         run: |
-          if [ -n "${{ inputs.llama_ref }}" ]; then
-            json=$(go run ./cmd/llama-lock resolve "${{ inputs.llama_ref }}")
+          if [ -n "$CANARY_REF" ]; then
+            case "$CANARY_REF" in
+              b[0-9]*) ;;
+              *) echo "E_REF: canary input must be an exact bNNNN tag, got '$CANARY_REF'" >&2; exit 1 ;;
+            esac
+            json=$(go run ./cmd/llama-lock resolve "$CANARY_REF")
           else
             json=$(go run ./cmd/llama-lock latest-nightly)
           fi
@@ -44,7 +52,7 @@ jobs:
           {
             echo "ref=$(printf '%s' "$json" | python3 -c 'import sys,json;print(json.load(sys.stdin)["ref"])')"
             echo "commit=$(printf '%s' "$json" | python3 -c 'import sys,json;print(json.load(sys.stdin)["commit"])')"
-            echo "sha256=$(printf '%s' "$json" | python3 -c 'import sys,json;print(json.load(sys.stdin)["source_sha256"])')"
+            echo "digests=$(printf '%s' "$json" | python3 -c 'import sys,json;print(json.dumps(json.load(sys.stdin)["asset_sha256"]))')"
           } >> "$GITHUB_OUTPUT"
 
   test:
@@ -52,13 +60,12 @@ jobs:
     uses: ./.github/workflows/llama-build-e2e.yml
     with:
       llama_ref: ${{ needs.resolve.outputs.ref }}
-      llama_commit: ${{ needs.resolve.outputs.commit }}
-      llama_source_sha256: ${{ needs.resolve.outputs.sha256 }}
 
   summary:
     needs: [resolve, test]
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Canary summary
         run: |
@@ -66,7 +73,7 @@ jobs:
             echo "## llama nightly canary"
             echo "- ref: \`${{ needs.resolve.outputs.ref }}\`"
             echo "- commit: \`${{ needs.resolve.outputs.commit }}\`"
-            echo "- source sha256: \`${{ needs.resolve.outputs.sha256 }}\`"
+            echo "- asset digests: \`${{ needs.resolve.outputs.digests }}\`"
             echo "- matrix result: **${{ needs.test.result }}**"
             echo "- lockfile untouched: yes (canary never writes runtime/llama.lock)"
             echo "- stable release: none (canary channel only)"
