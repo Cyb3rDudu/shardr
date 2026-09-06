@@ -1,6 +1,6 @@
 // llama-lock is the single-truth CLI over runtime/llama.lock, used by
 // the Makefile, the CI workflows and humans (manual updates). The pin is
-// an upstream PREBUILT b-release (owner ruling 2026-09-05: never
+// an upstream PREBUILT b-release (project decision 2026-09-05: never
 // self-build); assets are digest-pinned per platform.
 package main
 
@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	llamalock "github.com/Cyb3rDudu/shardr/internal/llamalock"
@@ -34,7 +35,9 @@ commands:
                           with digests straight from the release API
   check-update [--write] [--ref bNNNN]
                           compare latest-pinnable (or --ref) with the lock:
-                          "noop <ref>" or "update <old> <new>"; --write rewrites runtime/llama.lock`)
+                          "noop <ref>" or "update <old> <new>"; --write rewrites
+                          runtime/llama.lock; --allow-downgrade explicitly pins
+                          an OLDER bNNNN (rollback)`)
 	os.Exit(2)
 }
 
@@ -51,14 +54,17 @@ func resolveRef(ctx context.Context, ref string) (resolved, error) {
 	if err != nil {
 		return resolved{}, err
 	}
-	digests, err := llamalock.ReleaseAssets(ctx, ref)
+	// ONE release-API request serves both the digests and the timestamp
+	// (the old shape fetched the release twice).
+	rel, err := llamalock.FetchRelease(ctx, ref)
 	if err != nil {
 		return resolved{}, err
 	}
-	pub, err := llamalock.ReleasePublishedAt(ctx, ref)
+	digests, err := rel.AssetDigests()
 	if err != nil {
 		return resolved{}, err
 	}
+	pub := rel.PublishedAt
 	urls := map[string]string{}
 	for p := range digests {
 		urls[p] = llamalock.AssetURLFor(ref, p)
@@ -106,7 +112,7 @@ func runFetch(ctx context.Context, platform, dest, refOverride string) error {
 	if err := os.MkdirAll(dest, 0o755); err != nil {
 		return err
 	}
-	tarPath, err := llamalock.DownloadAsset(ctx, llamalock.Lock{Assets: map[string]llamalock.Asset{platform: {URL: url, SHA256: sha}}}, platform)
+	tarPath, err := llamalock.DownloadAsset(ctx, url, sha, platform)
 	if err != nil {
 		return err
 	}
@@ -183,7 +189,7 @@ func main() {
 				fatal(fmt.Errorf("E_PROVENANCE: release-API digest for %s is %s, lock pins %s", p, digests[p], lk.Assets[p].SHA256))
 			}
 		}
-		fmt.Printf("provenance OK: %s -> %s (assets verified on darwin_arm64, linux_amd64)\n", lk.Ref, lk.Commit)
+		fmt.Printf("provenance OK: %s -> %s (assets verified on %s)\n", lk.Ref, lk.Commit, strings.Join(llamalock.Platforms, ", "))
 
 	case "fetch":
 		fs := flag.NewFlagSet("fetch", flag.ExitOnError)

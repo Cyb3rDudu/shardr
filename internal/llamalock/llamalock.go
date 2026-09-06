@@ -2,7 +2,7 @@
 // runtime shardr ships. Everything (Makefile, CI workflows, runner
 // diagnostics) reads runtime/llama.lock; there is no second pin.
 //
-// Owner ruling 2026-09-05: shardr NEVER compiles llama.cpp. The runtime
+// Project decision 2026-09-05: shardr NEVER compiles llama.cpp. The runtime
 // is consumed exclusively as upstream prebuilt release binaries,
 // digest-pinned per platform. Stability comes from OUR pin (exact bNNNN
 // + commit + per-platform asset sha256) plus the E2E gate.
@@ -14,7 +14,7 @@ package llamalock
 import (
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
+	cryptoSha256 "crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -360,7 +360,7 @@ type Release struct {
 	} `json:"assets"`
 }
 
-func fetchRelease(ctx context.Context, ref string) (Release, error) {
+func FetchRelease(ctx context.Context, ref string) (Release, error) {
 	url := "https://api.github.com/repos/" + RepoSlug + "/releases/tags/" + ref
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -389,36 +389,32 @@ func fetchRelease(ctx context.Context, ref string) (Release, error) {
 // platform for a b-release (independent truth to cross-check the lock
 // and the download against).
 func ReleaseAssets(ctx context.Context, ref string) (map[string]string, error) {
-	rel, err := fetchRelease(ctx, ref)
+	rel, err := FetchRelease(ctx, ref)
 	if err != nil {
 		return nil, err
 	}
+	return rel.AssetDigests()
+}
+
+// AssetDigests validates and returns the per-platform sha256 digests of
+// the release (every platform asset must exist with a valid digest).
+func (rel Release) AssetDigests() (map[string]string, error) {
 	digests := map[string]string{}
 	for _, a := range rel.Assets {
 		for _, p := range Platforms {
-			if a.Name == fmt.Sprintf(AssetNames[p], ref) {
+			if a.Name == fmt.Sprintf(AssetNames[p], rel.TagName) {
 				d := strings.TrimPrefix(a.Digest, "sha256:")
 				if !sha256Re.MatchString(d) {
-					return nil, fmt.Errorf("release %s: asset %s has no sha256 digest", ref, a.Name)
+					return nil, fmt.Errorf("release %s: asset %s has no sha256 digest", rel.TagName, a.Name)
 				}
 				digests[p] = d
 			}
 		}
 	}
 	if len(digests) != len(Platforms) {
-		return nil, fmt.Errorf("release %s: missing prebuilt assets (got %d/%d)", ref, len(digests), len(Platforms))
+		return nil, fmt.Errorf("release %s: missing prebuilt assets (got %d/%d)", rel.TagName, len(digests), len(Platforms))
 	}
 	return digests, nil
-}
-
-// ReleasePublishedAt returns the release timestamp (for the ≥7-day age
-// filter on pinning).
-func ReleasePublishedAt(ctx context.Context, ref string) (time.Time, error) {
-	rel, err := fetchRelease(ctx, ref)
-	if err != nil {
-		return time.Time{}, err
-	}
-	return rel.PublishedAt.UTC(), nil
 }
 
 // NewestPinnableBRelease returns the newest bNNNN release that is at
@@ -443,7 +439,7 @@ func ValidatePinnableRelease(ctx context.Context, ref string, now time.Time) err
 	if !IsNightly(ref) {
 		return fmt.Errorf("%q is not an exact bNNNN release", ref)
 	}
-	rel, err := fetchRelease(ctx, ref)
+	rel, err := FetchRelease(ctx, ref)
 	if err != nil {
 		return err
 	}
@@ -489,7 +485,7 @@ func newestPinnable(ctx context.Context, now time.Time, pageURL func(int) string
 // judged by the youngest asset: one freshly re-uploaded binary makes
 // the whole release unaged). ok=false if any platform asset (with
 // digest) is missing.
-func releaseAssetMatrix(rel Release) (digests map[string]string, oldest time.Time, ok bool) {
+func releaseAssetMatrix(rel Release) (digests map[string]string, youngest time.Time, ok bool) {
 	digests = map[string]string{}
 	for _, a := range rel.Assets {
 		for _, p := range Platforms {
@@ -500,13 +496,13 @@ func releaseAssetMatrix(rel Release) (digests map[string]string, oldest time.Tim
 				}
 				digests[p] = d
 				u := a.UpdatedAt.UTC()
-				if oldest.IsZero() || u.After(oldest) {
-					oldest = u
+				if youngest.IsZero() || u.After(youngest) {
+					youngest = u
 				}
 			}
 		}
 	}
-	return digests, oldest, len(digests) == len(Platforms)
+	return digests, youngest, len(digests) == len(Platforms)
 }
 
 func fetchReleases(ctx context.Context, url string) ([]Release, error) {
@@ -533,45 +529,41 @@ func fetchReleases(ctx context.Context, url string) ([]Release, error) {
 	return rels, nil
 }
 
-// DownloadAsset fetches the pinned prebuilt archive for platform,
-// streams it through SHA-256 (fail-closed on digest mismatch — no
+// DownloadAsset fetches a prebuilt archive from url, streams it through
+// SHA-256 (fail-closed on digest mismatch against sha256 — no
 // unverified bytes survive) into an exclusive unpredictable temp file
 // and returns its path. The CALLER owns removal after extraction.
-func DownloadAsset(ctx context.Context, lk Lock, platform string) (string, error) {
-	a, ok := lk.Assets[platform]
-	if !ok {
-		return "", fmt.Errorf("no pinned asset for %s", platform)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.URL, nil)
+func DownloadAsset(ctx context.Context, url, sha256, platform string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
 	}
 	resp, err := (&http.Client{Timeout: 10 * time.Minute}).Do(req)
 	if err != nil {
-		return "", fmt.Errorf("download %s: %w", a.URL, err)
+		return "", fmt.Errorf("download %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("download %s: HTTP %d", a.URL, resp.StatusCode)
+		return "", fmt.Errorf("download %s: HTTP %d", url, resp.StatusCode)
 	}
 	f, err := os.CreateTemp("", "llama-asset-*.tar.gz")
 	if err != nil {
 		return "", err
 	}
 	path := f.Name()
-	h := sha256.New()
+	h := cryptoSha256.New()
 	_, err = io.Copy(io.MultiWriter(f, h), io.LimitReader(resp.Body, maxAssetBytes+1))
 	if cerr := f.Close(); err == nil {
 		err = cerr // a failed close means broken bytes on disk
 	}
 	if err != nil {
 		os.Remove(path)
-		return "", fmt.Errorf("download %s: %w", a.URL, err)
+		return "", fmt.Errorf("download %s: %w", url, err)
 	}
 	got := hex.EncodeToString(h.Sum(nil))
-	if got != a.SHA256 {
+	if got != sha256 {
 		os.Remove(path)
-		return "", fmt.Errorf("E_DIGEST: asset sha256 %s != pinned %s for %s", got, a.SHA256, platform)
+		return "", fmt.Errorf("E_DIGEST: asset sha256 %s != pinned %s for %s", got, sha256, platform)
 	}
 	return path, nil
 }
@@ -588,16 +580,10 @@ func newGzipReader(r io.Reader) (*gzip.Reader, error) { return gzip.NewReader(r)
 // HostPlatform maps GOOS/GOARCH onto the supported runner platforms —
 // the ONE mapping truth (the Makefile just calls this).
 func HostPlatform() (string, error) {
-	arch := runtime.GOARCH
-	switch arch {
-	case "amd64":
-		arch = "amd64"
-	case "arm64":
-		arch = "arm64"
-	default:
+	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
 		return "", fmt.Errorf("unsupported architecture %q (want arm64/amd64)", runtime.GOARCH)
 	}
-	p := runtime.GOOS + "_" + arch
+	p := runtime.GOOS + "_" + runtime.GOARCH
 	for _, x := range Platforms {
 		if x == p {
 			return p, nil

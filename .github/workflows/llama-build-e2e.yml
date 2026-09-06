@@ -2,7 +2,7 @@
 # Reusable (workflow_call) so the release pipeline and the nightly canary
 # run the EXACT same matrix the lockfile PR is gated on.
 #
-# Owner ruling 2026-09-05: shardr NEVER compiles llama.cpp. The runtime is
+# Project decision 2026-09-05: shardr NEVER compiles llama.cpp. The runtime is
 # consumed as upstream prebuilt release binaries, digest-pinned per
 # platform in runtime/llama.lock. No CMake, no compilers: minutes, not
 # hours.
@@ -87,6 +87,7 @@ jobs:
         run: |
           BIN="$(ls -d "$PWD"/.llama-bin/llama-b*/llama-server)"
           probe() {
+            command -v timeout >/dev/null 2>&1 || { echo "E_PROBE: timeout missing on runner" >&2; exit 1; }
             out="$(timeout 15 "$BIN" "$@" 2>&1 || true)"
             if grep -qiE 'invalid argument|unrecognized' <<<"$out"; then
               echo "E_CONTRACT: llama-server rejected $*: $out" >&2
@@ -105,6 +106,9 @@ jobs:
           go build ./...
           go vet ./...
           go test ./...
+
+      - name: Makefile deploy wiring check
+        run: bash scripts/check-make-llama.sh
 
       - name: Cache pinned E2E model
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4

@@ -81,7 +81,7 @@ func ExtractAsset(tarPath, destDir string) (string, error) {
 		}
 		// entries are extracted RELATIVE to the top level; the temp dir
 		// is renamed onto destDir/<prefix> after full success
-		if err := extractEntryAt(rootFd, strings.TrimPrefix(clean, prefix+"/"), hdr, tr); err != nil {
+		if err := extractEntryAt(rootFd, strings.TrimPrefix(clean, prefix+"/"), hdr, tr, prefix); err != nil {
 			return fail(err)
 		}
 	}
@@ -167,24 +167,30 @@ func openUnderRoot(rootFd int, clean string) (int, error) {
 // directory component is opened with Openat(O_NOFOLLOW|O_DIRECTORY),
 // the leaf file is created with O_CREAT|O_EXCL|O_NOFOLLOW. A path whose
 // component is (or becomes) a symlink is refused by the kernel.
-func extractEntryAt(rootFd int, name string, hdr *tar.Header, tr *tar.Reader) error {
+func extractEntryAt(rootFd int, name string, hdr *tar.Header, tr *tar.Reader, prefix string) error {
 	comps := strings.Split(filepath.ToSlash(name), "/")
 	base := comps[len(comps)-1]
 	if base == "" { // trailing-slash dir entry
 		comps, base = comps[:len(comps)-1], comps[len(comps)-2]
 	}
 	dirFd := rootFd
+	closeDir := func() {
+		if dirFd != rootFd {
+			unix.Close(dirFd)
+			dirFd = rootFd
+		}
+	}
 	for _, c := range comps[:len(comps)-1] {
 		if err := unix.Mkdirat(dirFd, c, 0o755); err != nil && !errors.Is(err, unix.EEXIST) {
+			closeDir()
 			return fmt.Errorf("extract: mkdir %q: %w", c, err)
 		}
 		nfd, err := unix.Openat(dirFd, c, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
 		if err != nil {
+			closeDir()
 			return fmt.Errorf("extract: open dir %q refused (symlink component?): %w", c, err)
 		}
-		if dirFd != rootFd {
-			unix.Close(dirFd)
-		}
+		closeDir()
 		dirFd = nfd
 	}
 	defer func() {
@@ -218,15 +224,19 @@ func extractEntryAt(rootFd int, name string, hdr *tar.Header, tr *tar.Reader) er
 			return fmt.Errorf("extract: symlink %q: %w", name, err)
 		}
 	case tar.TypeLink:
-		// TAR SEMANTICS: hardlink targets are ARCHIVE-ROOT-relative —
-		// NOT relative to the link's directory (that is symlink semantics
-		// and would let "../victim" escape the FD root: the path check
-		// would accept it while Openat(rootFd, "../victim") reaches
-		// outside the temp tree). Reject absolute targets and any ".."
-		// outright, then open the target component-wise FD-anchored.
+		// TAR SEMANTICS: hardlink targets are ARCHIVE-ROOT-relative
+		// INCLUDING the top-level prefix ("llama-b1/bin/llama-server"),
+		// while entries are extracted prefix-stripped. Require the prefix,
+		// strip it, THEN reject absolute targets and any ".." outright,
+		// and open the target component-wise FD-anchored below rootFd
+		// (never with a path the kernel would walk outside the temp tree).
 		target := filepath.ToSlash(filepath.Clean(hdr.Linkname))
+		if !strings.HasPrefix(target, prefix+"/") {
+			return fmt.Errorf("extract: unsafe hardlink %q => %q (target must be archive-root-relative under %s/)", name, hdr.Linkname, prefix)
+		}
+		target = strings.TrimPrefix(target, prefix+"/")
 		if target == "" || target == "." || strings.HasPrefix(target, "/") || target == ".." || strings.HasPrefix(target, "../") || strings.Contains(target, "/../") {
-			return fmt.Errorf("extract: unsafe hardlink %q => %q (must be root-relative, no ..)", name, hdr.Linkname)
+			return fmt.Errorf("extract: unsafe hardlink %q => %q (must stay under the extract root, no ..)", name, hdr.Linkname)
 		}
 		tgtFd, err := openUnderRoot(rootFd, target)
 		if err != nil {
