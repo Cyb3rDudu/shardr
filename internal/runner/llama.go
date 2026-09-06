@@ -15,7 +15,7 @@ import (
 	"github.com/Cyb3rDudu/shardr/internal/llamalock"
 )
 
-// LlamaPin is the llama.cpp release `make llama` builds, read from
+// LlamaPin is the llama.cpp release `make llama` fetches, read from
 // runtime/llama.lock — the SINGLE version truth (no second pin).
 func LlamaPin() string { return llamalock.RefOf() }
 
@@ -57,7 +57,7 @@ func ResolveBinary() (string, error) {
 	if p, err := exec.LookPath("llama-server"); err == nil {
 		return p, nil
 	}
-	return "", fmt.Errorf("E_BINARY: no llama-server binary found — set $SHARDR_LLAMA_SERVER, run `make llama` (builds the pinned llama.cpp %s into bin/), or install llama-server on $PATH", LlamaPin())
+	return "", fmt.Errorf("E_BINARY: no llama-server binary found — set $SHARDR_LLAMA_SERVER, run `make llama` (fetches the pinned prebuilt llama.cpp %s into bin/), or install llama-server on $PATH", LlamaPin())
 }
 
 // freePort reserves an ephemeral loopback port (listen :0, close). The

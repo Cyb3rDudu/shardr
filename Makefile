@@ -2,7 +2,7 @@ BIN ?= bin
 
 # llama.cpp pin lives in runtime/llama.lock — the SINGLE version truth
 # (fail-closed parser in internal/llamalock; no second pin anywhere).
-# Runtime = upstream PREBUILT b-release binaries (owner ruling
+# Runtime = upstream PREBUILT b-release binaries (project decision
 # 2026-09-05: never self-build). The whole extract dir is kept:
 # llama-server loads its dylibs via @loader_path.
 LLAMA_VERSION = $(shell go run ./cmd/llama-lock ref)

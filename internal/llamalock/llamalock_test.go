@@ -138,10 +138,10 @@ func TestDownloadAssetDigestRefusal(t *testing.T) {
 		w.Write(payload)
 	}))
 	defer srv.Close()
-	lk := Lock{Assets: map[string]Asset{
-		"darwin_arm64": {Platform: "darwin_arm64", URL: srv.URL + "/asset.tar.gz", SHA256: "0000000000000000000000000000000000000000000000000000000000000000"},
-	}}
-	path, err := DownloadAsset(context.Background(), lk, "darwin_arm64")
+	url := srv.URL + "/asset.tar.gz"
+	// snapshot the temp dir: a refused download must leave NO new file
+	before, _ := filepath.Glob(filepath.Join(os.TempDir(), "llama-asset-*"))
+	path, err := DownloadAsset(context.Background(), url, strings.Repeat("0", 64), "darwin_arm64")
 	if err == nil {
 		t.Fatal("digest mismatch must fail")
 	}
@@ -151,20 +151,19 @@ func TestDownloadAssetDigestRefusal(t *testing.T) {
 	if path != "" {
 		t.Errorf("refused asset must not return a path, got %q", path)
 	}
-	if _, statErr := os.Stat(path); statErr == nil {
-		t.Error("refused asset must not remain on disk")
+	after, _ := filepath.Glob(filepath.Join(os.TempDir(), "llama-asset-*"))
+	if strings.Join(after, ",") != strings.Join(before, ",") {
+		t.Errorf("refused download leaked a temp asset: before=%v after=%v", before, after)
 	}
 	// positive control: matching digest passes, temp path is unpredictable
 	h := sha256.Sum256(payload)
-	a := lk.Assets["darwin_arm64"]
-	a.SHA256 = hex.EncodeToString(h[:])
-	lk.Assets["darwin_arm64"] = a
-	p1, err := DownloadAsset(context.Background(), lk, "darwin_arm64")
+	good := hex.EncodeToString(h[:])
+	p1, err := DownloadAsset(context.Background(), url, good, "darwin_arm64")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.Remove(p1)
-	p2, err := DownloadAsset(context.Background(), lk, "darwin_arm64")
+	p2, err := DownloadAsset(context.Background(), url, good, "darwin_arm64")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,13 +182,13 @@ func TestSingleTruthLockfile(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, bad := range []string{"LLAMA_VERSION := v", "LLAMA_VERSION ?= v", "LLAMA_VERSION := b", `LlamaPin = "v`, `LlamaPin = "b`} {
+		for _, bad := range []string{"LLAMA_VERSION := v", "LLAMA_VERSION ?= v", "LLAMA_VERSION = v", "LLAMA_VERSION := b", "LLAMA_VERSION ?= b", "LLAMA_VERSION = b", `LlamaPin = "v`, `LlamaPin = "b`} {
 			if strings.Contains(string(data), bad) {
 				t.Errorf("%s contains a second version pin (%q)", src, bad)
 			}
 		}
 		if strings.Contains(string(data), "cmake ") || strings.Contains(string(data), "LLAMA_BUILD_") {
-			t.Errorf("%s still self-builds llama.cpp (owner ruling: prebuilt only)", src)
+			t.Errorf("%s still self-builds llama.cpp (project decision: prebuilt only)", src)
 		}
 	}
 	root, err := FindRepoRoot()
@@ -344,8 +343,6 @@ func TestParseRejectsDuplicates(t *testing.T) {
 	dupSha := strings.Replace(base, `[assets.linux_amd64]`, "[assets.linux_amd64]\nsha256 = \""+strings.Repeat("a", 64)+"\"", 1)
 	dupURL := strings.Replace(base, `[assets.linux_amd64]`, "[assets.linux_amd64]\nurl = \"https://github.com/ggml-org/llama.cpp/releases/download/b10684/llama-b10684-bin-ubuntu-x64.tar.gz\"", 1)
 	dupSection := base + "\n[assets.darwin_arm64]\nurl = \"https://github.com/ggml-org/llama.cpp/releases/download/b10684/llama-b10684-bin-macos-arm64.tar.gz\"\nsha256 = \"" + strings.Repeat("8", 64) + "\"\n"
-	dupTop := strings.Replace(base, `ref = "b10684"`, `ref = "b10684"`+"\n"+"ref2 = \"b1\"", 1)
-	_ = dupTop
 	for name, doc := range map[string]string{
 		"duplicate sha256":    dupSha,
 		"duplicate url":       dupURL,
@@ -479,6 +476,43 @@ func TestExtractHardlinkRootEscapePoC(t *testing.T) {
 	}
 }
 
+// TestExtractHardlinkTarConvention: GNU tar writes hardlink targets
+// ARCHIVE-ROOT-relative INCLUDING the top-level prefix ("llama-b1/bin/
+// llama-server") while entries are extracted prefix-stripped — the
+// extractor must strip the prefix and link to the already-extracted file.
+func TestExtractHardlinkTarConvention(t *testing.T) {
+	dest := t.TempDir()
+	root, err := ExtractAsset(buildTar(t, [3]string{
+		"llama-b1/bin/llama-server",
+		"llama-b1/bin/llama-cli=>llama-b1/bin/llama-server",
+		"",
+	}), dest)
+	if err != nil {
+		t.Fatalf("tar-convention hardlink must extract: %v", err)
+	}
+	if root != "llama-b1" {
+		t.Fatalf("root = %q, want llama-b1", root)
+	}
+	fi1, err1 := os.Stat(filepath.Join(dest, "llama-b1", "bin", "llama-server"))
+	fi2, err2 := os.Stat(filepath.Join(dest, "llama-b1", "bin", "llama-cli"))
+	if err1 != nil || err2 != nil {
+		t.Fatalf("hardlink/stat failed: %v %v", err1, err2)
+	}
+	if !os.SameFile(fi1, fi2) {
+		t.Error("llama-cli must be a hardlink (same inode) as llama-server")
+	}
+	// and the same convention outside the prefix stays refused
+	for bad, entries := range map[string][3]string{
+		"no prefix":       {"llama-b1/bin/ok", "llama-b1/bin/h=>bin/ok", ""},
+		"parent escape":   {"llama-b1/victim", "llama-b1/d/hard=>../victim", ""},
+		"cross top-level": {"b1/f", "b1/h=>b2/f", ""},
+	} {
+		if _, err := ExtractAsset(buildTar(t, entries), t.TempDir()); err == nil {
+			t.Errorf("%s: extractor accepted unsafe hardlink target", bad)
+		}
+	}
+}
+
 // TestValidatePinnableRelFreshAsset: an OLD release timestamp with a
 // FRESHLY re-uploaded asset must NOT be pinnable — this is exactly the
 // hole the manual --ref path used to leave open.
@@ -521,7 +555,7 @@ func TestGitignoreCoversBin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, need := range []string{"bin/", "llama-server"} {
+	for _, need := range []string{"bin/", ".llama-bin/"} {
 		if !strings.Contains(string(gi), need) {
 			t.Errorf(".gitignore must cover %q (make llama artifacts must stay untracked)", need)
 		}

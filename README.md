@@ -44,7 +44,7 @@ node (see [Synchronization & integrity](#synchronization--integrity)).
 ```sh
 go build -o sh-bin/shardr ./cmd/shardr
 go build -o sh-bin/shardhive ./cmd/shardhive
-make llama        # builds the llama-server pinned in runtime/llama.lock into bin/
+make llama        # fetches the prebuilt llama-server pinned in runtime/llama.lock into bin/
                   # or: any llama-server in $PATH, or $SHARDR_LLAMA_SERVER
 ```
 
@@ -132,7 +132,7 @@ The llama.cpp runtime shardr ships is pinned in
 [`runtime/llama.lock`](runtime/llama.lock) — the single version truth:
 an upstream **prebuilt b-release** (`bNNNN`) with the full commit SHA and
 per-platform binary-archive SHA-256s, parsed fail-closed by
-`internal/llamalock`. shardr never compiles llama.cpp (owner ruling
+`internal/llamalock`. shardr never compiles llama.cpp (project decision
 2026-09-05): `make llama` fetches the digest-verified prebuilt binaries.
 
 Two strictly separated channels:
@@ -156,7 +156,9 @@ Two strictly separated channels:
 
 Manual update: `go run ./cmd/llama-lock check-update --write --ref bNNNN`
 (exact b-releases, ≥ 7 days old, only), then open a PR against `main`.
-Verify a lockfile with `go run ./cmd/llama-lock validate` and prove its
+Rolling the pin back to an older b-release needs the explicit
+`--allow-downgrade` flag. Verify a lockfile with
+`go run ./cmd/llama-lock validate` and prove its
 provenance (tag → commit, release-API digests) with
 `go run ./cmd/llama-lock verify`.
 
