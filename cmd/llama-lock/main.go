@@ -125,6 +125,35 @@ func runFetch(ctx context.Context, platform, dest, refOverride string) error {
 	return nil
 }
 
+// parseFetchArgs accepts --ref BEFORE or AFTER the two positional args
+// (the standard Go flag package stops at the first positional, which
+// silently broke the documented `fetch <platform> <destdir> --ref bN`
+// syntax — canary dispatches used exactly that order).
+func parseFetchArgs(args []string) (platform, dest, ref string, err error) {
+	var pos []string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--ref", "-ref":
+			if i+1 >= len(args) {
+				return "", "", "", fmt.Errorf("--ref needs a value")
+			}
+			i++
+			ref = args[i]
+		case "--ref=*", "-ref=*":
+			ref = strings.TrimPrefix(args[i], "--ref=")
+		default:
+			if strings.HasPrefix(args[i], "-") && args[i] != "-" && !strings.Contains(args[i], "=") {
+				return "", "", "", fmt.Errorf("unknown flag %q", args[i])
+			}
+			pos = append(pos, args[i])
+		}
+	}
+	if len(pos) != 2 {
+		return "", "", "", fmt.Errorf("fetch wants exactly <platform> <destdir> (+ optional --ref bNNNN), got %d positional args", len(pos))
+	}
+	return pos[0], pos[1], ref, nil
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -192,14 +221,11 @@ func main() {
 		fmt.Printf("provenance OK: %s -> %s (assets verified on %s)\n", lk.Ref, lk.Commit, strings.Join(llamalock.Platforms, ", "))
 
 	case "fetch":
-		fs := flag.NewFlagSet("fetch", flag.ExitOnError)
-		ref := fs.String("ref", "", "canary override: exact bNNNN release (digests from the release API)")
-		fs.Parse(args)
-		if fs.NArg() != 2 {
-			usage()
+		platform, dest, ref, err := parseFetchArgs(args)
+		if err != nil {
+			fatal(err)
 		}
-		platform, dest := fs.Arg(0), fs.Arg(1)
-		if err := runFetch(ctx, platform, dest, *ref); err != nil {
+		if err := runFetch(ctx, platform, dest, ref); err != nil {
 			fatal(err)
 		}
 
@@ -215,15 +241,11 @@ func main() {
 		printJSON(r)
 
 	case "latest-pinnable":
-		tag, err := llamalock.NewestPinnableBRelease(ctx, time.Now())
+		p, err := llamalock.NewestPinnableBRelease(ctx, time.Now())
 		if err != nil {
 			fatal(err)
 		}
-		r, err := resolveRef(ctx, tag)
-		if err != nil {
-			fatal(err)
-		}
-		printJSON(r)
+		printJSON(pinnableToResolved(p))
 
 	case "resolve":
 		fs := flag.NewFlagSet("resolve", flag.ExitOnError)
@@ -247,21 +269,25 @@ func main() {
 		if err != nil {
 			fatal(err)
 		}
-		var latest string
+		// Both paths validate the release ONCE and write exactly the
+		// validated snapshot's digests — a second fetch between soak
+		// check and lock write would be a TOCTOU hole (swapped asset
+		// digests entering the pin unsoaked).
+		var pin llamalock.Pinnable
 		if *ref != "" {
-			// Same gate as the automatic selection: complete asset matrix
-			// AND per-asset soak (youngest asset updated_at >= MinAge).
-			if err := llamalock.ValidatePinnableRelease(ctx, *ref, time.Now()); err != nil {
+			p, err := llamalock.ValidatePinnableRelease(ctx, *ref, time.Now())
+			if err != nil {
 				fatal(fmt.Errorf("--ref rejected: %w", err))
 			}
-			latest = *ref
+			pin = p
 		} else {
-			latest, err = llamalock.NewestPinnableBRelease(ctx, time.Now())
+			p, err := llamalock.NewestPinnableBRelease(ctx, time.Now())
 			if err != nil {
 				fatal(err)
 			}
+			pin = p
 		}
-		update, err := llamalock.Decide(lk.Ref, latest, *allowDown)
+		update, err := llamalock.Decide(lk.Ref, pin.Ref, *allowDown)
 		if err != nil {
 			fatal(err)
 		}
@@ -269,29 +295,34 @@ func main() {
 			fmt.Printf("noop %s\n", lk.Ref)
 			return
 		}
-		r, err := resolveRef(ctx, latest)
-		if err != nil {
-			fatal(err)
-		}
 		if *write {
 			root, err := llamalock.FindRepoRoot()
 			if err != nil {
 				fatal(err)
 			}
-			nl := llamalock.Lock{Ref: r.Ref, Commit: r.Commit, UpdatedAt: llamalock.Now()}
+			nl := llamalock.Lock{Ref: pin.Ref, Commit: pin.Commit, UpdatedAt: llamalock.Now()}
 			nl.Assets = map[string]llamalock.Asset{}
 			for _, p := range llamalock.Platforms {
-				nl.Assets[p] = llamalock.Asset{Platform: p, URL: llamalock.AssetURLFor(r.Ref, p), SHA256: r.SourceSHA256[p]}
+				nl.Assets[p] = llamalock.Asset{Platform: p, URL: llamalock.AssetURLFor(pin.Ref, p), SHA256: pin.Digests[p]}
 			}
 			if err := os.WriteFile(filepath.Join(root, llamalock.Path), nl.Format(), 0o644); err != nil {
 				fatal(err)
 			}
 		}
-		fmt.Printf("update %s %s\n", lk.Ref, r.Ref)
+		fmt.Printf("update %s %s\n", lk.Ref, pin.Ref)
 
 	default:
 		usage()
 	}
+}
+
+// pinnableToResolved renders a validated snapshot in the resolved-JSON shape.
+func pinnableToResolved(p llamalock.Pinnable) resolved {
+	urls := map[string]string{}
+	for plat := range p.Digests {
+		urls[plat] = llamalock.AssetURLFor(p.Ref, plat)
+	}
+	return resolved{Ref: p.Ref, Commit: p.Commit, SourceSHA256: p.Digests, Assets: urls}
 }
 
 func fatal(err error) {

@@ -150,10 +150,12 @@ jobs:
           cp -R .llama-bin/llama-b*/ dist/llama-dist/
           cp llama-version.txt dist/
           go build -o dist/shardr ./cmd/shardr
+          # upload-artifact v4 loses the exec bit on download — ship a tar
+          tar -czf runner-bin.tar.gz -C dist .
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: runner-bin-${{ matrix.platform }}
           retention-days: 7
-          path: dist/
+          path: runner-bin.tar.gz
           if-no-files-found: error

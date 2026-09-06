@@ -417,92 +417,120 @@ func (rel Release) AssetDigests() (map[string]string, error) {
 	return digests, nil
 }
 
-// NewestPinnableBRelease returns the newest bNNNN release that is at
-// least MinAge old and carries all platform assets. Soak age is judged
-// by the ASSET updated_at (freshly re-uploaded binaries on an old
-// release must not count as aged), not the release published_at.
-// b-releases ship ~30/day, so the 7-day window needs a few pages of the
-// newest-first list.
-func NewestPinnableBRelease(ctx context.Context, now time.Time) (string, error) {
-	return newestPinnable(ctx, now, func(page int) string {
-		return fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=100&page=%d", RepoSlug, page)
-	})
+// Pinnable is a FULLY VALIDATED release snapshot: the exact digests of
+// the response that passed the soak+matrix validation. Lock writes must
+// use exactly these digests — never a second, later fetch (TOCTOU: an
+// asset swapped between validation and write would smuggle a fresh,
+// unsoaked digest into the pin).
+type Pinnable struct {
+	Ref     string
+	Commit  string
+	Digests map[string]string // platform -> sha256 of the validated response
 }
 
-// ValidatePinnableRelease proves a b-release is pinnable: exact bNNNN
-// tag, complete platform asset matrix WITH digests, and the YOUNGEST
-// asset updated_at at least MinAge old (soak is judged per asset — a
-// freshly re-uploaded binary on an old release does not count as aged).
+// NewestPinnableBRelease returns the newest bNNNN release that is at
+// least MinAge old and carries all platform assets, as a validated
+// snapshot. Soak age is judged by the ASSET updated_at (freshly
+// re-uploaded binaries on an old release must not count as aged), not
+// the release published_at. b-releases ship ~30/day, so the 7-day
+// window needs a few pages of the newest-first list.
+func NewestPinnableBRelease(ctx context.Context, now time.Time) (Pinnable, error) {
+	return newestPinnable(ctx, now, func(page int) string {
+		return fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=100&page=%d", RepoSlug, page)
+	}, ResolveTag)
+}
+
+// ValidatePinnableRelease proves a b-release is pinnable — exact bNNNN
+// tag, complete platform asset matrix WITH digests, youngest asset
+// updated_at at least MinAge old — and returns the validated snapshot.
 // BOTH the automatic selection and the manual --ref path go through
 // this one function; there is no second, weaker check.
-func ValidatePinnableRelease(ctx context.Context, ref string, now time.Time) error {
+func ValidatePinnableRelease(ctx context.Context, ref string, now time.Time) (Pinnable, error) {
 	if !IsNightly(ref) {
-		return fmt.Errorf("%q is not an exact bNNNN release", ref)
+		return Pinnable{}, fmt.Errorf("%q is not an exact bNNNN release", ref)
 	}
 	rel, err := FetchRelease(ctx, ref)
 	if err != nil {
-		return err
+		return Pinnable{}, err
 	}
-	return validatePinnableRel(rel, now)
+	digests, err := pinnableDigests(rel, now)
+	if err != nil {
+		return Pinnable{}, err
+	}
+	commit, err := ResolveTag(ctx, ref)
+	if err != nil {
+		return Pinnable{}, err
+	}
+	return Pinnable{Ref: rel.TagName, Commit: commit, Digests: digests}, nil
 }
 
-// validatePinnableRel is the pure core of ValidatePinnableRelease.
-func validatePinnableRel(rel Release, now time.Time) error {
-	if !IsNightly(rel.TagName) {
-		return fmt.Errorf("%q is not an exact bNNNN release", rel.TagName)
+// soakedMatrix returns the per-platform digests and the YOUNGEST asset
+// updated_at (one freshly re-uploaded binary makes the whole release
+// unaged). ok=false if any platform asset is missing, lacks a digest,
+// or carries a missing/null updated_at (Go zero time must never look
+// ancient — that would pass the soak vacuously).
+func (rel Release) soakedMatrix(now time.Time) (digests map[string]string, youngest time.Time, ok bool) {
+	digests = map[string]string{}
+	for _, a := range rel.Assets {
+		for _, p := range Platforms {
+			if a.Name != fmt.Sprintf(AssetNames[p], rel.TagName) {
+				continue
+			}
+			d := strings.TrimPrefix(a.Digest, "sha256:")
+			if !sha256Re.MatchString(d) {
+				return nil, time.Time{}, false
+			}
+			u := a.UpdatedAt.UTC()
+			if u.IsZero() {
+				return nil, time.Time{}, false
+			}
+			digests[p] = d
+			if youngest.IsZero() || u.After(youngest) {
+				youngest = u
+			}
+		}
 	}
-	_, youngest, ok := releaseAssetMatrix(rel)
+	return digests, youngest, len(digests) == len(Platforms)
+}
+
+// pinnableDigests is the pure core: matrix completeness + per-asset soak.
+func pinnableDigests(rel Release, now time.Time) (map[string]string, error) {
+	if !IsNightly(rel.TagName) {
+		return nil, fmt.Errorf("%q is not an exact bNNNN release", rel.TagName)
+	}
+	digests, youngest, ok := rel.soakedMatrix(now)
 	if !ok {
-		return fmt.Errorf("release %s: incomplete prebuilt asset matrix", rel.TagName)
+		return nil, fmt.Errorf("release %s: incomplete or unverified prebuilt asset matrix (missing digest or missing/null asset updated_at)", rel.TagName)
 	}
 	if age := now.Sub(youngest); age < MinAge {
-		return fmt.Errorf("release %s: youngest asset is only %s old (soak window %s) — assets updated %s", rel.TagName, age.Truncate(time.Minute), MinAge, youngest.Format(time.RFC3339))
+		return nil, fmt.Errorf("release %s: youngest asset is only %s old (soak window %s) — assets updated %s", rel.TagName, age.Truncate(time.Minute), MinAge, youngest.Format(time.RFC3339))
 	}
-	return nil
+	return digests, nil
 }
 
-func newestPinnable(ctx context.Context, now time.Time, pageURL func(int) string) (string, error) {
+func newestPinnable(ctx context.Context, now time.Time, pageURL func(int) string, resolve func(context.Context, string) (string, error)) (Pinnable, error) {
 	for page := 1; page <= 10; page++ {
 		rels, err := fetchReleases(ctx, pageURL(page))
 		if err != nil {
-			return "", err
+			return Pinnable{}, err
 		}
 		if len(rels) == 0 {
 			break
 		}
 		for _, rel := range rels {
-			if err := validatePinnableRel(rel, now); err != nil {
+			digests, err := pinnableDigests(rel, now)
+			if err != nil {
 				continue // not pinnable (wrong tag, matrix, or soak)
 			}
-			return rel.TagName, nil
-		}
-	}
-	return "", fmt.Errorf("no b-release older than %s with a complete asset matrix found", MinAge)
-}
-
-// releaseAssetMatrix returns the per-platform digests of a release and
-// the NEWEST asset updated_at across the required platforms (soak is
-// judged by the youngest asset: one freshly re-uploaded binary makes
-// the whole release unaged). ok=false if any platform asset (with
-// digest) is missing.
-func releaseAssetMatrix(rel Release) (digests map[string]string, youngest time.Time, ok bool) {
-	digests = map[string]string{}
-	for _, a := range rel.Assets {
-		for _, p := range Platforms {
-			if a.Name == fmt.Sprintf(AssetNames[p], rel.TagName) {
-				d := strings.TrimPrefix(a.Digest, "sha256:")
-				if !sha256Re.MatchString(d) {
-					return nil, time.Time{}, false
-				}
-				digests[p] = d
-				u := a.UpdatedAt.UTC()
-				if youngest.IsZero() || u.After(youngest) {
-					youngest = u
-				}
+			// commit proof once, for the validated snapshot only
+			commit, err := resolve(ctx, rel.TagName)
+			if err != nil {
+				continue
 			}
+			return Pinnable{Ref: rel.TagName, Commit: commit, Digests: digests}, nil
 		}
 	}
-	return digests, youngest, len(digests) == len(Platforms)
+	return Pinnable{}, fmt.Errorf("no b-release older than %s with a complete asset matrix found", MinAge)
 }
 
 func fetchReleases(ctx context.Context, url string) ([]Release, error) {
