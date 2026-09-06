@@ -94,7 +94,7 @@ jobs:
             local pid=$!
             ( sleep 15 && kill -TERM "$pid" 2>/dev/null ) & local killer=$!
             wait "$pid" 2>/dev/null || true
-            kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null || true
+            kill "$killer" 2>/dev/null || true; wait "$killer" 2>/dev/null || true
             if grep -qiE 'invalid argument|unrecognized' "$out_file"; then
               echo "E_CONTRACT: llama-server rejected $*: $(cat "$out_file")" >&2
               rm -f "$out_file"; exit 1
