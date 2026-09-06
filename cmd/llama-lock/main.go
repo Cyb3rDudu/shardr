@@ -132,20 +132,24 @@ func runFetch(ctx context.Context, platform, dest, refOverride string) error {
 func parseFetchArgs(args []string) (platform, dest, ref string, err error) {
 	var pos []string
 	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--ref", "-ref":
+		a := args[i]
+		switch {
+		case a == "--ref" || a == "-ref":
 			if i+1 >= len(args) {
 				return "", "", "", fmt.Errorf("--ref needs a value")
 			}
 			i++
 			ref = args[i]
-		case "--ref=*", "-ref=*":
-			ref = strings.TrimPrefix(args[i], "--ref=")
+		case strings.HasPrefix(a, "--ref="):
+			ref = strings.TrimPrefix(a, "--ref=")
+		case strings.HasPrefix(a, "-ref="):
+			ref = strings.TrimPrefix(a, "-ref=")
+		case strings.HasPrefix(a, "-") && a != "-":
+			// no "=" exemption: any other -x=y token is unknown, never a
+			// silently ignored positional (e.g. a mistyped --ref= dest)
+			return "", "", "", fmt.Errorf("unknown flag %q", a)
 		default:
-			if strings.HasPrefix(args[i], "-") && args[i] != "-" && !strings.Contains(args[i], "=") {
-				return "", "", "", fmt.Errorf("unknown flag %q", args[i])
-			}
-			pos = append(pos, args[i])
+			pos = append(pos, a)
 		}
 	}
 	if len(pos) != 2 {
@@ -300,11 +304,7 @@ func main() {
 			if err != nil {
 				fatal(err)
 			}
-			nl := llamalock.Lock{Ref: pin.Ref, Commit: pin.Commit, UpdatedAt: llamalock.Now()}
-			nl.Assets = map[string]llamalock.Asset{}
-			for _, p := range llamalock.Platforms {
-				nl.Assets[p] = llamalock.Asset{Platform: p, URL: llamalock.AssetURLFor(pin.Ref, p), SHA256: pin.Digests[p]}
-			}
+			nl := lockFromPin(pin, llamalock.Now())
 			if err := os.WriteFile(filepath.Join(root, llamalock.Path), nl.Format(), 0o644); err != nil {
 				fatal(err)
 			}
@@ -316,13 +316,32 @@ func main() {
 	}
 }
 
-// pinnableToResolved renders a validated snapshot in the resolved-JSON shape.
+// pinnableToResolved renders a validated snapshot in the resolved-JSON
+// shape. published_at carries the youngest asset updated_at of the
+// validated response (that is the timestamp the soak judged).
 func pinnableToResolved(p llamalock.Pinnable) resolved {
 	urls := map[string]string{}
 	for plat := range p.Digests {
 		urls[plat] = llamalock.AssetURLFor(p.Ref, plat)
 	}
-	return resolved{Ref: p.Ref, Commit: p.Commit, SourceSHA256: p.Digests, Assets: urls}
+	pub := ""
+	if !p.YoungestAsset.IsZero() {
+		pub = p.YoungestAsset.Format(time.RFC3339)
+	}
+	return resolved{Ref: p.Ref, Commit: p.Commit, PublishedAt: pub, SourceSHA256: p.Digests, Assets: urls}
+}
+
+// lockFromPin renders the new lock from a validated snapshot: EXACTLY
+// the digests of the validated API response, never a second fetch (a
+// re-fetch between soak check and write could pin unsoaked bytes —
+// the TOCTOU this function structurally prevents).
+func lockFromPin(pin llamalock.Pinnable, updatedAt string) llamalock.Lock {
+	lk := llamalock.Lock{Ref: pin.Ref, Commit: pin.Commit, UpdatedAt: updatedAt}
+	lk.Assets = map[string]llamalock.Asset{}
+	for _, p := range llamalock.Platforms {
+		lk.Assets[p] = llamalock.Asset{Platform: p, URL: llamalock.AssetURLFor(pin.Ref, p), SHA256: pin.Digests[p]}
+	}
+	return lk
 }
 
 func fatal(err error) {

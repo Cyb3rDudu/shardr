@@ -14,7 +14,7 @@ package llamalock
 import (
 	"compress/gzip"
 	"context"
-	cryptoSha256 "crypto/sha256"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -423,9 +423,10 @@ func (rel Release) AssetDigests() (map[string]string, error) {
 // asset swapped between validation and write would smuggle a fresh,
 // unsoaked digest into the pin).
 type Pinnable struct {
-	Ref     string
-	Commit  string
-	Digests map[string]string // platform -> sha256 of the validated response
+	Ref           string
+	Commit        string
+	Digests       map[string]string // platform -> sha256 of the validated response
+	YoungestAsset time.Time         // youngest asset updated_at of that same response
 }
 
 // NewestPinnableBRelease returns the newest bNNNN release that is at
@@ -453,7 +454,7 @@ func ValidatePinnableRelease(ctx context.Context, ref string, now time.Time) (Pi
 	if err != nil {
 		return Pinnable{}, err
 	}
-	digests, err := pinnableDigests(rel, now)
+	digests, youngest, err := pinnableDigests(rel, now)
 	if err != nil {
 		return Pinnable{}, err
 	}
@@ -461,7 +462,7 @@ func ValidatePinnableRelease(ctx context.Context, ref string, now time.Time) (Pi
 	if err != nil {
 		return Pinnable{}, err
 	}
-	return Pinnable{Ref: rel.TagName, Commit: commit, Digests: digests}, nil
+	return Pinnable{Ref: rel.TagName, Commit: commit, Digests: digests, YoungestAsset: youngest}, nil
 }
 
 // soakedMatrix returns the per-platform digests and the YOUNGEST asset
@@ -469,7 +470,7 @@ func ValidatePinnableRelease(ctx context.Context, ref string, now time.Time) (Pi
 // unaged). ok=false if any platform asset is missing, lacks a digest,
 // or carries a missing/null updated_at (Go zero time must never look
 // ancient — that would pass the soak vacuously).
-func (rel Release) soakedMatrix(now time.Time) (digests map[string]string, youngest time.Time, ok bool) {
+func (rel Release) soakedMatrix() (digests map[string]string, youngest time.Time, ok bool) {
 	digests = map[string]string{}
 	for _, a := range rel.Assets {
 		for _, p := range Platforms {
@@ -493,19 +494,21 @@ func (rel Release) soakedMatrix(now time.Time) (digests map[string]string, young
 	return digests, youngest, len(digests) == len(Platforms)
 }
 
-// pinnableDigests is the pure core: matrix completeness + per-asset soak.
-func pinnableDigests(rel Release, now time.Time) (map[string]string, error) {
+// pinnableDigests is the pure core: matrix completeness + per-asset
+// soak. It returns the validated digests AND the youngest asset
+// updated_at of the very same response (the snapshot timestamp).
+func pinnableDigests(rel Release, now time.Time) (map[string]string, time.Time, error) {
 	if !IsNightly(rel.TagName) {
-		return nil, fmt.Errorf("%q is not an exact bNNNN release", rel.TagName)
+		return nil, time.Time{}, fmt.Errorf("%q is not an exact bNNNN release", rel.TagName)
 	}
-	digests, youngest, ok := rel.soakedMatrix(now)
+	digests, youngest, ok := rel.soakedMatrix()
 	if !ok {
-		return nil, fmt.Errorf("release %s: incomplete or unverified prebuilt asset matrix (missing digest or missing/null asset updated_at)", rel.TagName)
+		return nil, time.Time{}, fmt.Errorf("release %s: incomplete or unverified prebuilt asset matrix (missing digest or missing/null asset updated_at)", rel.TagName)
 	}
 	if age := now.Sub(youngest); age < MinAge {
-		return nil, fmt.Errorf("release %s: youngest asset is only %s old (soak window %s) — assets updated %s", rel.TagName, age.Truncate(time.Minute), MinAge, youngest.Format(time.RFC3339))
+		return nil, time.Time{}, fmt.Errorf("release %s: youngest asset is only %s old (soak window %s) — assets updated %s", rel.TagName, age.Truncate(time.Minute), MinAge, youngest.Format(time.RFC3339))
 	}
-	return digests, nil
+	return digests, youngest, nil
 }
 
 func newestPinnable(ctx context.Context, now time.Time, pageURL func(int) string, resolve func(context.Context, string) (string, error)) (Pinnable, error) {
@@ -518,16 +521,18 @@ func newestPinnable(ctx context.Context, now time.Time, pageURL func(int) string
 			break
 		}
 		for _, rel := range rels {
-			digests, err := pinnableDigests(rel, now)
+			digests, youngest, err := pinnableDigests(rel, now)
 			if err != nil {
 				continue // not pinnable (wrong tag, matrix, or soak)
 			}
-			// commit proof once, for the validated snapshot only
+			// commit proof once, for the validated snapshot only. A
+			// resolve failure here is FATAL: silently continuing would
+			// pin an OLDER release while claiming "newest".
 			commit, err := resolve(ctx, rel.TagName)
 			if err != nil {
-				continue
+				return Pinnable{}, fmt.Errorf("newest pinnable %s: resolving commit: %w", rel.TagName, err)
 			}
-			return Pinnable{Ref: rel.TagName, Commit: commit, Digests: digests}, nil
+			return Pinnable{Ref: rel.TagName, Commit: commit, Digests: digests, YoungestAsset: youngest}, nil
 		}
 	}
 	return Pinnable{}, fmt.Errorf("no b-release older than %s with a complete asset matrix found", MinAge)
@@ -558,10 +563,10 @@ func fetchReleases(ctx context.Context, url string) ([]Release, error) {
 }
 
 // DownloadAsset fetches a prebuilt archive from url, streams it through
-// SHA-256 (fail-closed on digest mismatch against sha256 — no
+// SHA-256 (fail-closed on digest mismatch against wantSHA — no
 // unverified bytes survive) into an exclusive unpredictable temp file
 // and returns its path. The CALLER owns removal after extraction.
-func DownloadAsset(ctx context.Context, url, sha256, platform string) (string, error) {
+func DownloadAsset(ctx context.Context, url, wantSHA, platform string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
@@ -579,7 +584,7 @@ func DownloadAsset(ctx context.Context, url, sha256, platform string) (string, e
 		return "", err
 	}
 	path := f.Name()
-	h := cryptoSha256.New()
+	h := sha256.New()
 	_, err = io.Copy(io.MultiWriter(f, h), io.LimitReader(resp.Body, maxAssetBytes+1))
 	if cerr := f.Close(); err == nil {
 		err = cerr // a failed close means broken bytes on disk
@@ -589,9 +594,9 @@ func DownloadAsset(ctx context.Context, url, sha256, platform string) (string, e
 		return "", fmt.Errorf("download %s: %w", url, err)
 	}
 	got := hex.EncodeToString(h.Sum(nil))
-	if got != sha256 {
+	if got != wantSHA {
 		os.Remove(path)
-		return "", fmt.Errorf("E_DIGEST: asset sha256 %s != pinned %s for %s", got, sha256, platform)
+		return "", fmt.Errorf("E_DIGEST: asset sha256 %s != pinned %s for %s", got, wantSHA, platform)
 	}
 	return path, nil
 }
