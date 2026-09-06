@@ -1,23 +1,13 @@
 BIN ?= bin
 
-# llama.cpp version comes from runtime/llama.lock — the SINGLE version
-# truth (parsed fail-closed by internal/llamalock; no second pin here).
-# Lazily expanded so targets that never use the version (clean, deploy)
-# don't compile Go on every make invocation.
+# llama.cpp pin lives in runtime/llama.lock — the SINGLE version truth
+# (fail-closed parser in internal/llamalock; no second pin anywhere).
+# Runtime = upstream PREBUILT b-release binaries (owner ruling
+# 2026-09-05: never self-build). The whole extract dir is kept:
+# llama-server loads its dylibs via @loader_path.
 LLAMA_VERSION = $(shell go run ./cmd/llama-lock ref)
+LLAMA_PLATFORM = $(shell go run ./cmd/llama-lock platform)
 LLAMA_SERVER := $(BIN)/llama-server
-
-.PHONY: all llama build-llama deploy-llama check-llama-deploy clean test
-
-all: llama
-
-# llama fetches the PINNED prebuilt llama.cpp release binaries
-# (runtime/llama.lock — single truth; owner ruling: never self-build)
-# into BIN. The whole extract dir is kept: llama-server loads its dylibs
-# via @loader_path, a lone binary is useless on macOS.
-LLAMA_VERSION = $(shell go run ./cmd/llama-lock ref)
-LLAMA_SERVER := $(BIN)/llama-server
-LLAMA_PLATFORM := $(shell uname -s | tr '[:upper:]' '[:lower:]')_$(shell uname -m | tr '[:upper:]' '[:lower:]')
 
 .PHONY: all llama fetch-llama deploy-llama check-llama-deploy clean test
 
@@ -32,15 +22,20 @@ fetch-llama:
 	go run ./cmd/llama-lock fetch $(LLAMA_PLATFORM) $(BIN)
 
 # deploy-llama links the fetched llama-server into BIN root (ResolveBinary
-# finds it next to the shardr executable). Its own target so the
-# fresh-checkout mechanics test can exercise the link WITHOUT the download.
+# finds it next to the shardr executable). Exact pinned path, no globs:
+# a missing fetch is a loud error, never a silent wildcard match. Its own
+# target so the fresh-checkout mechanics test can exercise the link
+# WITHOUT the download.
 deploy-llama:
 	@mkdir -p $(BIN)
-	ln -sf $$(basename $$(dirname $$(ls -d $(BIN)/llama-b*/llama-server | head -1)))/llama-server $(LLAMA_SERVER)
+	@test -x "$(BIN)/llama-$(LLAMA_VERSION)/llama-server" || { echo "E_DEPLOY: $(BIN)/llama-$(LLAMA_VERSION)/llama-server missing — run 'make fetch-llama' first (pin: $(LLAMA_VERSION))" >&2; exit 1; }
+	ln -sf llama-$(LLAMA_VERSION)/llama-server $(LLAMA_SERVER)
 	@echo ">> $(LLAMA_SERVER) ready (pin: $(LLAMA_VERSION))"
 
 # check-llama-deploy: fresh-checkout mechanics in a TEMP tree (never
-# touches the repo's real bin/ or .llama-build).
+# touches the repo's real bin/ — a developer-run `make llama` may
+# legitimately populate it; isolation is proven by the byte-identical
+# before/after check below).
 check-llama-deploy:
 	@bash scripts/check-make-llama.sh
 
@@ -48,4 +43,4 @@ test:
 	go test ./...
 
 clean:
-	rm -rf $(BIN)
+	rm -rf $(BIN) .llama-bin
