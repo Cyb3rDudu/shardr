@@ -52,9 +52,21 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: runner-bin-${{ matrix.platform }}
-          path: dist
+      - name: Restore dist (artifact tars preserve the exec bit)
+        run: |
+          mkdir -p dist
+          tar -xzf runner-bin.tar.gz -C dist
+          # hard gate: a non-executable binary in a published bundle is a
+          # release blocker, not a packaging detail
+          test -x dist/shardr
+          test -x dist/llama-dist/llama-server
       - name: Bundle (reproducible)
         run: bash scripts/make-runner-bundle.sh "${{ matrix.platform }}" dist out
+      - name: Smoke the bundle (executables must actually run)
+        run: |
+          tar -xzf out/shardr-runner_*_${{ matrix.platform }}.tar.gz -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/shardr-runner/llama/llama-server" --version
+          test -x "$RUNNER_TEMP/shardr-runner/shardr"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: runner-dist-${{ matrix.platform }}
