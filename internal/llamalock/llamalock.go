@@ -12,7 +12,6 @@
 package llamalock
 
 import (
-	"archive/tar"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -26,6 +25,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -85,10 +85,13 @@ func AssetURLFor(ref, platform string) string {
 
 // Parse validates and parses lockfile bytes. Fail-closed: every field
 // must be present, exactly once, in canonical form; exactly the known
-// platforms must be pinned.
+// platforms must be pinned; any duplicate key, header or section is a
+// hard error (no silent last-one-wins).
 func Parse(data []byte) (Lock, error) {
 	var lk Lock
 	seen := map[string]bool{}
+	seenSections := map[string]bool{}
+	seenAssetKeys := map[string]map[string]bool{}
 	platform := ""
 	for i, raw := range strings.Split(string(data), "\n") {
 		line := strings.TrimSuffix(raw, "\r")
@@ -97,6 +100,14 @@ func Parse(data []byte) (Lock, error) {
 		}
 		if m := assetHdrRe.FindStringSubmatch(line); m != nil {
 			platform = m[1]
+			if !validPlatform(platform) {
+				return Lock{}, fmt.Errorf("llama.lock:%d: unknown platform %q", i+1, platform)
+			}
+			if seenSections[platform] {
+				return Lock{}, fmt.Errorf("llama.lock:%d: duplicate section [assets.%s]", i+1, platform)
+			}
+			seenSections[platform] = true
+			seenAssetKeys[platform] = map[string]bool{}
 			continue
 		}
 		m := lockLineRe.FindStringSubmatch(line)
@@ -108,13 +119,14 @@ func Parse(data []byte) (Lock, error) {
 			if lk.Assets == nil {
 				lk.Assets = map[string]Asset{}
 			}
+			if seenAssetKeys[platform][k] {
+				return Lock{}, fmt.Errorf("llama.lock:%d: duplicate key %q in [assets.%s]", i+1, k, platform)
+			}
+			seenAssetKeys[platform][k] = true
 			a := lk.Assets[platform]
 			a.Platform = platform
 			switch k {
 			case "url":
-				if !validPlatform(platform) {
-					return Lock{}, fmt.Errorf("llama.lock:%d: unknown platform %q", i+1, platform)
-				}
 				if v != AssetURLFor(lk.Ref, platform) {
 					return Lock{}, fmt.Errorf("llama.lock:%d: asset url %q is not the canonical ggml-org release URL for %s/%s", i+1, v, lk.Ref, platform)
 				}
@@ -242,16 +254,26 @@ func IsNightly(ref string) bool { return nightlyRe.MatchString(ref) }
 // stable releases attach no binaries).
 func IsStable(ref string) bool { return stableTagRe.MatchString(ref) }
 
-// Decide is the pure update decision for the pin: same ref → no update;
+// Decide is the pure update decision for the pin: same ref or an older
+// bNNNN → no update (a downgrade needs an explicit --allow-downgrade);
 // anything that is not bNNNN → hard error.
-func Decide(current, latest string) (update bool, err error) {
+func Decide(current, latest string, allowDowngrade bool) (update bool, err error) {
 	if !IsNightly(latest) {
 		return false, fmt.Errorf("refusing pin update to %q: not an exact bNNNN release", latest)
 	}
 	if latest == current {
 		return false, nil
 	}
+	if bnum(latest) <= bnum(current) && !allowDowngrade {
+		return false, nil // older (or re-pin of same number) — not an update
+	}
 	return true, nil
+}
+
+// bnum extracts the numeric part of a bNNNN ref (0 if malformed).
+func bnum(ref string) int {
+	n, _ := strconv.Atoi(strings.TrimPrefix(ref, "b"))
+	return n
 }
 
 // LSRemote runs git ls-remote against upstream (tag→commit proof).
@@ -332,8 +354,9 @@ type Release struct {
 	TagName     string    `json:"tag_name"`
 	PublishedAt time.Time `json:"published_at"`
 	Assets      []struct {
-		Name   string `json:"name"`
-		Digest string `json:"digest"` // "sha256:…"
+		Name      string    `json:"name"`
+		Digest    string    `json:"digest"` // "sha256:…"
+		UpdatedAt time.Time `json:"updated_at"`
 	} `json:"assets"`
 }
 
@@ -399,97 +422,158 @@ func ReleasePublishedAt(ctx context.Context, ref string) (time.Time, error) {
 }
 
 // NewestPinnableBRelease returns the newest bNNNN release that is at
-// least MinAge old (community soak time) and carries all platform
-// assets. b-releases ship ~30/day, so the 7-day window needs a few
-// pages of the newest-first release list.
+// least MinAge old and carries all platform assets. Soak age is judged
+// by the ASSET updated_at (freshly re-uploaded binaries on an old
+// release must not count as aged), not the release published_at.
+// b-releases ship ~30/day, so the 7-day window needs a few pages of the
+// newest-first list.
 func NewestPinnableBRelease(ctx context.Context, now time.Time) (string, error) {
+	return newestPinnable(ctx, now, func(page int) string {
+		return fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=100&page=%d", RepoSlug, page)
+	})
+}
+
+// ValidatePinnableRelease proves a b-release is pinnable: exact bNNNN
+// tag, complete platform asset matrix WITH digests, and the YOUNGEST
+// asset updated_at at least MinAge old (soak is judged per asset — a
+// freshly re-uploaded binary on an old release does not count as aged).
+// BOTH the automatic selection and the manual --ref path go through
+// this one function; there is no second, weaker check.
+func ValidatePinnableRelease(ctx context.Context, ref string, now time.Time) error {
+	if !IsNightly(ref) {
+		return fmt.Errorf("%q is not an exact bNNNN release", ref)
+	}
+	rel, err := fetchRelease(ctx, ref)
+	if err != nil {
+		return err
+	}
+	return validatePinnableRel(rel, now)
+}
+
+// validatePinnableRel is the pure core of ValidatePinnableRelease.
+func validatePinnableRel(rel Release, now time.Time) error {
+	if !IsNightly(rel.TagName) {
+		return fmt.Errorf("%q is not an exact bNNNN release", rel.TagName)
+	}
+	_, youngest, ok := releaseAssetMatrix(rel)
+	if !ok {
+		return fmt.Errorf("release %s: incomplete prebuilt asset matrix", rel.TagName)
+	}
+	if age := now.Sub(youngest); age < MinAge {
+		return fmt.Errorf("release %s: youngest asset is only %s old (soak window %s) — assets updated %s", rel.TagName, age.Truncate(time.Minute), MinAge, youngest.Format(time.RFC3339))
+	}
+	return nil
+}
+
+func newestPinnable(ctx context.Context, now time.Time, pageURL func(int) string) (string, error) {
 	for page := 1; page <= 10; page++ {
-		url := fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=100&page=%d", RepoSlug, page)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		rels, err := fetchReleases(ctx, pageURL(page))
 		if err != nil {
 			return "", err
-		}
-		req.Header.Set("Accept", "application/vnd.github+json")
-		if tok := os.Getenv("GITHUB_TOKEN"); tok != "" {
-			req.Header.Set("Authorization", "Bearer "+tok)
-		}
-		resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
-		if err != nil {
-			return "", fmt.Errorf("release api: %w", err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			return "", fmt.Errorf("release api: HTTP %d", resp.StatusCode)
-		}
-		var rels []Release
-		err = json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(&rels)
-		resp.Body.Close()
-		if err != nil {
-			return "", fmt.Errorf("release api: %w", err)
 		}
 		if len(rels) == 0 {
 			break
 		}
 		for _, rel := range rels {
-			if !IsNightly(rel.TagName) {
-				continue
+			if err := validatePinnableRel(rel, now); err != nil {
+				continue // not pinnable (wrong tag, matrix, or soak)
 			}
-			if now.Sub(rel.PublishedAt.UTC()) < MinAge {
-				continue // too fresh to pin
-			}
-			digests := map[string]string{}
-			for _, a := range rel.Assets {
-				for _, p := range Platforms {
-					if a.Name == fmt.Sprintf(AssetNames[p], rel.TagName) {
-						digests[p] = strings.TrimPrefix(a.Digest, "sha256:")
-					}
-				}
-			}
-			if len(digests) == len(Platforms) {
-				return rel.TagName, nil
-			}
+			return rel.TagName, nil
 		}
 	}
 	return "", fmt.Errorf("no b-release older than %s with a complete asset matrix found", MinAge)
 }
 
-// DownloadAsset fetches the pinned prebuilt archive for platform,
-// streams it through SHA-256 (fail-closed on digest mismatch — no
-// unverified bytes on disk), writes it to dest and returns the extract
-// root directory name inside the archive.
-func DownloadAsset(ctx context.Context, lk Lock, platform, dest string) error {
-	a, ok := lk.Assets[platform]
-	if !ok {
-		return fmt.Errorf("no pinned asset for %s", platform)
+// releaseAssetMatrix returns the per-platform digests of a release and
+// the NEWEST asset updated_at across the required platforms (soak is
+// judged by the youngest asset: one freshly re-uploaded binary makes
+// the whole release unaged). ok=false if any platform asset (with
+// digest) is missing.
+func releaseAssetMatrix(rel Release) (digests map[string]string, oldest time.Time, ok bool) {
+	digests = map[string]string{}
+	for _, a := range rel.Assets {
+		for _, p := range Platforms {
+			if a.Name == fmt.Sprintf(AssetNames[p], rel.TagName) {
+				d := strings.TrimPrefix(a.Digest, "sha256:")
+				if !sha256Re.MatchString(d) {
+					return nil, time.Time{}, false
+				}
+				digests[p] = d
+				u := a.UpdatedAt.UTC()
+				if oldest.IsZero() || u.After(oldest) {
+					oldest = u
+				}
+			}
+		}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.URL, nil)
+	return digests, oldest, len(digests) == len(Platforms)
+}
+
+func fetchReleases(ctx context.Context, url string) ([]Release, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	resp, err := (&http.Client{Timeout: 10 * time.Minute}).Do(req)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	if tok := os.Getenv("GITHUB_TOKEN"); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
 	if err != nil {
-		return fmt.Errorf("download %s: %w", a.URL, err)
+		return nil, fmt.Errorf("release api: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download %s: HTTP %d", a.URL, resp.StatusCode)
+		return nil, fmt.Errorf("release api: HTTP %d", resp.StatusCode)
 	}
-	f, err := os.Create(dest)
+	var rels []Release
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(&rels); err != nil {
+		return nil, fmt.Errorf("release api: %w", err)
+	}
+	return rels, nil
+}
+
+// DownloadAsset fetches the pinned prebuilt archive for platform,
+// streams it through SHA-256 (fail-closed on digest mismatch — no
+// unverified bytes survive) into an exclusive unpredictable temp file
+// and returns its path. The CALLER owns removal after extraction.
+func DownloadAsset(ctx context.Context, lk Lock, platform string) (string, error) {
+	a, ok := lk.Assets[platform]
+	if !ok {
+		return "", fmt.Errorf("no pinned asset for %s", platform)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.URL, nil)
 	if err != nil {
-		return err
+		return "", err
 	}
+	resp, err := (&http.Client{Timeout: 10 * time.Minute}).Do(req)
+	if err != nil {
+		return "", fmt.Errorf("download %s: %w", a.URL, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("download %s: HTTP %d", a.URL, resp.StatusCode)
+	}
+	f, err := os.CreateTemp("", "llama-asset-*.tar.gz")
+	if err != nil {
+		return "", err
+	}
+	path := f.Name()
 	h := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(resp.Body, maxAssetBytes+1)); err != nil {
-		f.Close()
-		return fmt.Errorf("download %s: %w", a.URL, err)
+	_, err = io.Copy(io.MultiWriter(f, h), io.LimitReader(resp.Body, maxAssetBytes+1))
+	if cerr := f.Close(); err == nil {
+		err = cerr // a failed close means broken bytes on disk
 	}
-	f.Close()
+	if err != nil {
+		os.Remove(path)
+		return "", fmt.Errorf("download %s: %w", a.URL, err)
+	}
 	got := hex.EncodeToString(h.Sum(nil))
 	if got != a.SHA256 {
-		os.Remove(dest)
-		return fmt.Errorf("E_DIGEST: asset sha256 %s != pinned %s for %s", got, a.SHA256, platform)
+		os.Remove(path)
+		return "", fmt.Errorf("E_DIGEST: asset sha256 %s != pinned %s for %s", got, a.SHA256, platform)
 	}
-	return nil
+	return path, nil
 }
 
 // maxAssetBytes bounds asset downloads (real archives are ~10–20 MB).
@@ -498,79 +582,26 @@ const maxAssetBytes = 512 << 20
 // Now returns the canonical timestamp for updated_at.
 func Now() string { return time.Now().UTC().Format(time.RFC3339) }
 
-// ExtractAsset safely unpacks a verified tar.gz: every entry must live
-// under exactly one top-level directory, no absolute paths, no "..",
-// no symlink escaping its directory. Returns the extract root dir name.
-func ExtractAsset(tarPath, destDir string) (string, error) {
-	f, err := os.Open(tarPath)
-	if err != nil {
-		return "", err
+// newGzipReader is split out so extract_unix stays testable.
+func newGzipReader(r io.Reader) (*gzip.Reader, error) { return gzip.NewReader(r) }
+
+// HostPlatform maps GOOS/GOARCH onto the supported runner platforms —
+// the ONE mapping truth (the Makefile just calls this).
+func HostPlatform() (string, error) {
+	arch := runtime.GOARCH
+	switch arch {
+	case "amd64":
+		arch = "amd64"
+	case "arm64":
+		arch = "arm64"
+	default:
+		return "", fmt.Errorf("unsupported architecture %q (want arm64/amd64)", runtime.GOARCH)
 	}
-	defer f.Close()
-	gz, err := gzip.NewReader(f)
-	if err != nil {
-		return "", fmt.Errorf("extract: %w", err)
-	}
-	defer gz.Close()
-	tr := tar.NewReader(gz)
-	prefix := ""
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return "", fmt.Errorf("extract: %w", err)
-		}
-		clean := filepath.ToSlash(filepath.Clean(hdr.Name))
-		if strings.HasPrefix(clean, "/") || strings.HasPrefix(clean, "..") || strings.Contains(clean, "/../") || clean == ".." {
-			return "", fmt.Errorf("extract: unsafe entry %q", hdr.Name)
-		}
-		head := strings.SplitN(clean, "/", 2)[0]
-		if prefix == "" {
-			prefix = head
-		} else if head != prefix {
-			return "", fmt.Errorf("extract: multiple top-level entries (%q vs %q)", head, prefix)
-		}
-		if hdr.Typeflag == tar.TypeSymlink || hdr.Typeflag == tar.TypeLink {
-			target := filepath.ToSlash(filepath.Clean(hdr.Linkname))
-			if strings.HasPrefix(target, "/") {
-				return "", fmt.Errorf("extract: unsafe link %q -> %q", hdr.Name, hdr.Linkname)
-			}
-		}
-		target := filepath.Join(destDir, filepath.FromSlash(clean))
-		switch hdr.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0o755); err != nil {
-				return "", err
-			}
-		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return "", err
-			}
-			out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(hdr.Mode)&0o777|0o400)
-			if err != nil {
-				return "", err
-			}
-			if _, err := io.Copy(out, tr); err != nil {
-				out.Close()
-				return "", err
-			}
-			out.Close()
-		case tar.TypeSymlink:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return "", err
-			}
-			os.Remove(target)
-			if err := os.Symlink(hdr.Linkname, target); err != nil {
-				return "", err
-			}
-		default:
-			return "", fmt.Errorf("extract: unsupported entry type %q in %q", string(hdr.Typeflag), hdr.Name)
+	p := runtime.GOOS + "_" + arch
+	for _, x := range Platforms {
+		if x == p {
+			return p, nil
 		}
 	}
-	if prefix == "" {
-		return "", errors.New("extract: empty archive")
-	}
-	return prefix, nil
+	return "", fmt.Errorf("unsupported platform %q (want %v)", p, Platforms)
 }

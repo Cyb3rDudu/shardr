@@ -21,6 +21,7 @@ func usage() {
 
 commands:
   ref                     print the pinned bNNNN release
+  platform                print the shardr platform for this host (goos_goarch)
   validate [file]         fail-closed lockfile validation (default runtime/llama.lock)
   verify                  provenance proof: tag -> locked commit AND the GitHub
                           release API digests match the pinned asset sha256s
@@ -105,8 +106,8 @@ func runFetch(ctx context.Context, platform, dest, refOverride string) error {
 	if err := os.MkdirAll(dest, 0o755); err != nil {
 		return err
 	}
-	tarPath := filepath.Join(os.TempDir(), fmt.Sprintf("llama-asset-%s.tar.gz", platform))
-	if err := llamalock.DownloadAsset(ctx, llamalock.Lock{Assets: map[string]llamalock.Asset{platform: {URL: url, SHA256: sha}}}, platform, tarPath); err != nil {
+	tarPath, err := llamalock.DownloadAsset(ctx, llamalock.Lock{Assets: map[string]llamalock.Asset{platform: {URL: url, SHA256: sha}}}, platform)
+	if err != nil {
 		return err
 	}
 	defer os.Remove(tarPath)
@@ -133,6 +134,13 @@ func main() {
 			fatal(err)
 		}
 		fmt.Println(lk.Ref)
+
+	case "platform":
+		p, err := llamalock.HostPlatform()
+		if err != nil {
+			fatal(err)
+		}
+		fmt.Println(p)
 
 	case "validate":
 		path := llamalock.Path
@@ -227,6 +235,7 @@ func main() {
 		fs := flag.NewFlagSet("check-update", flag.ExitOnError)
 		write := fs.Bool("write", false, "rewrite runtime/llama.lock on change")
 		ref := fs.String("ref", "", "manual override: exact bNNNN release, must be >=7 days old")
+		allowDown := fs.Bool("allow-downgrade", false, "explicit rollback: allow pinning an OLDER bNNNN")
 		fs.Parse(args)
 		lk, err := llamalock.Load()
 		if err != nil {
@@ -234,15 +243,10 @@ func main() {
 		}
 		var latest string
 		if *ref != "" {
-			if !llamalock.IsNightly(*ref) {
-				fatal(fmt.Errorf("--ref %q rejected: pin accepts exact bNNNN releases only", *ref))
-			}
-			pub, err := llamalock.ReleasePublishedAt(ctx, *ref)
-			if err != nil {
-				fatal(err)
-			}
-			if time.Since(pub) < llamalock.MinAge {
-				fatal(fmt.Errorf("--ref %q rejected: released %s, pin requires >= %s soak time", *ref, pub.Format(time.RFC3339), llamalock.MinAge))
+			// Same gate as the automatic selection: complete asset matrix
+			// AND per-asset soak (youngest asset updated_at >= MinAge).
+			if err := llamalock.ValidatePinnableRelease(ctx, *ref, time.Now()); err != nil {
+				fatal(fmt.Errorf("--ref rejected: %w", err))
 			}
 			latest = *ref
 		} else {
@@ -251,7 +255,7 @@ func main() {
 				fatal(err)
 			}
 		}
-		update, err := llamalock.Decide(lk.Ref, latest)
+		update, err := llamalock.Decide(lk.Ref, latest, *allowDown)
 		if err != nil {
 			fatal(err)
 		}

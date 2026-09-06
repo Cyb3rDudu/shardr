@@ -11,10 +11,10 @@ cd "$(git rev-parse --show-toplevel)"
 repo_before="$(find bin .llama-bin -type f -exec shasum {} + 2>/dev/null | sort | sha256sum || true)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-mkdir -p "$TMP/bin/llama-bTEST"
-printf '#!/bin/sh\nfake-llama-server\n' > "$TMP/bin/llama-bTEST/llama-server"
-chmod +x "$TMP/bin/llama-bTEST/llama-server"
-BIN="$TMP/bin" make deploy-llama >/dev/null
+mkdir -p "$TMP/bin/llama-bTEST0"
+printf '#!/bin/sh\nfake-llama-server\n' > "$TMP/bin/llama-bTEST0/llama-server"
+chmod +x "$TMP/bin/llama-bTEST0/llama-server"
+make BIN="$TMP/bin" LLAMA_VERSION=bTEST0 deploy-llama >/dev/null
 test -x "$TMP/bin/llama-server"
 grep -q fake-llama-server "$TMP/bin/llama-server/" 2>/dev/null || grep -q fake-llama-server "$(readlink -f "$TMP/bin/llama-server" 2>/dev/null || readlink "$TMP/bin/llama-server")"
 # (isolation is proven by the byte-identical before/after check below —

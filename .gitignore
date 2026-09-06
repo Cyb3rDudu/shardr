@@ -1,3 +1,7 @@
 /shardr
 /shardhive
 .llama-build/
+
+# fetched prebuilt llama runtime (make llama) — never committable
+bin/
+bin/llama-server
