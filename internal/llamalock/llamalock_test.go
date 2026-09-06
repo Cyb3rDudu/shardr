@@ -244,8 +244,14 @@ func TestExtractAssetTraversalSafe(t *testing.T) {
 	if err != nil || root != "llama-b1" {
 		t.Fatalf("sane archive failed: root=%q err=%v", root, err)
 	}
-	if _, err := os.Stat(filepath.Join(dest, "llama-b1", "llama-server")); err != nil {
+	fi, err := os.Stat(filepath.Join(dest, "llama-b1", "llama-server"))
+	if err != nil {
 		t.Fatal(err)
+	}
+	// a 0755 tar entry must land with its exec bit intact (publishable
+	// bundles depend on it — upload-artifact would mask a regression)
+	if fi.Mode()&0o111 == 0 {
+		t.Errorf("0755 entry extracted as %v: exec bit lost", fi.Mode())
 	}
 }
 
@@ -529,17 +535,17 @@ func TestValidatePinnableRelFreshAsset(t *testing.T) {
 			{Name: "llama-b10000-bin-ubuntu-x64.tar.gz", Digest: "sha256:" + d, UpdatedAt: parseTime(linuxAge)},
 		}}
 	}
-	if _, err := pinnableDigests(mk("2026-08-20T00:00:00Z", "2026-08-25T00:00:00Z"), now); err != nil {
+	if _, _, err := pinnableDigests(mk("2026-08-20T00:00:00Z", "2026-08-25T00:00:00Z"), now); err != nil {
 		t.Errorf("fully aged release must be pinnable: %v", err)
 	}
 	// old release published_at, one asset uploaded MINUTES ago → refuse
-	if _, err := pinnableDigests(mk("2026-08-20T00:00:00Z", "2026-09-05T11:55:00Z"), now); err == nil {
+	if _, _, err := pinnableDigests(mk("2026-08-20T00:00:00Z", "2026-09-05T11:55:00Z"), now); err == nil {
 		t.Error("freshly re-uploaded asset must NOT be pinnable (per-asset soak)")
 	}
 	// missing platform asset → refuse
 	r := mk("2026-08-20T00:00:00Z", "2026-08-25T00:00:00Z")
 	r.Assets = r.Assets[:1]
-	if _, err := pinnableDigests(r, now); err == nil {
+	if _, _, err := pinnableDigests(r, now); err == nil {
 		t.Error("incomplete asset matrix must not be pinnable")
 	}
 }
@@ -578,14 +584,14 @@ func TestSoakFailClosedOnMissingUpdatedAt(t *testing.T) {
 		if err := json.Unmarshal([]byte(body), &rels); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := pinnableDigests(rels[0], now); err == nil {
+		if _, _, err := pinnableDigests(rels[0], now); err == nil {
 			t.Errorf("%s updated_at: release must be unpinnable (fail closed), was accepted", name)
 		}
 	}
 	// control: same release WITH real old timestamps is pinnable
 	var rels []Release
 	json.Unmarshal([]byte(`[{"tag_name":"b1","assets":[{"name":"llama-b1-bin-macos-arm64.tar.gz","digest":"sha256:`+d+`","updated_at":"2026-08-01T00:00:00Z"},{"name":"llama-b1-bin-ubuntu-x64.tar.gz","digest":"sha256:`+d+`","updated_at":"2026-08-01T00:00:00Z"}]}]`), &rels)
-	if _, err := pinnableDigests(rels[0], now); err != nil {
+	if _, _, err := pinnableDigests(rels[0], now); err != nil {
 		t.Errorf("aged control must be pinnable: %v", err)
 	}
 }

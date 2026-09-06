@@ -78,6 +78,7 @@ jobs:
         run: |
           BIN="$(ls -d "$PWD"/.llama-bin/llama-b*/llama-server)"
           "$BIN" --version | tee llama-version.txt
+          echo "LLAMA_SERVER_BIN=$BIN" >> "$GITHUB_ENV"
 
       # CLI contract per spec 002 §5.7: probe-start llama-server with each
       # argv flag the runner maps (§7.1). An "invalid argument" /
@@ -85,7 +86,7 @@ jobs:
       # upstream-internal and version-dependent.
       - name: Argv contract probes (002 §5.7)
         run: |
-          BIN="$(ls -d "$PWD"/.llama-bin/llama-b*/llama-server)"
+          BIN="$LLAMA_SERVER_BIN"
           # portable bounded run (macOS runners have no GNU timeout):
           # background + timed TERM; the probe judges stderr/stdout, not the exit
           probe() {
@@ -140,14 +141,16 @@ jobs:
       - name: Real runner E2E (shardr → llama-server)
         run: |
           SHARDR_E2E_REAL=1 \
-          SHARDR_LLAMA_SERVER="$(ls -d "$PWD"/.llama-bin/llama-b*/llama-server)" \
+          SHARDR_LLAMA_SERVER="$LLAMA_SERVER_BIN" \
           SHARDR_E2E_MODEL="$PWD/model.gguf" \
           go test ./internal/cli -run TestRealBinaryE2E -v -timeout 15m
 
       - name: Stage prebuilt runtime + shardr (short-lived CI artifacts)
         run: |
-          mkdir -p dist
-          cp -R .llama-bin/llama-b*/ dist/llama-dist/
+          mkdir -p dist/llama-dist
+          # contents idiom ("/." suffix): copy INTO the existing dir,
+          # independent of whether it pre-existed
+          cp -R .llama-bin/llama-b*/. dist/llama-dist/
           cp llama-version.txt dist/
           go build -o dist/shardr ./cmd/shardr
           # upload-artifact v4 loses the exec bit on download — ship a tar
