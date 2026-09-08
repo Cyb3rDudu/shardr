@@ -15,7 +15,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  actions: write # gh workflow run dispatch of the E2E matrix on the lockfile PR
+  actions: write # gh workflow run dispatch + commit status on the bot commit
 
 concurrency:
   group: llama-upstream-check
@@ -24,12 +24,20 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45 # includes watching the dispatched E2E matrix to completion
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod # pinned toolchain — moving "1.25" would break bundle idempotency
+
+      - name: Verify current pin before any update decision
+        # Fail loud BEFORE deciding: if upstream re-uploaded assets under
+        # the SAME bNNNN (digests no longer match the pin), the run must
+        # go red here — not silently continue as a no-op update check.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: go run ./cmd/llama-lock verify
 
       - name: Check upstream for a newer pinnable b-release
         id: decide
@@ -93,17 +101,66 @@ jobs:
             echo "existing PR for $branch updated"
           fi
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Dispatch E2E matrix on the bot branch
+        # PRs opened with GITHUB_TOKEN do not fire pull_request events —
+        # dispatch the matrix on the bot branch explicitly. The dispatched
+        # run is CORRELATED, not guessed: new run id (not in the pre-dispatch
+        # set), event workflow_dispatch, headSha == the bot commit just
+        # pushed, created after the dispatch. Workflow A then watches the
+        # run to completion and goes RED on failure/cancel — the link in
+        # the PR body plus the commit status make the outcome visible
+        # where a human merges.
         if: steps.decide.outputs.decision == 'update'
         env:
           GH_TOKEN: ${{ github.token }}
           BRANCH: ${{ steps.pr.outputs.branch }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
         run: |
-          # PRs opened with GITHUB_TOKEN do not fire pull_request events —
-          # dispatch the matrix on the bot branch explicitly.
+          # pre-dispatch watermark: GitHub databaseIds are monotonically
+          # increasing, so the dispatched run is the FIRST workflow_dispatch
+          # run on this branch, at this commit, with id > watermark.
+          watermark=$(gh run list --workflow llama-build-e2e.yml --branch "$BRANCH" \
+            --event workflow_dispatch --limit 1 --json databaseId \
+            --jq 'map(.databaseId) | max // 0')
           gh workflow run llama-build-e2e.yml --ref "$BRANCH"
-          echo "E2E matrix dispatched on bot branch \`$BRANCH\` (bot PRs opened with GITHUB_TOKEN do not trigger pull_request events)." >> "$GITHUB_STEP_SUMMARY"
+
+          run_id=""
+          for _ in $(seq 1 18); do
+            # --event: the bot PR also spawns an action_required
+            # pull_request run (empty placeholder) — never link that one.
+            # --commit: only runs for the bot commit just pushed.
+            run_id=$(gh run list --workflow llama-build-e2e.yml --branch "$BRANCH" \
+              --event workflow_dispatch --commit "$HEAD_SHA" --limit 10 \
+              --json databaseId --jq "map(select(.databaseId > ${watermark}) | .databaseId) | max // empty")
+            [ -n "$run_id" ] && break
+            sleep 10
+          done
+          if [ -z "$run_id" ]; then
+            echo "E_DISPATCH: no new E2E run for $BRANCH at commit $HEAD_SHA after dispatch" >&2
+            exit 1
+          fi
+
+          # real gate: watch to completion, red on failure OR cancellation
+          if gh run watch "$run_id" --exit-status; then
+            state=success
+          else
+            state=failure
+            echo "E_E2E: dispatched E2E run $run_id did not succeed" >&2
+          fi
+          run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${run_id}"
+
+          gh pr edit "$BRANCH" --body "$(gh pr view "$BRANCH" --json body --jq .body)
+
+          E2E matrix (dispatched on this branch, gated by workflow A): $run_url"
+          # commit status on the bot commit: shows up as a check in the PR
+          # (gates once branch protection requires this context)
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state="$state" -f context="llama build + E2E (bot dispatch)" \
+            -f target_url="$run_url" -f description="dispatched E2E matrix"
+          echo "E2E run $run_id ($state): $run_url" >> "$GITHUB_STEP_SUMMARY"
+          [ "$state" = success ]
 
       - name: No-op summary
         if: steps.decide.outputs.decision != 'update'
