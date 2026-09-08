@@ -31,6 +31,14 @@ jobs:
         with:
           go-version-file: go.mod # pinned toolchain — moving "1.25" would break bundle idempotency
 
+      - name: Verify current pin before any update decision
+        # Fail loud BEFORE deciding: if upstream re-uploaded assets under
+        # the SAME bNNNN (digests no longer match the pin), the run must
+        # go red here — not silently continue as a no-op update check.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: go run ./cmd/llama-lock verify
+
       - name: Check upstream for a newer pinnable b-release
         id: decide
         env:
@@ -103,7 +111,27 @@ jobs:
           # PRs opened with GITHUB_TOKEN do not fire pull_request events —
           # dispatch the matrix on the bot branch explicitly.
           gh workflow run llama-build-e2e.yml --ref "$BRANCH"
-          echo "E2E matrix dispatched on bot branch \`$BRANCH\` (bot PRs opened with GITHUB_TOKEN do not trigger pull_request events)." >> "$GITHUB_STEP_SUMMARY"
+          # the dispatch is asynchronous: poll until the run shows up, then
+          # link it in the PR body so a human sees CI status without hunting.
+          run_url=""
+          for _ in $(seq 1 12); do
+            # --event filter: the bot PR also spawns an action_required
+            # pull_request run (empty, awaiting approval) — link the real
+            # dispatched run, not that placeholder.
+            run_url=$(gh run list --workflow llama-build-e2e.yml --branch "$BRANCH" \
+              --event workflow_dispatch --limit 1 --json url --jq '.[0].url' 2>/dev/null)
+            [ -n "$run_url" ] && break
+            sleep 10
+          done
+          if [ -z "$run_url" ]; then
+            echo "E_DISPATCH: E2E run did not appear for $BRANCH after dispatch" >&2
+            exit 1
+          fi
+          gh pr edit "$BRANCH" --body "$(gh pr view "$BRANCH" --json body --jq .body)
+
+          E2E matrix (dispatched on this branch, bot PRs get no automatic pull_request CI): $run_url"
+          echo "E2E matrix dispatched and linked: $run_url" >> "$GITHUB_STEP_SUMMARY"
+          echo "e2e_run_url=$run_url" >> "$GITHUB_OUTPUT"
 
       - name: No-op summary
         if: steps.decide.outputs.decision != 'update'
