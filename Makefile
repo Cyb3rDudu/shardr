@@ -9,9 +9,16 @@ LLAMA_VERSION = $(shell go run ./cmd/llama-lock ref)
 LLAMA_PLATFORM = $(shell go run ./cmd/llama-lock platform)
 LLAMA_SERVER := $(BIN)/llama-server
 
-.PHONY: all llama fetch-llama deploy-llama check-llama-deploy clean test
+.PHONY: all build llama fetch-llama deploy-llama check-llama-deploy clean test
 
-all: llama
+all: build llama
+
+# build: the Go binaries (shardr CLI + shardhive daemon) into BIN.
+# Runtime comes via the llama targets; `make all` = complete local setup.
+build:
+	@echo ">> building shardr + shardhive into $(BIN)"
+	go build -o $(BIN)/shardr ./cmd/shardr
+	go build -o $(BIN)/shardhive ./cmd/shardhive
 
 llama:
 	@$(MAKE) --no-print-directory fetch-llama
