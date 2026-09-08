@@ -49,8 +49,11 @@ bin/shardhive serve
 ```
 
 The socket is created with mode 0600 — the file permission **is** the
-access boundary. Only your user can talk to the daemon; there is no TCP
-listener in this build.
+access boundary. Only your user can talk to the daemon: the
+management API has no TCP listener in this build. (The swarm client
+is separate: it opens a BitTorrent peer listener and a webseed HTTP
+listener on `127.0.0.1:<ephemeral>` when enabled — see
+[swarm.md](swarm.md).)
 
 Use `--socket <path>` to choose a different path for this run, or set
 `$SHARDR_SOCKET` for all clients. If the socket path is occupied by

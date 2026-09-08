@@ -32,31 +32,33 @@ view.
 
 ## Data flow
 
-```
-                upstream bytes                     wire
-  local dir ──┐                                     │
-  HF repo ────┤                                     ▼
-  BT swarm ───┘                ┌───────────── API v1 (Unix socket, 0600)
-      │                        │              resolve/open/ensure/blob/
-      ▼                        │              import.local/hf/bt/models
-  importer (001 §8)             │
-  classify (default deny)       │
-  eligibility gate ── fail ──► E_NOT_IMPORTABLE
-      │ pass                   │
-      ▼                        │            ┌──────────────┐
-  CAS verifying write ──► blobs/sha256/ …   │    swarm     │
-  (re-hash on write)          ▲             │ fetch / seed │
-      │                       │             └──────┬───────┘
-      ▼                       │                    │ pieces,
-  artifact.Seal ──► manifest, │◄───────────────────│ verified
-  model-index, distribution   │   webseed HTTP     │ bytes
-  record (deterministic)      │                    │
-      │                       │                    │
-      ▼                       │                    │
-  state/ (namespaces, tags, ──┘                    │
-  distribution links, hints)                      │
-                                                  ▼
-                                     peers ←→ DHT/PEX ←→ webseeds
+```mermaid
+flowchart TD
+    subgraph sources[upstream bytes]
+        LOCAL[local dir]
+        HF[HF repo]
+        BT[BT swarm]
+    end
+    IMP[importer (001 §8)<br/>classify (default deny)<br/>eligibility gate]
+    LOCAL --> IMP
+    HF --> IMP
+    BT --> IMP
+    IMP -- "fail" --> NI[E_NOT_IMPORTABLE]
+    IMP -- "pass" --> W[CAS verifying write<br/>(re-hash on write) → blobs/sha256/]
+    W --> SEAL[artifact.Seal → manifest,<br/>model-index, distribution record<br/>(deterministic)]
+    SEAL --> STATE[state/ (namespaces, tags,<br/>distribution links, hints)]
+
+    SW[swarm<br/>fetch / seed]
+    W -.-> SW
+    STATE -.-> SW
+    SW -- "pieces, verified bytes" --> W
+    SW <--> NET[peers ↔ DHT/PEX ↔ webseeds<br/>(webseed HTTP) ]
+
+    API[API v1 (Unix socket, 0600)<br/>resolve/open/ensure/blob/<br/>import.local/hf/bt/models]
+    STATE --> API
+    W --> API
+    SW -.-> API
+    CLI[shardr / shardhive CLI] -- wire --> API
 ```
 
 ## Resolution order (005 §6)
@@ -85,11 +87,17 @@ first, swarm fill for the missing remainder.
   before the swarm is joined. The swarm decides where bytes come from;
   the pin (and the verifying write path) decides whether they are
   right.
-- **Blobs are immutable** (mode 0444, never mutated in place). Reads
-  from the CAS therefore cannot diverge from digests; explicit
-  re-verification is `shardhive cas verify`.
-- **The socket is the boundary.** API v1 lives on a 0600 Unix socket —
-  file permission is the access control; there is no TCP surface.
+- **Blob hygiene, not immutability.** Blob files are written mode 0444
+  and are never mutated in place by shardhive write paths — but a file
+  mode is hygiene, not a guarantee: the owner, privileged processes, or
+  failing hardware can still change bytes. Integrity is proven by
+  digest verification (verifying write path; `shardhive cas verify`
+  re-hashes on demand), never by the file mode.
+- **The socket is the management boundary.** API v1 lives on a 0600
+  Unix socket — file permission is the access control; the management
+  API has no TCP surface. (The swarm client does open network
+  listeners: a BitTorrent peer listener and a plain-HTTP webseed on
+  `127.0.0.1:<ephemeral>` — see [swarm](../user/swarm.md).)
 - **State is never silently rebuilt.** A corrupt index or unreadable
   state file is a loud error (`E_INVALID_INDEX`, verify state errors),
   never a quiet rebuild that would mask corruption.

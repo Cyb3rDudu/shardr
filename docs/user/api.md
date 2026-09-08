@@ -78,10 +78,15 @@ curl -s --unix-socket "$S" 'http://localhost/v1/resolve?ref=shardr:///gold/toy-q
 #  "planReason":"manifest document parsing lands with imports (001 §8)"}
 ```
 
-`plan`/`planReason` describe the runner's execution plan and stay
-`pending` until the runner slice lands. The `@sha256:<hex>` form
-resolves without any state lookup (the digest *is* the answer) and
-returns no `indexDigest`.
+`plan`/`planReason`: `plan` is always `"pending"` in this build, and
+the `planReason` string ("manifest document parsing lands with
+imports") is a stale message from an earlier slice — imports and the
+runner have landed; the server still emits the old constant. This is a
+known legacy defect in the API surface, reported as a spec comment on
+005 §3 — treat `plan` as unimplemented, not as a statement about
+runner capability. The `@sha256:<hex>` form resolves without any
+state lookup (the digest *is* the answer) and returns no
+`indexDigest`.
 
 Errors: `E_BAD_REQUEST` (missing `ref`), `E_PARSE`/`E_LENGTH`/…
 (reference grammar, with canonical-form hints), `E_UNKNOWN_REF` (no
