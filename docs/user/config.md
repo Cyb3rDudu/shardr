@@ -73,8 +73,34 @@ section is reserved and parsed harmlessly.
 
 ## `[runtimes.*]` and `[models.*]` — runner overlay (layer 2)
 
-These sections belong to the model runner (spec 002 §2, overlay layer
-2) and are not implemented in this build. shardhive reads and
-validates nothing here today — the sections are shown so the config
-file's shape is complete. Model keys use the scheme-less short form
-`ns/name:quant` (000 §2).
+These sections belong to the model runner (`shardr run` / `shardr
+serve`, spec 002 §2). Model keys use the scheme-less short form
+`ns/name:quant` (000 §2); `[runtimes.llama]` applies globally.
+shardhive ignores them — they are consumed at run time.
+
+The runner merges four layers, lowest → highest precedence:
+
+1. **Advisory defaults** — optional `runtime-config` entries inside
+   the artifact (publisher-provided; machine-neutral keys only)
+2. **User config** — `~/.config/shardr/config.toml` (`[runtimes.llama]`,
+   per-model `[models."ns/name:quant"]`)
+3. **`--config <file>`** — per-invocation TOML file, same schema as
+   layer 2
+4. **`--set key=value`** — CLI flags (repeatable), highest precedence
+
+A higher layer replaces individual keys; no cross-key inference. Keys
+are validated against the 002 §7.1 allowlist (`n_gpu_layers`,
+`ctx_size`, `n_threads`, `flash_attn`, `mlock`, `kv_cache_type`,
+`batch_size`, `ubatch_size`, `n_parallel`, `jinja`, `mmproj_variant`).
+An unknown key in any layer is a loud error that names the layer it
+came from — nothing is dropped silently. A key absent from every
+layer falls back to the runtime built-in.
+
+**Bool keys are tri-state**: absent = inherit (runtime default
+applies), `true` = pass the flag, `false` = omit the flag — which
+means the runtime default applies, **not "off"**. An overlay cannot
+explicitly disable a runtime-default-ON flag in v1.
+
+```sh
+shardr run qwen/test:q8_0 --set llama.n_gpu_layers=40 --set llama.ctx_size=32768
+```

@@ -10,10 +10,19 @@ From source (requires Go ≥ 1.25):
 ```sh
 git clone https://github.com/Cyb3rDudu/shardr
 cd shardr
-go build -o shardhive ./cmd/shardhive
-./shardhive version
+make build           # builds shardr + shardhive into bin/
+./bin/shardhive version
 # shardhive 0.0.1-dev
 ```
+
+`make all` is the complete local setup: `make build` plus `make llama`,
+which fetches the **prebuilt** llama-server pinned in
+[`runtime/llama.lock`](https://github.com/Cyb3rDudu/shardr/blob/main/runtime/llama.lock)
+(digest-verified) and links it into `bin/`. The project never compiles
+llama.cpp — the pin is the single version truth. Alternatively: any
+`llama-server` in `$PATH`, or `$SHARDR_LLAMA_SERVER`. Prebuilt runner
+bundles (Go binaries + pinned runtime, SHA256SUMS, BUILDINFO) are also
+attached to shardr releases.
 
 The version string is injectable at build time:
 
@@ -35,7 +44,7 @@ defaults apply (see [config.md](config.md)).
 ## Start the daemon
 
 ```sh
-./shardhive serve
+bin/shardhive serve
 # shardhive 0.0.1-dev listening on /run/user/1000/shardhive.sock
 ```
 
@@ -53,7 +62,7 @@ With the swarm enabled and complete artifacts in the store, the daemon
 also joins their swarms at startup:
 
 ```sh
-./shardhive serve
+bin/shardhive serve
 # shardhive: swarm: seeding 1 artifact(s)
 # shardhive 0.0.1-dev listening on /run/user/1000/shardhive.sock
 ```
@@ -119,7 +128,7 @@ The CAS is content-addressed: every blob's name is its SHA-256. `cas
 verify` re-hashes and proves it:
 
 ```sh
-./shardhive cas verify --all
+bin/shardhive cas verify --all
 # verify --all: 0 mismatched, 0 missing, 0 state errors
 # all blobs clean          (exit 0)
 ```
