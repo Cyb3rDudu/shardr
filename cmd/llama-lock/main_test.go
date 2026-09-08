@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Cyb3rDudu/shardr/internal/llamalock"
 )
@@ -76,6 +78,47 @@ func TestParseFetchArgsEqualsForm(t *testing.T) {
 		if _, _, _, err := parseFetchArgs(bad); err == nil {
 			t.Errorf("%v: must be rejected", bad)
 		}
+	}
+}
+
+// TestParseFetchArgsRefFailLoud: an EMPTY --ref value silently fell
+// back to the stable pin and a DUPLICATE --ref silently kept only the
+// last value — both must fail instead (fail-loud rule).
+func TestParseFetchArgsRefFailLoud(t *testing.T) {
+	for _, bad := range [][]string{
+		{"darwin_arm64", "d", "--ref="},                     // empty value
+		{"darwin_arm64", "d", "-ref="},                      // empty, single dash
+		{"darwin_arm64", "d", "--ref", ""},                  // empty separate value
+		{"darwin_arm64", "d", "--ref", "b1", "--ref", "b2"}, // duplicate
+		{"darwin_arm64", "d", "--ref=b1", "--ref=b2"},       // duplicate, equals form
+		{"--ref=b1", "--ref=b2", "darwin_arm64", "d"},       // duplicate, leading
+	} {
+		if _, _, _, err := parseFetchArgs(bad); err == nil {
+			t.Errorf("%v: must be rejected", bad)
+		}
+	}
+}
+
+// TestPinnableToResolvedFieldName: latest-pinnable's timestamp field
+// must be named for what it carries (youngest asset updated_at), and
+// must NOT claim to be published_at — the soak age is judged on asset
+// re-upload time, and a lying field name hides upstream asset swaps.
+func TestPinnableToResolvedFieldName(t *testing.T) {
+	pin := llamalock.Pinnable{
+		Ref: "b10819", Commit: "c0ffee",
+		Digests:       map[string]string{"darwin_arm64": strings.Repeat("a", 64), "linux_amd64": strings.Repeat("b", 64)},
+		YoungestAsset: time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC),
+	}
+	b, err := json.Marshal(pinnableToResolved(pin))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	if !strings.Contains(s, `"youngest_asset_updated_at":"2026-09-01T00:00:00Z"`) {
+		t.Errorf("missing truthful youngest_asset_updated_at: %s", s)
+	}
+	if strings.Contains(s, "published_at") {
+		t.Errorf("pinnable snapshot must not emit published_at (it is not one): %s", s)
 	}
 }
 
