@@ -15,7 +15,8 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  actions: write # gh workflow run dispatch + commit status on the bot commit
+  actions: write # gh workflow run dispatch of the E2E matrix on the bot branch
+  statuses: write # commit status 'llama build + E2E (bot dispatch)' on the bot commit
 
 concurrency:
   group: llama-upstream-check
