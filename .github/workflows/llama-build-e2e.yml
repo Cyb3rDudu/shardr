@@ -27,6 +27,13 @@ on:
     paths:
       - runtime/llama.lock
       - .github/workflows/llama-build-e2e.yml
+      - cmd/llama-lock/**
+      - internal/llamalock/**
+      - Makefile
+      - scripts/check-make-llama.sh
+      - scripts/make-runner-bundle.sh
+      - scripts/publish-release.sh
+      - scripts/sha256sums.sh
 
 permissions:
   contents: read
