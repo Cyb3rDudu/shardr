@@ -1,7 +1,9 @@
 # shardhive API v1
 
 HTTP/1.1 over a Unix domain socket (mode 0600 — the socket permission
-is the access boundary; no TCP in this build). JSON in, JSON out.
+is the access boundary; the management API has no TCP surface — the
+swarm client's peer/webseed listeners are separate, see
+[swarm.md](swarm.md)). JSON in, JSON out.
 
 ```sh
 S=${SHARDR_SOCKET:-${XDG_RUNTIME_DIR:-/tmp/shardhive-$(id -u)}/shardhive.sock}
@@ -82,8 +84,9 @@ curl -s --unix-socket "$S" 'http://localhost/v1/resolve?ref=shardr:///gold/toy-q
 the `planReason` string ("manifest document parsing lands with
 imports") is a stale message from an earlier slice — imports and the
 runner have landed; the server still emits the old constant. This is a
-known legacy defect in the API surface, reported as a spec comment on
-005 §3 — treat `plan` as unimplemented, not as a statement about
+known legacy defect in the API surface, tracked in the code comment on
+`resolveResult` in `internal/api/server.go` — treat `plan` as
+unimplemented, not as a statement about
 runner capability. The `@sha256:<hex>` form resolves without any
 state lookup (the digest *is* the answer) and returns no
 `indexDigest`.

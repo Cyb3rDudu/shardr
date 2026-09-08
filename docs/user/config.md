@@ -66,8 +66,8 @@ Rules the parser enforces:
 ## `[references]` — CLI-only comfort
 
 `default_selector` applies **only** when a human types a selector-less
-reference at the interactive `shardr` CLI (`run`, `serve`, `pull`,
-`import`, …): the client completes the ref with it before sending the
+reference at the interactive `shardr` CLI (`run`, `serve`, `pull`):
+the client completes the ref with it before sending the
 canonical URI. It is never applied to API requests, Modelfiles,
 manifests, or shardrbay entries — those always require an explicit
 selector. A selector-less ref without a configured `default_selector`
