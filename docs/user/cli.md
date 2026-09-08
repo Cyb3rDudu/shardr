@@ -1,6 +1,10 @@
-# shardhive CLI reference
+# CLI reference
 
-Everything the `shardhive` binary does today, derived from the code.
+Everything the `shardhive` daemon binary does today, derived from the
+code, plus the `shardr` runner lifecycle. The `shardr` CLI surface
+(import/pull/models/verify/status) is covered in the
+[README](https://github.com/Cyb3rDudu/shardr#adding-models) and
+[getting-started.md](getting-started.md).
 Usage/dispatch errors and warnings go to stderr; `cas verify` prints
 its per-digest outcome lines (including `FAIL …`) to stdout.
 
@@ -124,6 +128,59 @@ Semantics:
 
 Exit codes: `0` clean · `1` digest mismatch · `2` missing blob /
 store error · `64` usage (no argument, or `cas` without `verify`).
+
+## `shardr` runner lifecycle (run / serve / stop)
+
+`shardr` is the client binary for the model runner (spec 002 §4). It
+talks to the same daemon over the same socket.
+
+```
+shardr run <ref> [--config f.toml] [--set k=v]…      foreground run
+shardr serve <ref> [--id name] [--config f.toml] [--set k=v]…
+                                                     background instance
+shardr stop [<id>|--all]                             stop instances
+```
+
+Short refs (`ns/name:quant`) are canonicalized before the API sees
+them. Runtime keys are validated against the 002 §7.1 allowlist.
+
+**`run`** resolves and ensures the ref against the daemon, merges the
+runtime overlay (see [config.md](config.md)), spawns llama-server, and
+waits. The reference is passed as CAS paths — llama-server mmaps the
+weights **directly out of the content-addressed store**; no additional
+copy of the model is written. Multi-part (split) GGUFs get a
+per-launch scratch directory of hardlinks that is removed on every
+exit path. `Ctrl-C` sends SIGTERM to llama-server; if it has not exited
+within 30 s it is killed with SIGKILL:
+
+```
+ready: http://127.0.0.1:8080 (model id shardr:///qwen/test:q8_0) — Ctrl-C to stop
+^C
+stopping (SIGTERM; SIGKILL after 30 s)
+```
+
+**`serve`** runs the same lifecycle detached under a stable `--id`
+(name defaults to a generated one), records the instance in the
+runner registry, and prints the endpoint:
+
+```
+shardr serve qwen/test:q8_0 --id mainllm
+# serving shardr:///qwen/test:q8_0
+#   id       mainllm
+#   endpoint http://127.0.0.1:8081
+#   model    shardr:///qwen/test:q8_0
+```
+
+`--id` is serve-only (`run` rejects it — a foreground process has no
+stable id).
+
+**`stop`** terminates serve instances: SIGTERM with a 30 s deadline,
+then SIGKILL — per `id`, or all at once with `--all`. With no
+argument it lists the running instances. Before signaling, the stop
+path re-verifies the target's identity (start token and served ref)
+so a recycled PID is never killed by name; the identity check is
+repeated before the SIGKILL escalation. Split-scratch cleanup runs on
+stop as on `run` exit.
 
 ## Exit codes at a glance
 

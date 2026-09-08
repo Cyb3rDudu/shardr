@@ -28,6 +28,7 @@ classes. API errors come in the envelope
 | `E_UNKNOWN_REF` | 404 | no local index for the repo (or HF repo not found) | model never imported here; resolver fetch not implemented in this build → import it (`/v1/import/*`); `candidates` lists same-namespace repos |
 | `E_NO_INDEX` | 404 | index blob not present in the CAS | metadata fetch is ensure's job in a later slice → the importing node's index is absent |
 | `E_INVALID_INDEX` | 500 | model-index blob fails validation | corruption — never silently rebuilt; restore the blob or re-import; `shardhive cas verify --all` shows the state |
+| `E_CORRUPTION` | 500 | manifest blob is not valid JSON or fails validation (CAS corruption) | corruption is a storage verdict, not a daemon bug — restore the blob or re-import; never silently rebuilt |
 | `E_RANGE_INVALID` | 416 | blob range does not overlap | `Range` beyond EOF → fix the range |
 | `E_UNSUPPORTED_VERSION` | 400 | another API major version | client speaks `/v2/` → speak `/v1/` (`candidates` names the supported version) |
 | `E_NOT_IMPLEMENTED` | 501 | reserved endpoint/slice | swarm disabled for `/v1/import/bt` → set `[swarm] enabled = true` (message says so) |
@@ -36,6 +37,7 @@ classes. API errors come in the envelope
 | `E_RATE_LIMITED` | 502/job | HF rate limit | retry later / set a token |
 | `E_NOT_IMPORTABLE` | job | import fails the 001 §8 rule set or verification | no recognized weights (eligibility gate); swarm bytes ≠ pin (see importing.md's eligibility table for the class split); structurally invalid distribution record → fix the source or the pin |
 | `E_INTERNAL` | 500/job | daemon bug — never a user-input verdict | report it; `cas verify` rules out disk corruption |
+| `E_VERIFY_FAILED` | job | a verify target failed: digest mismatch or missing blob (`--all` reports mismatched/missing/state-error counts; a manifest target verifies the manifest blob and every file blob) | corruption or a deleted blob under the CAS → `shardhive cas verify --all` lists the affected digests; restore or re-import |
 
 Notes:
 
