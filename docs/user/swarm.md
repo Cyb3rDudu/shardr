@@ -12,8 +12,9 @@ shardhive embeds a BitTorrent v2 client (spec 004). It serves two roles:
   `127.0.0.1:<ephemeral>`.
 - **Use is replication:** every complete artifact you hold is (or,
   for imports made while the daemon is already running, becomes at the
-  next restart — see below) available for others to pull. There is no
-  leech mode; that is the design (community mirror, 004 §5).
+  next restart — see below) available for others to pull. Seeding is
+  on by default; `[swarm] seed = false` is the deliberate local
+  opt-out — the node then fetches without uploading (004 §5).
 - Upload can be bounded: `[swarm] upload_limit = <bytes/sec>` in
   `config.toml` (`0` = unlimited, the default). Seeding can be turned
   off entirely with `[swarm] seed = false`; the swarm client itself can

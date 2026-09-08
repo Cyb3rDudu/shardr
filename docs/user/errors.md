@@ -26,7 +26,7 @@ classes. API errors come in the envelope
 | `E_SOURCE_NOT_REGULAR` | 400 | import source is not a regular file | symlink/FIFO/device in or at the import root → import real files (the boundary is the point) |
 | `E_NOT_FOUND` | 404 | unknown endpoint or blob/job id | wrong path/digest/id |
 | `E_UNKNOWN_REF` | 404 | no local index for the repo (or HF repo not found) | model never imported here; resolver fetch not implemented in this build → import it (`/v1/import/*`); `candidates` lists same-namespace repos |
-| `E_NO_INDEX` | 404 | index blob not present in the CAS | metadata fetch is ensure's job in a later slice → the importing node's index is absent |
+| `E_NO_INDEX` | 404 | local state references a model whose index blob is not present in the CAS | incomplete or corrupted local state — restore the index blob or re-import the model (`shardhive cas verify --all` shows the store state) |
 | `E_INVALID_INDEX` | 500 | model-index blob fails validation | corruption — never silently rebuilt; restore the blob or re-import; `shardhive cas verify --all` shows the state |
 | `E_CORRUPTION` | 500 | manifest blob is not valid JSON or fails validation (CAS corruption) | corruption is a storage verdict, not a daemon bug — restore the blob or re-import; never silently rebuilt |
 | `E_RANGE_INVALID` | 416 | blob range does not overlap | `Range` beyond EOF → fix the range |
