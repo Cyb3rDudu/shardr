@@ -39,26 +39,26 @@ flowchart TD
         HF[HF repo]
         BT[BT swarm]
     end
-    IMP[importer (001 §8)<br/>classify (default deny)<br/>eligibility gate]
+    IMP["importer (001 §8)<br/>classify (default deny)<br/>eligibility gate"]
     LOCAL --> IMP
     HF --> IMP
     BT --> IMP
     IMP -- "fail" --> NI[E_NOT_IMPORTABLE]
-    IMP -- "pass" --> W[CAS verifying write<br/>(re-hash on write) → blobs/sha256/]
-    W --> SEAL[artifact.Seal → manifest,<br/>model-index, distribution record<br/>(deterministic)]
-    SEAL --> STATE[state/ (namespaces, tags,<br/>distribution links, hints)]
+    IMP -- "pass" --> W["CAS verifying write<br/>(re-hash on write) → blobs/sha256/"]
+    W --> SEAL["artifact.Seal → manifest,<br/>model-index, distribution record<br/>(deterministic)"]
+    SEAL --> STATE["state/ (namespaces, tags,<br/>distribution links, hints)"]
 
-    SW[swarm<br/>fetch / seed]
+    SW["swarm<br/>fetch / seed"]
     W -.-> SW
     STATE -.-> SW
     SW -- "pieces, verified bytes" --> W
-    SW <--> NET[peers ↔ DHT/PEX ↔ webseeds<br/>(webseed HTTP) ]
+    SW <--> NET["peers ↔ DHT/PEX ↔ webseeds<br/>(webseed HTTP)"]
 
-    API[API v1 (Unix socket, 0600)<br/>resolve/open/ensure/blob/<br/>import.local/hf/bt/models]
+    API["API v1 (Unix socket, 0600)<br/>resolve/open/ensure/blob/<br/>import.local/hf/bt/models"]
     STATE --> API
     W --> API
     SW -.-> API
-    CLI[shardr / shardhive CLI] -- wire --> API
+    CLI["shardr CLI / clients"] -- wire --> API
 ```
 
 ## Resolution order (005 §6)
@@ -96,8 +96,9 @@ first, swarm fill for the missing remainder.
 - **The socket is the management boundary.** API v1 lives on a 0600
   Unix socket — file permission is the access control; the management
   API has no TCP surface. (The swarm client does open network
-  listeners: a BitTorrent peer listener and a plain-HTTP webseed on
-  `127.0.0.1:<ephemeral>` — see [swarm](../user/swarm.md).)
+  listeners: a BitTorrent peer listener — TCP + uTP on all interfaces,
+  ephemeral port — and a webseed HTTP listener on
+  `127.0.0.1:<ephemeral>`; see [swarm](../user/swarm.md).)
 - **State is never silently rebuilt.** A corrupt index or unreadable
   state file is a loud error (`E_INVALID_INDEX`, verify state errors),
   never a quiet rebuild that would mask corruption.

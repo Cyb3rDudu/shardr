@@ -59,8 +59,10 @@ production code, never beside it):
 flowchart TD
     HIVE[cmd/shardhive] --> API[internal/api]
     HIVE --> CAS[(internal/cas)]
+    HIVE --> CFG[internal/config]
+    HIVE --> SW[internal/swarm]
     API --> IMP[internal/importer]
-    API --> SW[internal/swarm]
+    API --> SW
     IMP --> ART[internal/artifact]
     SW --> ART
     IMP --> REF[internal/ref]
@@ -72,10 +74,12 @@ flowchart TD
     R[cmd/shardr] --> CLI[internal/cli]
     CLI --> API
     CLI --> RUN[internal/runner]
-    R --> CFG[internal/config]
     CLI --> CFG
+    CLI --> REF
+    RUN --> CFG
+    RUN --> ART
     RUN --> LOCK[internal/llamalock]
-    RUN -- "CAS paths (zero-copy)" --> CAS
+    RUN -. "CAS paths at runtime (not an import)" .-> CAS
 
     VEC[internal/specvectors<br/>vectors run PRODUCTION code] --> REF
     VEC --> ART
