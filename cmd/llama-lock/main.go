@@ -28,6 +28,7 @@ commands:
                           release API digests match the pinned asset sha256s
   latest-nightly          newest bNNNN release with a complete asset matrix (JSON)
   latest-pinnable         newest bNNNN release at least 7 days old (JSON) — pin candidate
+                          (youngest_asset_updated_at is the timestamp the soak judged)
   resolve <bNNNN>         resolve a release to JSON (ref, commit, assets, published_at)
   fetch <platform> <destdir> [--ref bNNNN]
                           download the pinned prebuilt asset (digest-verified,
@@ -42,11 +43,16 @@ commands:
 }
 
 type resolved struct {
-	Ref          string            `json:"ref"`
-	Commit       string            `json:"commit"`
-	PublishedAt  string            `json:"published_at"`
-	SourceSHA256 map[string]string `json:"asset_sha256"`
-	Assets       map[string]string `json:"asset_url"`
+	Ref         string `json:"ref"`
+	Commit      string `json:"commit"`
+	PublishedAt string `json:"published_at,omitempty"` // true release published_at (resolve)
+	// YoungestAssetUpdatedAt is what latest-pinnable reports: the youngest
+	// asset updated_at of the validated response — the timestamp the soak
+	// judged. Named for what it is, NOT published_at (a re-uploaded asset
+	// makes these two diverge).
+	YoungestAssetUpdatedAt string            `json:"youngest_asset_updated_at,omitempty"`
+	SourceSHA256           map[string]string `json:"asset_sha256"`
+	Assets                 map[string]string `json:"asset_url"`
 }
 
 func resolveRef(ctx context.Context, ref string) (resolved, error) {
@@ -139,11 +145,17 @@ func parseFetchArgs(args []string) (platform, dest, ref string, err error) {
 				return "", "", "", fmt.Errorf("--ref needs a value")
 			}
 			i++
-			ref = args[i]
+			if ref, err = takeRef(ref, args[i]); err != nil {
+				return "", "", "", err
+			}
 		case strings.HasPrefix(a, "--ref="):
-			ref = strings.TrimPrefix(a, "--ref=")
+			if ref, err = takeRef(ref, strings.TrimPrefix(a, "--ref=")); err != nil {
+				return "", "", "", err
+			}
 		case strings.HasPrefix(a, "-ref="):
-			ref = strings.TrimPrefix(a, "-ref=")
+			if ref, err = takeRef(ref, strings.TrimPrefix(a, "-ref=")); err != nil {
+				return "", "", "", err
+			}
 		case strings.HasPrefix(a, "-") && a != "-":
 			// no "=" exemption: any other -x=y token is unknown, never a
 			// silently ignored positional (e.g. a mistyped --ref= dest)
@@ -156,6 +168,19 @@ func parseFetchArgs(args []string) (platform, dest, ref string, err error) {
 		return "", "", "", fmt.Errorf("fetch wants exactly <platform> <destdir> (+ optional --ref bNNNN), got %d positional args", len(pos))
 	}
 	return pos[0], pos[1], ref, nil
+}
+
+// takeRef sets the override ref exactly once: an empty value (--ref=)
+// would silently fall back to the stable pin, and a second --ref would
+// silently shadow the first — both fail loud instead.
+func takeRef(cur, v string) (string, error) {
+	if v == "" {
+		return "", fmt.Errorf("--ref value must not be empty")
+	}
+	if cur != "" {
+		return "", fmt.Errorf("duplicate --ref (had %q, got %q)", cur, v)
+	}
+	return v, nil
 }
 
 func main() {
@@ -317,8 +342,10 @@ func main() {
 }
 
 // pinnableToResolved renders a validated snapshot in the resolved-JSON
-// shape. published_at carries the youngest asset updated_at of the
-// validated response (that is the timestamp the soak judged).
+// shape. youngest_asset_updated_at carries the youngest asset
+// updated_at of the validated response (that is the timestamp the soak
+// judged) — deliberately NOT published_at: a re-uploaded asset on an
+// old release makes the two diverge, and lying field names hide that.
 func pinnableToResolved(p llamalock.Pinnable) resolved {
 	urls := map[string]string{}
 	for plat := range p.Digests {
@@ -328,7 +355,7 @@ func pinnableToResolved(p llamalock.Pinnable) resolved {
 	if !p.YoungestAsset.IsZero() {
 		pub = p.YoungestAsset.Format(time.RFC3339)
 	}
-	return resolved{Ref: p.Ref, Commit: p.Commit, PublishedAt: pub, SourceSHA256: p.Digests, Assets: urls}
+	return resolved{Ref: p.Ref, Commit: p.Commit, YoungestAssetUpdatedAt: pub, SourceSHA256: p.Digests, Assets: urls}
 }
 
 // lockFromPin renders the new lock from a validated snapshot: EXACTLY
