@@ -4,3 +4,9 @@
 
 # fetched prebuilt llama runtime (make llama) — never committable
 bin/
+
+# mkdocs build output — never committable (renders into _site/, not site/)
+_site/
+
+# local python venv for building the docs site (mkdocs + material)
+.docs-venv/

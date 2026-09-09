@@ -1,0 +1,116 @@
+# Site: https://cyb3rdudu.github.io/shardr/
+# Built with MkDocs Material. CI source of truth: .github/workflows/docs.yml
+# (primes docs(**)-commits only; strict build is the link guarantee).
+#
+# Staged delivery (Epic #41): this file is the S1 skeleton. Sections whose
+# real pages land in later stages are committed as marked "in progress"
+# stubs so the nav guarantee holds: every nav entry must point at an
+# existing file.
+#
+# Content rules: English only; the product names are "shardr" (runner/CLI)
+# and "shardhive" (storage daemon). Specs in docs/specs/ are canonical and
+# excluded from the site — pages summarize and link to the code tree.
+site_name: shardr
+site_description: A decentralized LLM repository with sync-based
+    distribution — content-addressed local store, swarm sync, and an
+    OpenAI-compatible runtime
+site_url: https://cyb3rdudu.github.io/shardr/
+repo_url: https://github.com/Cyb3rDudu/shardr
+edit_uri: blob/main/docs/
+
+# MkDocs' default output dir is "site", which is a tracked product
+# placeholder (site/shardrbay/) that must never be cleared by a build.
+# The rendered site is a gitignored artifact in _site/.
+site_dir: _site
+
+theme:
+    name: material
+    palette:
+        - media: "(prefers-color-scheme: light)"
+          scheme: default
+          primary: indigo
+          toggle:
+              icon: material/brightness-7
+              name: Switch to dark mode
+        - media: "(prefers-color-scheme: dark)"
+          scheme: slate
+          primary: indigo
+          toggle:
+              icon: material/brightness-4
+              name: Switch to light mode
+    language: en
+    features:
+        - navigation.sections
+        - navigation.tracking
+        - navigation.top
+        - toc.follow
+        - search.highlight
+        - search.share
+        - content.code.copy
+        - content.tabs.link
+        - content.action.edit
+
+plugins:
+    - search
+
+# pages never published to the site. docs/ is the mkdocs source dir, and
+# docs/specs/* stay canonical in the repo (the site summarizes + links);
+# this file plus _inventory.md and requirements.txt are working artifacts.
+exclude_docs: |
+    mkdocs.yml
+    _inventory.md
+    requirements.txt
+    check-links.sh
+
+    specs/
+    user/getting-started.md
+
+markdown_extensions:
+    - admonition
+    - attr_list
+    - md_in_html
+    - tables
+    - pymdownx.details
+    - pymdownx.superfences:
+          custom_fences:
+              - name: mermaid
+                class: mermaid
+                format: !!python/name:pymdownx.superfences.fence_code_format
+    - pymdownx.highlight
+    - pymdownx.inlinehilite
+    - pymdownx.tasklist:
+          custom_checkbox: true
+    - toc:
+          permalink: true
+
+# Client-side chart rendering for mermaid architecture diagrams.
+extra_javascript:
+    - https://unpkg.com/mermaid@10.9.8/dist/mermaid.min.js
+
+nav:
+    - Welcome: index.md
+    - Get Started:
+          - Concept Tour: get-started/concept-tour.md
+          - Quickstart: get-started/quickstart.md
+    - User Guide:
+          - Importing models: user/importing.md
+          - Swarm & seeding: user/swarm.md
+          - Configuration: user/config.md
+          - API — HTTP v1: user/api.md
+          - CLI reference: user/cli.md
+          - Error reference: user/errors.md
+    - Developer Guide:
+          - Architecture overview: dev/architecture.md
+          - Code layout: dev/layout.md
+          - Conventions: dev/conventions.md
+          - Testing: dev/testing.md
+    - Operations:
+          - Daemon operation: operations/daemon.md
+          - Swarm & sync operation: operations/swarm.md
+          - Runtime & releases: operations/releases.md
+          - Troubleshooting: operations/troubleshooting.md
+    - References:
+          - HTTP API v1: references/api.md
+          - URI & reference grammar: references/uri-references.md
+          - Error inventory: references/errors.md
+          - Configuration reference: references/configuration.md
