@@ -59,6 +59,6 @@ joining a swarm (pin-before-join) — see
 
 ## Config knobs
 
-See [config.md](config.md#swarm--shardhives-section) for the full
+See [config.md](config.md) (the `[swarm]` — shardhive's section) for the full
 `[swarm]` table: `enabled`, `seed`, `upload_limit`, `dht`,
 `no_seed_verify`, `webseed_addr`.

@@ -164,6 +164,8 @@ provenance (tag → commit, release-API digests) with
 
 ## Specifications & documentation
 
+Documentation site: **https://cyb3rdudu.github.io/shardr/**
+
 User and developer documentation lives in [`docs/user/`](docs/user/) and
 [`docs/dev/`](docs/dev/).
 

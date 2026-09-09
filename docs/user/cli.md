@@ -3,8 +3,9 @@
 Everything the `shardhive` daemon binary does today, derived from the
 code, plus the `shardr` runner lifecycle. The `shardr` CLI surface
 (import/pull/models/verify/status) is covered in the
-[README](https://github.com/Cyb3rDudu/shardr#adding-models) and
-[getting-started.md](getting-started.md).
+[README](https://github.com/Cyb3rDudu/shardr#adding-models). The earlier
+first-run walkthrough is archived in the repository at
+[docs/user/getting-started.md](https://github.com/Cyb3rDudu/shardr/blob/main/docs/user/getting-started.md).
 Usage/dispatch errors and warnings go to stderr; `cas verify` prints
 its per-digest outcome lines (including `FAIL …`) to stdout.
 
@@ -56,11 +57,12 @@ Startup sequence:
    are fetched via `/v1/ensure` on this node.
 3. Open the CAS, create the socket, serve API v1.
 
-Startup output (stderr for swarm lines, stdout for the ready line):
+Startup output (stderr for swarm lines, stdout for the ready line, which
+prints the resolved socket path):
 
 ```
 shardhive: swarm: seeding 1 artifact(s)
-shardhive 0.0.1-dev listening on /run/user/1000/shardhive.sock
+shardhive 0.0.1-dev listening on <socket path>
 ```
 
 Socket path resolution, in order:
