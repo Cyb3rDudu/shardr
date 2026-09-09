@@ -1,6 +1,9 @@
 # Code layout
 
-Module path: `github.com/Cyb3rDudu/shardr`. Go ≥ 1.25 (see go.mod), no CGO.
+Module path: `github.com/Cyb3rDudu/shardr`. Go ≥ 1.25 (see go.mod). CGO is
+used on Darwin only, for precise process-start identity
+(`internal/runner/starttime_darwin.go`, libproc); other platform
+paths stay pure Go.
 
 ```
 cmd/
