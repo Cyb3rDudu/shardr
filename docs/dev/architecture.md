@@ -1,8 +1,9 @@
 # Architecture
 
 How the pieces fit, derived from the current build. Protocol behavior
-is specified in [docs/specs/](../specs/); this page is the code-level
-view.
+is specified in the canonical specs at
+[docs/specs/](https://github.com/Cyb3rDudu/shardr/tree/main/docs/specs);
+this page is the code-level view.
 
 ## Components
 
