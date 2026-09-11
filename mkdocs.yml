@@ -83,9 +83,12 @@ markdown_extensions:
     - toc:
           permalink: true
 
-# Client-side chart rendering for mermaid architecture diagrams.
+# Client-side chart rendering for mermaid architecture diagrams. Vendored
+# (docs/assets/mermaid.min.js, mermaid 10.9.8) instead of a CDN <script>: the
+# site serves a file whose bytes are committed and reviewable, not executable
+# third-party code fetched at page view with no integrity binding.
 extra_javascript:
-    - https://unpkg.com/mermaid@10.9.8/dist/mermaid.min.js
+    - assets/mermaid.min.js
 
 nav:
     - Welcome: index.md
