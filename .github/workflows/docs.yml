@@ -23,10 +23,11 @@ on:
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
+# Least privilege at the workflow level: every job can read the repo. The
+# deploy job opts into Pages publishing below; no other job gets those
+# scopes.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: "pages"
@@ -35,6 +36,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -48,11 +51,13 @@ jobs:
         run: pip install -r docs/requirements.txt
 
       - name: Generalizability gate (no private infra in published docs)
-        # The published site must carry no host-specific values. docs/
-        # is the whole MkDocs source dir (the internal _inventory.md holds
-        # any explicit reference values and is exempt).
+        # Scope = the pages the site actually publishes, derived from
+        # mkdocs.yml via docs/list-published.py (the same source as the link
+        # checker). Canonical specs, the inventory, and the archived first-run
+        # page are not published and do not trip this gate.
         run: |
-          if grep -rniE '192\.168\.|mothership|\/Users\/|100\.(6[4-9]|7[0-9]|8[0-9]|9[0-9]|1[0-2][0-7])\.' docs/ | grep -v '_inventory.md'; then
+          mapfile -t published < <(python3 docs/list-published.py)
+          if grep -nHiE '192\.168\.|mothership|\/Users\/|100\.(6[4-9]|7[0-9]|8[0-9]|9[0-9]|1[0-2][0-7])\.' "${published[@]}"; then
             echo "private infra found in published docs"
             exit 1
           fi
@@ -60,7 +65,7 @@ jobs:
       - name: Build documentation
         run: mkdocs build --clean --strict
 
-      - name: Check relative links
+      - name: Check relative links and anchors
         run: bash docs/check-links.sh
 
       - name: Upload artifact
@@ -69,7 +74,12 @@ jobs:
           path: ./_site
 
   deploy:
-    if: github.event_name != 'pull_request'
+    # Publishing is main-only. A workflow_dispatch on any ref still runs the
+    # build (and can fail it), but only a main ref may overwrite the site.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
