@@ -61,6 +61,7 @@ exclude_docs: |
     _inventory.md
     requirements.txt
     check-links.sh
+    list-published.py
 
     specs/
     user/getting-started.md
