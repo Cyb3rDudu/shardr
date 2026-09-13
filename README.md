@@ -2,6 +2,8 @@
 
 # shardr
 
+**Documentation:** <https://cyb3rdudu.github.io/shardr/>
+
 shardr is a decentralized LLM repository with sync-based distribution. It
 keeps large language models available and digitally sovereign: artifacts
 live in content-addressed storage on your machines, synchronize over a
@@ -164,10 +166,9 @@ provenance (tag → commit, release-API digests) with
 
 ## Specifications & documentation
 
-Documentation site: **https://cyb3rdudu.github.io/shardr/**
-
-User and developer documentation lives in [`docs/user/`](docs/user/) and
-[`docs/dev/`](docs/dev/).
+The documentation site is the user and developer documentation:
+**<https://cyb3rdudu.github.io/shardr/>** — built from this repository's
+[`docs/`](docs/) directory.
 
 Design contracts live in [`docs/specs/`](docs/specs/) — see the
 [spec index](docs/specs/README.md) for surface statuses. Reference scheme &
