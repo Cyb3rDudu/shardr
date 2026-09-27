@@ -1,11 +1,11 @@
-ref = "b10684"
-commit = "cc83d7b4824f73cfdda4dfbb47ee39804f71b328"
-updated_at = "2026-09-05T15:58:13Z"
+ref = "b11060"
+commit = "4260903678a7525f43419dc234a942b551a8951e"
+updated_at = "2026-09-27T09:12:19Z"
 
 [assets.darwin_arm64]
-url = "https://github.com/ggml-org/llama.cpp/releases/download/b10684/llama-b10684-bin-macos-arm64.tar.gz"
-sha256 = "8310138372444cbeb5c1123c88d27aa9bc78dd14a549c5654733eb339f665c07"
+url = "https://github.com/ggml-org/llama.cpp/releases/download/b11060/llama-b11060-bin-macos-arm64.tar.gz"
+sha256 = "f38d330eb9e097316cbda7838d99d5414ab4195f8f96b303949ec80547168592"
 
 [assets.linux_amd64]
-url = "https://github.com/ggml-org/llama.cpp/releases/download/b10684/llama-b10684-bin-ubuntu-x64.tar.gz"
-sha256 = "2eb35b197e220511456dfb011c118f74707735457c4d09927ae0382c6b29e7ee"
+url = "https://github.com/ggml-org/llama.cpp/releases/download/b11060/llama-b11060-bin-ubuntu-x64.tar.gz"
+sha256 = "0ef19058e60555e9a318baa9d8490335505e6207dafdb936fb07f9623368ec46"
