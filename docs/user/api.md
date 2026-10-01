@@ -361,6 +361,50 @@ disabled; the message names the `[swarm] enabled` config knob), then
 swarm outcomes as terminal job errors (`E_NOT_IMPORTABLE`,
 `E_SOURCE_UNAVAILABLE`).
 
+## POST /v1/import/catalog
+
+Anchored pull of a community-listed model torrent (pirateface, Epic
+#65). Body:
+
+```json
+{
+  "repo": "owner/name",             // REQUIRED — the listed repo
+  "quant": "q4_k_m",                // optional GGUF family selector
+  "trustCatalog": true,             // REQUIRED for rescued models
+  "as": "ns/name",                  // optional namespace override
+  "peers": ["host:port"]            // optional direct-peer hints
+}
+```
+
+The daemon owns the whole trust path: it resolves the listing from the
+provider itself (never trusting caller-supplied magnets), builds the
+anchor — Hugging Face tree at the revision pinned by the listing's
+webseed — and runs the foreign-swarm (BitTorrent v1) import, then keeps
+seeding that swarm from CAS bytes (good-citizen mode, `[catalog]`
+upload_limit budget).
+
+A **rescued** model (HF repo or revision gone) refuses loudly without
+`trustCatalog`:
+
+```sh
+curl -s --unix-socket "$S" -X POST http://localhost/v1/import/catalog \
+  -d '{"repo":"owner/gone-model"}'
+# {"error":{"code":"E_NOT_ANCHORED",
+#           "message":"catalog: no anchor — the model is rescued … re-run
+#            with --trust-catalog …"}}                                  # 422
+```
+
+With `trustCatalog: true` the anchor becomes the catalog's own recorded
+SHA-256s; the job result carries the trust-shift warning.
+
+Errors: `E_BAD_REQUEST` (400 — bad body, missing `repo`),
+`E_UNKNOWN_REF` (400 — repo not listed by the provider),
+`E_NOT_ANCHORED` (422 — rescued without the trust shift), then
+provider/HF unreachability as `E_SOURCE_UNAVAILABLE` (502). Swarm and
+anchor failures surface as terminal job errors (`E_NOT_IMPORTABLE`,
+`E_SOURCE_UNAVAILABLE`). See [catalog pulls](catalog.md) for the full
+flow.
+
 ## GET /v1/models
 
 Local inventory from state + CAS presence:

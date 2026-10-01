@@ -54,7 +54,10 @@ func TestResolveAnchorLiveCoversEveryFile(t *testing.T) {
 	if a.Source != "huggingface" || a.Rescued {
 		t.Fatalf("anchor: %+v", a)
 	}
-	byPath := a.ByPath()
+	byPath := map[string]AnchorFile{}
+	for _, f := range a.Files {
+		byPath[f.Path] = f
+	}
 	if len(byPath) != 8 { // 9 tree files minus .gitattributes
 		t.Fatalf("want 8 anchored files, got %d", len(byPath))
 	}

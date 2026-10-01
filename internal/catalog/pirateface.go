@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/anacrolix/torrent/metainfo"
+
+	"github.com/Cyb3rDudu/shardr/internal/importer"
 )
 
 // DefaultPiratefaceURL is the live catalog endpoint; SHARDR_CATALOG_URL
@@ -69,6 +71,12 @@ func (p *Pirateface) get(ctx context.Context, path string) (int, []byte, error) 
 	if resp.StatusCode == http.StatusNotFound {
 		return resp.StatusCode, nil, ErrNotListed
 	}
+	if resp.StatusCode != http.StatusOK {
+		// A provider 5xx (or any odd status) is UNREACHABLE, not
+		// "not listed": parsing an error page as a listing would turn a
+		// provider outage into a wrong E_UNKNOWN_REF for the caller.
+		return resp.StatusCode, nil, fmt.Errorf("%w: HTTP %d from %s", ErrCatalogUnreachable, resp.StatusCode, path)
+	}
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return resp.StatusCode, nil, fmt.Errorf("%w: read body: %v", ErrCatalogUnreachable, err)
@@ -108,7 +116,7 @@ func (p *Pirateface) Search(ctx context.Context, terms string) ([]Model, error) 
 // Resolve implements Provider: exact-match search for the repo, then
 // decompose the magnet into identity + transport hints + pinned revision.
 func (p *Pirateface) Resolve(ctx context.Context, repo string) (*Resolved, error) {
-	if !ValidRepoID(repo) {
+	if !importer.ValidRepoID(repo) {
 		return nil, fmt.Errorf("%w: repo id %q is not owner/name", ErrBadListing, repo)
 	}
 	models, err := p.Search(ctx, repo)
@@ -129,15 +137,12 @@ func (p *Pirateface) Resolve(ctx context.Context, repo string) (*Resolved, error
 // "<sha256>  <path>"-per-line string prop. LFS weight files only — the
 // record is the rescued-anchor source, never the default anchor.
 func (p *Pirateface) Checksums(ctx context.Context, repo string) ([]FileChecksum, error) {
-	if !ValidRepoID(repo) {
+	if !importer.ValidRepoID(repo) {
 		return nil, fmt.Errorf("%w: repo id %q is not owner/name", ErrBadListing, repo)
 	}
-	status, body, err := p.get(ctx, "/"+repo)
+	_, body, err := p.get(ctx, "/"+repo)
 	if err != nil {
 		return nil, err
-	}
-	if status != http.StatusOK {
-		return nil, fmt.Errorf("%w: model page HTTP %d for %s", ErrBadListing, status, repo)
 	}
 	return ParseChecksumRecord(string(body))
 }
@@ -204,7 +209,7 @@ func ParseSearchLine(ln string) (*Model, error) {
 		return nil, fmt.Errorf("%w: line %q: want 4 double-space-separated fields, got %d", ErrBadListing, ln, len(fields))
 	}
 	repo, size, seeds, magnet := fields[0], fields[1], fields[2], fields[3]
-	if !ValidRepoID(repo) {
+	if !importer.ValidRepoID(repo) {
 		return nil, fmt.Errorf("%w: line %q: field 0 is not owner/name", ErrBadListing, ln)
 	}
 	seeds = strings.TrimSuffix(strings.TrimSuffix(seeds, "s"), " seed")
@@ -238,19 +243,4 @@ func ParseChecksumRecord(html string) ([]FileChecksum, error) {
 		out = append(out, FileChecksum{Path: parts[1], SHA256: parts[0]})
 	}
 	return out, nil
-}
-
-// ValidRepoID: namespace/name, bounded charset (mirrors the HF repo id
-// rules of the importer — catalog repos ARE HF repo ids).
-func ValidRepoID(repo string) bool {
-	if len(repo) < 3 || len(repo) > 200 || strings.Contains(repo, "..") {
-		return false
-	}
-	for _, r := range repo {
-		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
-			r == '/' || r == '.' || r == '-' || r == '_') {
-			return false
-		}
-	}
-	return strings.Count(repo, "/") == 1
 }

@@ -47,6 +47,10 @@ Provider facts worth knowing (verified 2026-10):
 - The listing's webseed redirects to `huggingface.co/<repo>/resolve/
   <revision>/<file>` — live models download straight from the HF CDN
   with the swarm as fallback.
+- Strict-mode anchors exclude `.gitattributes` (HF repo bookkeeping,
+  never part of a catalog torrent) — a listing torrent that packed it
+  anyway would be refused as carrying unanchorable bytes. No current
+  listing does.
 - Torrent metadata comes from peers: a pull of a listing with **zero
   seeders online** fails after two minutes with a loud error. A magnet
   alone never carries the file tree.

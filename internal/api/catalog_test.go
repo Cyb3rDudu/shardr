@@ -159,6 +159,7 @@ func (h *harness) startCatalogE2E(t *testing.T) *catalogE2E {
 	scfg := torrent.NewDefaultClientConfig()
 	scfg.DataDir = dir
 	scfg.NoDHT = true
+	scfg.ListenPort = 0 // ephemeral: anacrolix's fixed default (42069) collides when test binaries run in parallel
 	scfg.DisableIPv6 = true
 	scfg.ListenHost = func(string) string { return "127.0.0.1" }
 	scfg.Seed = true
@@ -321,11 +322,84 @@ func TestImportCatalogUnlistedRepo(t *testing.T) {
 	h := newHarness(t)
 	h.startCatalogE2E(t)
 	code, body := h.postJSON("/v1/import/catalog", map[string]any{"repo": "who/what"})
-	if code != http.StatusBadGateway {
+	// Unlisted is a client-input class (E_UNKNOWN_REF → 400): the caller
+	// asked for a repo the provider does not list.
+	if code != http.StatusBadRequest {
 		t.Fatalf("unlisted repo: %d %s", code, body)
 	}
 	if !strings.Contains(string(body), "E_UNKNOWN_REF") {
 		t.Fatalf("unlisted must map to E_UNKNOWN_REF: %s", body)
+	}
+}
+
+// The rescued pull WITH trustCatalog over the full daemon path: HF is
+// gone, the anchor becomes the catalog's checksum record (weights only —
+// the record covers LFS files), the driver runs in trust mode (uncovered
+// files ride the torrent's piece hashes), and the job completes with the
+// trust-shift warning riding the result. This also pins the strict-flag
+// wiring (strict: !Anchor.Rescued) — rot here turns this red.
+func TestImportCatalogRescuedTrustPull(t *testing.T) {
+	h := newHarness(t)
+	e := h.startCatalogE2E(t)
+	peer, _ := e.seederAdr.Load().(string)
+	if peer == "" {
+		t.Fatal("seeder not listening")
+	}
+	// HF gone: the source is rescued.
+	e.hfStub.Close()
+	gone := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(gone.Close)
+	h.server.HF = &importer.HFClient{BaseURL: gone.URL, HTTP: gone.Client()}
+	// Provider record covering ONLY the weights file: everything else
+	// must seal under computed digests (catalog trust).
+	e.pfStub.Close()
+	weights := e.fx.Files[1]
+	trusted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.EscapedPath(), "/s/") {
+			magnet := "magnet:?xt=urn:btih:" + e.fx.Infohash +
+				"&ws=" + url.QueryEscape("https://pirateface.co/api/ws/owner/repo/"+strings.Repeat("b", 40)+"/")
+			fmt.Fprintf(w, "owner/repo  150 KB  1 seeds  %s\n", magnet)
+			return
+		}
+		if r.URL.Path == "/owner/repo" {
+			fmt.Fprintf(w, `x{\"manifest\":\"%s  %s\"}`, weights.SHA256, weights.Path)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(trusted.Close)
+	h.server.Catalog = &catalog.Pirateface{BaseURL: trusted.URL, HTTP: trusted.Client()}
+
+	code, body := h.postJSON("/v1/import/catalog", map[string]any{
+		"repo": "owner/repo", "trustCatalog": true, "peers": []string{peer},
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("rescued trust pull: %d %s", code, body)
+	}
+	var job Job
+	json.Unmarshal(body, &job)
+	term := waitJob(t, h, job.ID)
+	if term.State != "done" {
+		t.Fatalf("terminal: %+v (error %+v)", term, term.Error)
+	}
+	// The weights file verified against the CATALOG record (anchor
+	// digest in the CAS); the companions sealed under computed digests.
+	if !h.store.Has(weights.SHA256) {
+		t.Fatal("catalog-record digest for the weights file missing from CAS")
+	}
+	for _, f := range e.fx.Files {
+		if f.Path == weights.Path {
+			continue
+		}
+		if !h.store.Has(f.SHA256) {
+			t.Fatalf("computed digest for uncovered file %s missing from CAS (trust mode must seal it)", f.Path)
+		}
+	}
+	// The trust-shift warning rides the terminal result.
+	if len(term.Result.Warnings) == 0 || !strings.Contains(strings.Join(term.Result.Warnings, " "), "trust shifts from Hugging Face") {
+		t.Fatalf("trust-shift warning must ride the job result: %+v", term.Result.Warnings)
 	}
 }
 

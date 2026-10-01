@@ -822,8 +822,6 @@ func (s *Server) handleImportBT(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
-// handleJob returns a job by id. The stored pointer is immutable after
-// publication; the copy keeps future mutation-safety obvious.
 // handleImportCatalog (Epic #65): POST {repo, quant?, trustCatalog?, as?} —
 // anchored pull of a community-listed model torrent. The daemon owns the
 // whole trust path: it resolves the listing from the provider itself
@@ -860,17 +858,13 @@ func (s *Server) handleImportCatalog(w http.ResponseWriter, r *http.Request) {
 	resolved, err := s.Catalog.Resolve(r.Context(), body.Repo)
 	if err != nil {
 		he := mapImportError(err)
-		writeErr(w, http.StatusBadGateway, he.Code, he.Message)
+		writeErr(w, importErrStatus(he), he.Code, he.Message)
 		return
 	}
 	anchor, err := catalog.ResolveAnchor(r.Context(), s.HF, s.Catalog, resolved, body.TrustCatalog)
 	if err != nil {
 		he := mapImportError(err)
-		status := http.StatusBadGateway
-		if he.Code == "E_NOT_ANCHORED" {
-			status = http.StatusUnprocessableEntity
-		}
-		writeErr(w, status, he.Code, he.Message)
+		writeErr(w, importErrStatus(he), he.Code, he.Message)
 		return
 	}
 	as := body.As
@@ -897,6 +891,23 @@ func (s *Server) handleImportCatalog(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, job)
 }
 
+// importErrStatus maps resolve/anchor error classes to HTTP statuses:
+// client-input classes are 4xx (matching the ensure-handler convention),
+// the rescued refusal keeps its own 422, provider/HF unreachability is
+// 502 (their outage, not the caller's mistake).
+func importErrStatus(he *APIError) int {
+	switch he.Code {
+	case ErrUnknownRef:
+		return http.StatusBadRequest
+	case "E_NOT_ANCHORED":
+		return http.StatusUnprocessableEntity
+	default:
+		return http.StatusBadGateway
+	}
+}
+
+// handleJob returns a job by id. The stored pointer is immutable after
+// publication; the copy keeps future mutation-safety obvious.
 func (s *Server) handleJob(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	s.mu.Lock()
@@ -1251,18 +1262,31 @@ func (s *Server) runImport(job *Job, run func(progress func(int, int)) (*importe
 	next := *job
 	next.State = "fetching"
 	s.publishJob(&next)
+	// Terminal-first discipline (mirrors startFillJob): a progress tick
+	// racing the terminal publication must never flip a terminal job back
+	// to "fetching" — the job would never terminate for API readers.
+	var mu sync.Mutex
+	terminal := false
 	res, err := run(func(done, total int) {
+		mu.Lock()
+		defer mu.Unlock()
+		if terminal {
+			return
+		}
 		prog := *s.currentJob(job.ID)
 		prog.State = "fetching"
 		prog.FilesDone, prog.FilesTotal = done, total
 		s.publishJob(&prog)
 	})
+	mu.Lock()
 	term := *job
 	term.FilesDone = term.FilesTotal
 	if err != nil {
 		term.State = "failed"
 		term.Error = mapImportError(err)
+		terminal = true
 		s.publishJob(&term)
+		mu.Unlock()
 		return
 	}
 	term.State = "done"
@@ -1278,7 +1302,9 @@ func (s *Server) runImport(job *Job, run func(progress func(int, int)) (*importe
 			term.Manifest = m.Manifest
 		}
 	}
+	terminal = true
 	s.publishJob(&term)
+	mu.Unlock()
 }
 
 // currentJob returns the current published instance (or the given fallback).

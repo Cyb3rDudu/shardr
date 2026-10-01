@@ -31,6 +31,11 @@ func TestArgParsingFailLoud(t *testing.T) {
 		{"stop-two-ids", []string{"stop", "a", "b"}, "at most one id"},
 		{"stop-all-with-id", []string{"stop", "--all", "a"}, "--all takes no id"},
 		{"run-serve-only-id", []string{"run", "ns/name:q8_0", "--id", "foo"}, "--id is serve-only"},
+		{"catalog-pull-two-repos", []string{"pull", "a/b", "c/d"}, "pull takes exactly one owner/repo"},
+		{"catalog-pull-quant-last", []string{"pull", "a/b", "--quant"}, "--quant needs a value"},
+		{"catalog-pull-no-repo", []string{"pull", "--trust-catalog"}, "catalog pull needs an owner/repo"},
+		{"catalog-no-subcommand", []string{"catalog"}, "catalog needs a subcommand"},
+		{"catalog-unknown-subcommand", []string{"catalog", "list"}, "unknown catalog subcommand"},
 	}
 	for _, tc := range cases {
 		// The command must fail BEFORE touching the socket: SHARDR_SOCKET

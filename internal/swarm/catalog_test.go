@@ -40,6 +40,7 @@ func TestCatalogPullLoopSeedsForeignSwarm(t *testing.T) {
 	scfg := torrent.NewDefaultClientConfig()
 	scfg.DataDir = dir
 	scfg.NoDHT = true
+	scfg.ListenPort = 0 // ephemeral: anacrolix's fixed default (42069) collides when test binaries run in parallel
 	scfg.DisableIPv6 = true
 	scfg.ListenHost = func(string) string { return "127.0.0.1" }
 	scfg.Seed = true

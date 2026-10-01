@@ -89,7 +89,7 @@ func (c *HFClient) ListRepo(ctx context.Context, repo, revision string) (*RepoIn
 	if revision == "" {
 		revision = "main"
 	}
-	if !validHFRepoID(repo) {
+	if !ValidRepoID(repo) {
 		return nil, fmt.Errorf("invalid repo id %q", repo)
 	}
 	rev, rerr := escapeSegments(revision)
@@ -127,10 +127,10 @@ func (c *HFClient) ListRepo(ctx context.Context, repo, revision string) (*RepoIn
 // (lfs.oid). Both are anchor material — the catalog layer verifies bytes
 // against whichever digest HF publishes (Epic #65).
 type TreeFile struct {
-	Path    string
-	Size    int64
-	GitOID  string
-	LFSOID  string // bare 64-hex sha256, LFS files only
+	Path   string
+	Size   int64
+	GitOID string
+	LFSOID string // bare 64-hex sha256, LFS files only
 }
 
 // ListRepoTree fetches /api/models/{repo}/tree/{revision}?recursive=1
@@ -141,7 +141,7 @@ func (c *HFClient) ListRepoTree(ctx context.Context, repo, revision string) ([]T
 	if revision == "" {
 		revision = "main"
 	}
-	if !validHFRepoID(repo) {
+	if !ValidRepoID(repo) {
 		return nil, fmt.Errorf("invalid repo id %q", repo)
 	}
 	rev, rerr := escapeSegments(revision)
@@ -219,7 +219,7 @@ func (c *HFClient) OpenFile(ctx context.Context, repo, revision, path string) (i
 	if revision == "" {
 		revision = "main"
 	}
-	if !validHFRepoID(repo) {
+	if !ValidRepoID(repo) {
 		return nil, fmt.Errorf("invalid repo id %q", repo)
 	}
 	rev, rerr := escapeSegments(revision)
@@ -257,8 +257,10 @@ func escapeSegments(s string) (string, error) {
 	return strings.Join(segs, "/"), nil
 }
 
-// validHFRepoID: namespace/name with a permissive but bounded charset.
-func validHFRepoID(repo string) bool {
+// ValidRepoID: namespace/name with a permissive but bounded charset.
+// Exported: the catalog layer validates the same repo ids (catalog
+// repos ARE HF repo ids) — one source of truth, no drifting copies.
+func ValidRepoID(repo string) bool {
 	if len(repo) < 3 || len(repo) > 200 || strings.Contains(repo, "..") {
 		return false
 	}
