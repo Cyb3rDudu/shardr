@@ -19,6 +19,9 @@ type Provider interface {
 	// Resolve fetches one repo's listing record: magnet, transport hints,
 	// pinned revision, and the catalog-recorded per-file checksums.
 	Resolve(ctx context.Context, repo string) (*Resolved, error)
+	// Checksums fetches the provider's recorded per-file SHA-256 record
+	// for a repo (the rescued-anchor source under --trust-catalog).
+	Checksums(ctx context.Context, repo string) ([]FileChecksum, error)
 }
 
 // Model is one search hit (listing, not a guarantee of availability).

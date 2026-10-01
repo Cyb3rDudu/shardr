@@ -122,6 +122,94 @@ func (c *HFClient) ListRepo(ctx context.Context, repo, revision string) (*RepoIn
 	return info, nil
 }
 
+// TreeFile is one file entry of the HF tree API: the git blob id (SHA-1)
+// pins every file; LFS files additionally carry their official SHA-256
+// (lfs.oid). Both are anchor material — the catalog layer verifies bytes
+// against whichever digest HF publishes (Epic #65).
+type TreeFile struct {
+	Path    string
+	Size    int64
+	GitOID  string
+	LFSOID  string // bare 64-hex sha256, LFS files only
+}
+
+// ListRepoTree fetches /api/models/{repo}/tree/{revision}?recursive=1
+// with cursor pagination (Link header, rel=next). An empty revision
+// defaults to "main". A 404 (repo or revision gone) maps to
+// ErrUnknownRepo — the caller's rescued-model detection.
+func (c *HFClient) ListRepoTree(ctx context.Context, repo, revision string) ([]TreeFile, error) {
+	if revision == "" {
+		revision = "main"
+	}
+	if !validHFRepoID(repo) {
+		return nil, fmt.Errorf("invalid repo id %q", repo)
+	}
+	rev, rerr := escapeSegments(revision)
+	if rerr != nil {
+		return nil, fmt.Errorf("invalid revision %q: %s", revision, rerr)
+	}
+	var files []TreeFile
+	url := c.BaseURL + "/api/models/" + repo + "/tree/" + rev + "?recursive=true"
+	for url != "" {
+		resp, err := c.do(ctx, url)
+		if err != nil {
+			return nil, err
+		}
+		var entries []struct {
+			Type string `json:"type"`
+			Path string `json:"path"`
+			OID  string `json:"oid"`
+			Size int64  `json:"size"`
+			LFS  *struct {
+				OID  string `json:"oid"`
+				Size int64  `json:"size"`
+			} `json:"lfs"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&entries)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("hf tree api decode: %w", err)
+		}
+		for _, e := range entries {
+			if e.Type != "file" {
+				continue
+			}
+			tf := TreeFile{Path: e.Path, Size: e.Size, GitOID: e.OID}
+			if e.LFS != nil && len(e.LFS.OID) == 64 {
+				tf.LFSOID = strings.ToLower(e.LFS.OID)
+			}
+			files = append(files, tf)
+		}
+		url = nextLink(resp.Header.Get("Link"))
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("hf repo %s@%s: empty file tree", repo, revision)
+	}
+	return files, nil
+}
+
+// nextLink extracts the rel=next cursor URL from an RFC 8288 Link header
+// (the HF tree API paginates beyond 1000 entries this way).
+func nextLink(h string) string {
+	for _, part := range strings.Split(h, ",") {
+		var url string
+		rel := ""
+		for _, param := range strings.Split(strings.TrimSpace(part), ";") {
+			param = strings.TrimSpace(param)
+			if strings.HasPrefix(param, "<") && strings.HasSuffix(param, ">") {
+				url = param[1 : len(param)-1]
+			}
+			if strings.HasPrefix(param, "rel=") {
+				rel = strings.Trim(strings.TrimPrefix(param, "rel="), `"`)
+			}
+		}
+		if rel == "next" && url != "" {
+			return url
+		}
+	}
+	return ""
+}
+
 // OpenFile streams one file: GET /{repo}/resolve/{revision}/{path}. The
 // endpoint is range-capable; this slice streams sequentially (resume via
 // Range is CAS-part follow-up work). Redirects (CDN) are followed by the
