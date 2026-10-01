@@ -58,7 +58,8 @@ func (c *Client) foreignEngine() (*torrent.Client, error) {
 		}
 		tcfg.ListenPort = 0
 		if c.cfg.CatalogUploadLimit > 0 {
-			tcfg.UploadRateLimiter = uploadLimiter(c.cfg.CatalogUploadLimit)
+			c.foreignLim = uploadLimiter(c.cfg.CatalogUploadLimit)
+			tcfg.UploadRateLimiter = c.foreignLim
 		}
 		tc, err := torrent.NewClient(tcfg)
 		if err != nil {

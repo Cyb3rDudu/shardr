@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/Cyb3rDudu/shardr/internal/cli"
 )
@@ -16,7 +17,10 @@ var version = "0.1.0-dev"
 const usage = `shardr — model runner & shardhive CLI (005 §4)
 
 Usage:
-  shardr pull <ref>                    fill the CAS (import/swarm), no run
+  shardr pull <owner/repo> [--quant q] [--trust-catalog]
+                                       catalog pull (pirateface), anchored
+  shardr pull <ns/name:quant>          fill the CAS (import/swarm), no run
+  shardr catalog search <terms…>       search the catalog listing
   shardr import local <paths> --as ns/name
   shardr import hf <repo> [--rev <sha>]
   shardr import bt <magnet> --manifest <sha256:…>
@@ -32,6 +36,10 @@ Usage:
 Short refs (ns/name:quant) canonicalize internally; the API only ever
 sees the canonical shardr:/// URI (000 §2). Runtime keys are validated
 against the 002 §7.1 allowlist — unknown keys fail loudly.
+
+Catalog pulls (bare owner/repo, no quant selector) fetch the listed
+torrent anchored at Hugging Face; rescued models need --trust-catalog
+and then verify against the catalog's own checksums.
 
 Version %s
 `
@@ -52,12 +60,20 @@ func run(args []string) int {
 	ctx := context.Background()
 	switch args[0] {
 	case "pull":
+		// Two pull forms: a bare owner/repo (no quant selector) is a
+		// CATALOG pull (Epic #65); anything selector-bearing is the
+		// established ref pull (ensure/fill).
+		if len(args) >= 2 && !strings.Contains(args[1], ":") {
+			return cmdCatalogPull(ctx, args[1:])
+		}
 		return withClient(func(c *cli.Client) error {
 			if len(args) != 2 {
 				return fmt.Errorf("E_BAD_REQUEST: pull needs exactly one ref, got %d arguments", len(args)-1)
 			}
 			return cli.Pull(ctx, c, args[1], os.Stdout)
 		})
+	case "catalog":
+		return cmdCatalog(ctx, args[1:])
 	case "import":
 		return cmdImport(ctx, args[1:])
 	case "models":
@@ -109,6 +125,46 @@ func fail(err error) int {
 	// API/job errors pass through unchanged.
 	fmt.Fprintf(os.Stderr, "shardr: %s\n", err.Error())
 	return 1
+}
+
+func cmdCatalog(ctx context.Context, args []string) int {
+	if len(args) < 1 {
+		return fail(fmt.Errorf("E_BAD_REQUEST: catalog needs a subcommand: search <terms…>"))
+	}
+	switch args[0] {
+	case "search":
+		return fail(cli.CatalogSearch(ctx, args[1:], os.Stdout))
+	default:
+		return fail(fmt.Errorf("E_BAD_REQUEST: unknown catalog subcommand %q (search)", args[0]))
+	}
+}
+
+func cmdCatalogPull(ctx context.Context, args []string) int {
+	var repo, quant string
+	trust := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--quant":
+			if i+1 >= len(args) {
+				return fail(fmt.Errorf("E_BAD_REQUEST: --quant needs a value (it is the last argument)"))
+			}
+			i++
+			quant = args[i]
+		case "--trust-catalog":
+			trust = true
+		default:
+			if repo != "" {
+				return fail(fmt.Errorf("E_BAD_REQUEST: pull takes exactly one owner/repo, got %q and %q", repo, args[i]))
+			}
+			repo = args[i]
+		}
+	}
+	if repo == "" {
+		return fail(fmt.Errorf("E_BAD_REQUEST: catalog pull needs an owner/repo"))
+	}
+	return withClient(func(c *cli.Client) error {
+		return cli.CatalogPull(ctx, c, repo, cli.CatalogPullOptions{Quant: quant, TrustCatalog: trust}, os.Stdout)
+	})
 }
 
 func cmdImport(ctx context.Context, args []string) int {
