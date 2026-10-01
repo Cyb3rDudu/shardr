@@ -1,0 +1,8 @@
+catalog real E2E (TestCatalogRealE2E)
+repo:       bartowski/Qwen2.5-0.5B-Instruct-GGUF
+quant:      raw (raw filter)
+pull:       50s
+ref:        bartowski/qwen2.5-0.5b-instruct-gguf:raw
+chat:       HTTP 200
+answer:     OK, thank you.
+tok/s:      prompt 1639.1 / predicted 259.5

@@ -159,7 +159,14 @@ func (c *Client) ImportCatalog(ctx context.Context, pull *CatalogPull, progress 
 	}
 	target := len(wanted)
 	if progress != nil {
-		go pollProgress(ctx, drv, target, progress)
+		// The poller MUST die with this function: a live poller keeps
+		// republishing the terminal job as "fetching" (the progress
+		// callback re-reads the current job), and the job never
+		// terminates for API readers — the race Fill already guards
+		// against with its own cancel.
+		pollCtx, pollCancel := context.WithCancel(ctx)
+		defer pollCancel()
+		go pollProgress(pollCtx, drv, target, progress)
 	}
 	if err := drv.WaitSealed(ctx, target); err != nil {
 		dropTorrent(t)
@@ -236,9 +243,14 @@ func pollProgress(ctx context.Context, drv *foreignTorrent, target int, progress
 	}
 }
 
-// wantedFiles computes the download set: with a quant selector, only the
-// GGUF weights files whose filename token matches plus every non-weights
-// file; without, everything.
+// wantedFiles computes the download set: with a quant selector, only
+// the GGUF weights files matching it plus every non-weights file;
+// without, everything. Matching follows the derivation chain's first
+// hop (filename token): a selector matches when QuantFromFilename(base)
+// equals it, and "raw" also matches token-less files — uppercase
+// real-world names (Q4_K_M.gguf) derive raw per 000 App. A (the quant
+// vocabulary is lowercase-only). Safetensors groups derive their quant
+// from bytes; pull those without --quant.
 func wantedFiles(t *torrent.Torrent, quant string) (map[string]bool, error) {
 	info := t.Info()
 	wanted := map[string]bool{}
@@ -255,17 +267,21 @@ func wantedFiles(t *torrent.Torrent, quant string) (map[string]bool, error) {
 			wanted[path] = true
 			continue
 		}
+		if !strings.HasSuffix(lower, ".gguf") {
+			continue // safetensors under a selector: derive-from-bytes, not filterable
+		}
 		weightsTotal++
-		if importer.QuantFromFilename(base) == strings.ToLower(quant) {
+		token := importer.QuantFromFilename(base)
+		if token == strings.ToLower(quant) || (token == "" && quant == "raw") {
 			wanted[path] = true
 			weightsMatched++
 		}
 	}
 	if quant != "" && weightsMatched == 0 {
 		if weightsTotal == 0 {
-			return nil, fmt.Errorf("swarm: catalog: --quant %q: repo has no GGUF weights to filter (safetensors groups derive their quant from the bytes; pull without --quant)", quant)
+			return nil, fmt.Errorf("swarm: catalog: --quant %q: the listing carries no GGUF weights to filter (safetensors groups derive their quant from the bytes; pull without --quant)", quant)
 		}
-		return nil, fmt.Errorf("swarm: catalog: --quant %q matches no weights file (%d GGUF files listed)", quant, weightsTotal)
+		return nil, fmt.Errorf("swarm: catalog: --quant %q matches no listed weights file (%d GGUF files in the torrent)", quant, weightsTotal)
 	}
 	return wanted, nil
 }

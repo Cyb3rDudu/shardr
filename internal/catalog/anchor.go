@@ -57,7 +57,18 @@ func ResolveAnchor(ctx context.Context, hf *importer.HFClient, pf Provider, r *R
 			if tf.Path == ".gitattributes" {
 				continue // repo bookkeeping, never part of a catalog torrent
 			}
-			a.Files = append(a.Files, AnchorFile{Path: tf.Path, Size: tf.Size, SHA256: tf.LFSOID, GitSHA1: tf.GitOID})
+			af := AnchorFile{Path: tf.Path, Size: tf.Size}
+			if tf.LFSOID != "" {
+				// LFS file: lfs.oid (sha256) pins the CONTENT; the tree's git
+				// oid pins the 130-byte LFS POINTER, not the bytes — using it
+				// as a content gate would refuse every honest download
+				// (proven live: the bartowski Q4_K_M pull refused on exactly
+				// this until fixed).
+				af.SHA256 = tf.LFSOID
+			} else {
+				af.GitSHA1 = tf.GitOID
+			}
+			a.Files = append(a.Files, af)
 		}
 		return a, nil
 	}
