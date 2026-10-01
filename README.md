@@ -75,6 +75,13 @@ shardr import hf Qwen/Qwen3-4B-Instruct-GGUF
 # accepted)
 shardr import bt "magnet:?xt=…" --manifest sha256:ab…
 
+# Catalog (pirateface.co): search the listing, pull anchored — bytes
+# verify against Hugging Face at the pinned revision, then keep seeding
+# the listed swarm (good-citizen mode). A bare owner/repo (no :quant)
+# is a catalog pull; rescued models need --trust-catalog.
+shardr catalog search qwen 0.5b gguf
+shardr pull bartowski/Qwen2.5-0.5B-Instruct-GGUF --quant raw
+
 shardr models          # inventory: namespaces, quants, sizes
 shardr status          # job progress / recent jobs
 ```

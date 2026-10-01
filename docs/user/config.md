@@ -26,6 +26,11 @@ seed = true               # seed complete artifacts (the community mirror)
 upload_limit = 0          # bytes/sec, 0 = unlimited
 dht = true                # DHT + PEX
 
+[catalog]
+# good-citizen seeding budget for foreign catalog swarms; unset
+# inherits [swarm] upload_limit
+upload_limit = 524288
+
 [references]
 # Interactive-CLI comfort ONLY: applied when a human types a
 # selector-less ref. Never applied in Modelfiles, the API, manifests,
@@ -62,6 +67,25 @@ Rules the parser enforces:
 - Keys inside `[swarm]` that are not in the table above are errors.
 - Keys inside other sections are **not** validated by shardhive — those
   sections belong to other components.
+
+## `[catalog]` — community seeding budget
+
+The good-citizen seeding budget for foreign catalog swarms (see
+[Catalog pulls](catalog.md)). One key:
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `upload_limit` | int | inherits `[swarm] upload_limit` | bytes/sec for seeding catalog-listed torrents, `0` = unlimited; must be ≥ 0 |
+
+When the key is unset, the `[swarm]` value applies — one budget for
+your own swarms, a separate, explicitly-configurable budget for
+community swarms. Unknown `[catalog]` keys are a loud error (same
+fail-closed rule as `[swarm]`).
+
+```toml
+[catalog]
+upload_limit = 524288     # 512 KiB/s give-back to community swarms
+```
 
 ## `[references]` — CLI-only comfort
 

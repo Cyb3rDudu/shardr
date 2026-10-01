@@ -98,6 +98,7 @@ nav:
           - Quickstart: get-started/quickstart.md
     - User Guide:
           - Importing models: user/importing.md
+          - Catalog pulls: user/catalog.md
           - Swarm & seeding: user/swarm.md
           - Configuration: user/config.md
           - API — HTTP v1: user/api.md
