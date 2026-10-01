@@ -34,6 +34,15 @@ func TestCatalogUploadLimitWiring(t *testing.T) {
 	if c.foreignLim.Limit() != rate.Limit(4096) {
 		t.Fatalf("limiter rate: %v, want 4096", c.foreignLim.Limit())
 	}
+	// The attachment itself (mutation-proof): the engine config must
+	// carry exactly the constructed limiter — deleting the
+	// `tcfg.UploadRateLimiter = c.foreignLim` wiring line turns this red.
+	if c.foreignTcfg == nil {
+		t.Fatal("foreign engine config must be retained for wiring assertion")
+	}
+	if c.foreignTcfg.UploadRateLimiter != c.foreignLim {
+		t.Fatal("foreign engine config must carry the [catalog] upload_limit limiter")
+	}
 	// The v2 engine's budget is separate: no catalog limit on it (the
 	// swarm UploadLimit is 0 here = unlimited).
 	if c.uploadLim != nil {
@@ -57,5 +66,10 @@ func TestCatalogUploadLimitUnlimitedByDefault(t *testing.T) {
 	}
 	if c.foreignLim != nil {
 		t.Fatal("unset [catalog] upload_limit (0 = unlimited) must not construct a limiter")
+	}
+	// NewDefaultClientConfig pre-attaches its own "unlimited" limiter;
+	// the assertion is that OUR limiter never replaced it.
+	if c.foreignTcfg.UploadRateLimiter == c.foreignLim {
+		t.Fatal("unset [catalog] upload_limit must not attach our limiter to the engine")
 	}
 }

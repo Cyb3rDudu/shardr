@@ -35,22 +35,18 @@ type Model struct {
 // FileChecksum is one catalog-recorded per-file SHA-256 (the provider's
 // copy of the official HF hashes for LFS weight files).
 type FileChecksum struct {
-	Path  string
+	Path   string
 	SHA256 string // bare 64-hex
 }
 
 // Resolved is the full listing record for one repo.
 type Resolved struct {
-	Repo      string
-	Revision  string   // 40-hex HF commit pinned by the listing's webseed
-	Infohash  string   // v1, 40 hex — the foreign torrent's identity
-	Magnet    string   // the listed magnet (uri-escaped as served)
-	Trackers  []string // tr= values
-	Webseeds  []string // ws= values
-	Size      string
-	Seeds     int
-	// Checksums is the catalog's checksum record for the repo (LFS weight
-	// files). For non-rescued pulls the anchor of record is HF itself;
-	// for rescued pulls (trust-catalog) this record IS the anchor.
-	Checksums []FileChecksum
+	Repo     string
+	Revision string   // 40-hex HF commit pinned by the listing's webseed
+	Infohash string   // v1, 40 hex — the foreign torrent's identity
+	Magnet   string   // the listed magnet (uri-escaped as served)
+	Trackers []string // tr= values
+	Webseeds []string // ws= values
+	Size     string
+	Seeds    int
 }

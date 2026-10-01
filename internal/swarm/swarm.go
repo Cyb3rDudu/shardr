@@ -82,6 +82,7 @@ type Client struct {
 	foreignOnce  sync.Once
 	foreignErr   error
 	foreignTC    *torrent.Client
+	foreignTcfg  *torrent.ClientConfig // retained config (wiring test asserts the limiter attachment)
 	foreignStor  *ForeignStorage
 	foreignLim   *rate.Limiter // good-citizen upload budget (nil = unlimited)
 	foreignMu    sync.Mutex
@@ -127,8 +128,7 @@ func New(cfg Config) (*Client, error) {
 	if cfg.UploadLimit > 0 {
 		// One shared budget across both upload paths (peer protocol +
 		// webseed HTTP): upload_limit is a node-level knob (004 §7).
-		// Burst covers one peer request window (config default if unset).
-		uploadLim = rate.NewLimiter(rate.Limit(cfg.UploadLimit), 1<<16)
+		uploadLim = uploadLimiter(cfg.UploadLimit)
 		tcfg.UploadRateLimiter = uploadLim
 	}
 	tc, err := torrent.NewClient(tcfg)
@@ -171,10 +171,13 @@ func (c *Client) PeerAddrs() []string {
 // ForeignPeerAddrs returns the FOREIGN (catalog) engine's listener
 // addresses — the x.pe-style hints for good-citizen seeding.
 func (c *Client) ForeignPeerAddrs() []string {
-	if c.foreignTC == nil {
+	c.foreignMu.Lock()
+	ftc := c.foreignTC
+	c.foreignMu.Unlock()
+	if ftc == nil {
 		return nil
 	}
-	return c.listenAddrs(c.foreignTC)
+	return c.listenAddrs(ftc)
 }
 
 func (c *Client) listenAddrs(tc *torrent.Client) []string {
@@ -263,8 +266,11 @@ func (c *Client) Close() {
 		c.wsSrv.Close()
 	}
 	c.tc.Close()
-	if c.foreignTC != nil {
-		c.foreignTC.Close()
+	c.foreignMu.Lock()
+	ftc := c.foreignTC
+	c.foreignMu.Unlock()
+	if ftc != nil {
+		ftc.Close()
 	}
 }
 

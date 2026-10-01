@@ -98,6 +98,10 @@ func testFixture() *v1Fixture {
 		{Path: "config.json", Content: bytes.Repeat([]byte(`{"model_type":"toy"}`), 60)}, // ~960 B
 		{Path: "model.safetensors", Content: foreignBytes(300*1024 + 123)},
 		{Path: "tokenizer.json", Content: []byte(`{"tokens":[]}`)},
+		// v1-legal empty file: no stream bytes, no pieces — must still
+		// seal (at open, under the empty digest) or the wanted target is
+		// unreachable and the pull hangs.
+		{Path: "empty.txt", Content: nil},
 	}
 	return buildV1("owner__repo", files, 64*1024)
 }
@@ -168,7 +172,7 @@ func TestForeignDriverRefusesAnchorMismatch(t *testing.T) {
 		}
 	}
 	if err == nil {
-		if err = drv.WaitSealed(context.Background(), len(fx.Files)); err == nil {
+		if err = drv.WaitSealedWanted(context.Background(), wantedOf(fx)); err == nil {
 			t.Fatal("tampered anchor digest must refuse the seal")
 		}
 	}
@@ -311,5 +315,170 @@ func TestForeignDriverCASHitSeedsAndCompletesViaEngine(t *testing.T) {
 	}
 	if c := ti2a.Piece(p0).Completion(); !c.Ok || !c.Complete {
 		t.Fatal("engine-verified piece must report complete after MarkComplete")
+	}
+}
+
+// wantedOf indexes the fixture paths (the wanted set).
+func wantedOf(fx *v1Fixture) map[string]bool {
+	m := make(map[string]bool, len(fx.Files))
+	for _, f := range fx.Files {
+		m[f.Path] = true
+	}
+	return m
+}
+
+// Empty torrent files (v1-legal) seal at open under the empty digest and
+// count toward the wanted target — before the fix they had no state at
+// all and WaitSealedWanted hung forever.
+func TestForeignDriverEmptyFileSealsAtOpen(t *testing.T) {
+	fx := testFixture()
+	_, drv, ti := openFixtureStorage(t, fx, fx.anchorOf(), true)
+	infoV, _ := fx.MetaInfo.UnmarshalInfo()
+	info := &infoV
+	if got := drv.SealedFiles()["empty.txt"]; got != emptyContentSHA256 {
+		t.Fatalf("empty file must be sealed at open under the empty digest, got %q", got)
+	}
+	var stream []byte
+	for _, f := range fx.Files {
+		stream = append(stream, f.Content...)
+	}
+	for i := 0; i < info.NumPieces(); i++ {
+		if err := downloadPiece(t, ti, info.Piece(i), stream); err != nil {
+			t.Fatalf("piece %d: %v", i, err)
+		}
+	}
+	if err := drv.WaitSealedWanted(context.Background(), wantedOf(fx)); err != nil {
+		t.Fatalf("empty file must not block the target: %v", err)
+	}
+}
+
+// An anchor pinning an EMPTY torrent file with any other digest is an
+// anchor/torrent mismatch: refuse at open (strict semantics intact).
+func TestForeignDriverEmptyFileAnchorMismatch(t *testing.T) {
+	fx := testFixture()
+	anchor := fx.anchorOf()
+	e := anchor["empty.txt"]
+	e.SHA256 = strings.Repeat("f", 64)
+	anchor["empty.txt"] = e
+	store, err := cas.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := NewForeignStorage(store)
+	if err := fs.Register(fx.Infohash, anchor, true); err != nil {
+		t.Fatal(err)
+	}
+	infoV, _ := fx.MetaInfo.UnmarshalInfo()
+	ih := hashFromHex(t, fx.Infohash)
+	if _, err := fs.OpenTorrent(context.Background(), &infoV, ih); err == nil {
+		t.Fatal("anchor digest mismatch on an empty file must refuse at open")
+	}
+}
+
+// Anchor size mismatch at open: the torrent is not what the anchor
+// describes — refuse before a single byte moves.
+func TestForeignDriverRefusesAnchorSizeMismatch(t *testing.T) {
+	fx := testFixture()
+	anchor := fx.anchorOf()
+	a := anchor["config.json"]
+	a.Size++ // anchor says 961 bytes, torrent says 960
+	anchor["config.json"] = a
+	store, err := cas.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := NewForeignStorage(store)
+	if err := fs.Register(fx.Infohash, anchor, true); err != nil {
+		t.Fatal(err)
+	}
+	infoV, _ := fx.MetaInfo.UnmarshalInfo()
+	ih := hashFromHex(t, fx.Infohash)
+	if _, err := fs.OpenTorrent(context.Background(), &infoV, ih); err == nil {
+		t.Fatal("anchor size mismatch must refuse at open")
+	}
+}
+
+// Partial-CAS re-pull liveness (the C1a hang): after a first full pass,
+// a second registration where one file is a CAS hit (sealed at open)
+// and the others are NOT must still complete — the engine re-downloads
+// pieces that overlap the sealed range, and those duplicate writes into
+// the sealed file are dropped+acked (never an error that would disable
+// the engine's download), with verification reading the CAS bytes.
+func TestForeignDriverPartialCASRepullSurvivesSealedWrites(t *testing.T) {
+	fx := testFixture()
+	// Pass 1: full download into a store we keep.
+	store, err := cas.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := NewForeignStorage(store)
+	if err := fs.Register(fx.Infohash, fx.anchorOf(), true); err != nil {
+		t.Fatal(err)
+	}
+	infoV, _ := fx.MetaInfo.UnmarshalInfo()
+	info := &infoV
+	ih := hashFromHex(t, fx.Infohash)
+	ti1, err := fs.OpenTorrent(context.Background(), info, ih)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ti1a := storageTI{piece: func(p metainfo.Piece) storagePiece { return ti1.Piece(p) }}
+	var stream []byte
+	for _, f := range fx.Files {
+		stream = append(stream, f.Content...)
+	}
+	for i := 0; i < info.NumPieces(); i++ {
+		if err := downloadPiece(t, ti1a, info.Piece(i), stream); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ti1.Close()
+
+	// Pass 2: trust-mode anchor covering ONLY the weights file — it is a
+	// CAS hit (sealed at open), the companions re-download.
+	weights := fx.Files[1]
+	fs2 := NewForeignStorage(store)
+	anchor2 := map[string]ForeignFile{
+		weights.Path: {Path: weights.Path, Size: int64(len(weights.Content)), SHA256: sha256Hex(weights.Content)},
+	}
+	if err := fs2.Register(fx.Infohash, anchor2, false); err != nil {
+		t.Fatal(err)
+	}
+	ti2, err := fs2.OpenTorrent(context.Background(), info, ih)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ti2.Close()
+	ti2a := storageTI{piece: func(p metainfo.Piece) storagePiece { return ti2.Piece(p) }}
+	drv2 := fs2.driverFor(fx.Infohash)
+	if got := drv2.SealedFiles()[weights.Path]; got != sha256Hex(weights.Content) {
+		t.Fatalf("weights file must be a sealed CAS hit, got %q", got)
+	}
+	// Full re-download simulation: writes overlapping the sealed range
+	// must be ACKED (dropped), everything else downloads normally.
+	for i := 0; i < info.NumPieces(); i++ {
+		if err := downloadPiece(t, ti2a, info.Piece(i), stream); err != nil {
+			t.Fatalf("piece %d overlapping sealed ranges must be droppable, got: %v", i, err)
+		}
+	}
+	if err := drv2.WaitSealedWanted(context.Background(), wantedOf(fx)); err != nil {
+		t.Fatalf("partial-CAS re-pull must complete: %v", err)
+	}
+	sealed := drv2.SealedFiles()
+	if sealed[weights.Path] != sha256Hex(weights.Content) {
+		t.Fatalf("sealed digest must be unchanged by dropped writes: %s", sealed[weights.Path])
+	}
+	if sealed["config.json"] != sha256Hex(fx.Files[0].Content) {
+		t.Fatal("unpinned companion must seal under its computed digest")
+	}
+	// Seed read across the sealed/unsealed boundary still serves the
+	// CAS bytes for the sealed side.
+	p0 := info.Piece(0)
+	got := make([]byte, p0.Length())
+	if _, err := ti2a.Piece(p0).ReadAt(got, 0); err != nil {
+		t.Fatalf("seed read after re-pull: %v", err)
+	}
+	if !bytes.Equal(got, stream[:p0.Length()]) {
+		t.Fatal("seed read after re-pull returned wrong bytes")
 	}
 }
