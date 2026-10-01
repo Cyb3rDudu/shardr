@@ -83,6 +83,7 @@ type Client struct {
 	foreignErr   error
 	foreignTC    *torrent.Client
 	foreignStor  *ForeignStorage
+	foreignLim   *rate.Limiter // good-citizen upload budget (nil = unlimited)
 	foreignMu    sync.Mutex
 	foreignSeeds map[string]*foreignSeedEntry // v1 infohash hex → handle
 }

@@ -126,3 +126,36 @@ n_gpu_layers = 40
 		t.Fatalf("spec example must yield the documented defaults: %+v", cfg)
 	}
 }
+
+// [catalog] upload_limit resolution (Epic #65 ruling 2): set → own
+// value; unset → INHERIT [swarm] upload_limit; garbage keys are loud.
+// Mutation-proofing: ignoring the config turns this red.
+func TestCatalogUploadLimitResolution(t *testing.T) {
+	write := func(toml string) string {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte(toml), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	t.Setenv("SHARDR_CONFIG", write("[catalog]\nupload_limit = 4096\n"))
+	if n, err := loadCatalogUploadLimit(1 << 20); err != nil || n != 4096 {
+		t.Fatalf("[catalog] set: %d %v (want 4096)", n, err)
+	}
+	t.Setenv("SHARDR_CONFIG", write("[swarm]\nupload_limit = 250000\n"))
+	if n, err := loadCatalogUploadLimit(250000); err != nil || n != 250000 {
+		t.Fatalf("[catalog] unset must inherit [swarm]: %d %v (want 250000)", n, err)
+	}
+	t.Setenv("SHARDR_CONFIG", write(""))
+	if n, err := loadCatalogUploadLimit(0); err != nil || n != 0 {
+		t.Fatalf("both unset = unlimited: %d %v", n, err)
+	}
+	t.Setenv("SHARDR_CONFIG", write("[catalog]\nupload_limit = -1\n"))
+	if _, err := loadCatalogUploadLimit(0); err == nil {
+		t.Fatal("negative upload_limit must be loud")
+	}
+	t.Setenv("SHARDR_CONFIG", write("[catalog]\nseed_faster = true\n"))
+	if _, err := loadCatalogUploadLimit(0); err == nil || !strings.Contains(err.Error(), "unknown [catalog] key") {
+		t.Fatalf("unknown key must be loud: %v", err)
+	}
+}

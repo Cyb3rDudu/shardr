@@ -2,12 +2,15 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
+	"github.com/Cyb3rDudu/shardr/internal/catalog"
 	"github.com/Cyb3rDudu/shardr/internal/config"
+	"github.com/Cyb3rDudu/shardr/internal/importer"
 )
 
 // Pull runs /ensure for a ref and follows the job to its terminal state
@@ -112,6 +115,91 @@ func runImportJob(ctx context.Context, c *Client, out io.Writer, path string, bo
 		}
 	}
 	fmt.Fprintf(out, "done\n")
+	return nil
+}
+
+// CatalogSearch runs a provider search and renders the listing
+// (repo, size, reported seeds, magnet).
+func CatalogSearch(ctx context.Context, terms []string, out io.Writer) error {
+	if len(terms) == 0 {
+		return fmt.Errorf("E_BAD_REQUEST: catalog search needs terms")
+	}
+	pf := catalog.NewPirateface()
+	models, err := pf.Search(ctx, strings.Join(terms, " "))
+	if err != nil {
+		return err
+	}
+	if len(models) == 0 {
+		fmt.Fprintln(out, "no models match — try broader terms")
+		return nil
+	}
+	for _, m := range models {
+		fmt.Fprintf(out, "%s\t%s\t%d seeds\t%s\n", m.Repo, m.Size, m.Seeds, m.Magnet)
+	}
+	return nil
+}
+
+// CatalogPullOptions configure a catalog pull.
+type CatalogPullOptions struct {
+	Quant        string
+	TrustCatalog bool
+}
+
+// CatalogPull pulls a catalog-listed model through the daemon: resolve
+// for display, early rescued refusal (the daemon re-derives the whole
+// trust path itself — the CLI is comfort, never authority), then the
+// import job with its trust-shift warning rendered on top.
+func CatalogPull(ctx context.Context, c *Client, repo string, opts CatalogPullOptions, out io.Writer) error {
+	pf := catalog.NewPirateface()
+	resolved, err := pf.Resolve(ctx, repo)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "%s  %s  %d seeds  rev %s…\n", resolved.Repo, resolved.Size, resolved.Seeds, resolved.Revision[:12])
+	// Early rescued check: one HF probe, fail fast before the job.
+	hf := importer.NewHFClient()
+	if _, terr := hf.ListRepoTree(ctx, resolved.Repo, resolved.Revision); terr != nil {
+		if errors.Is(terr, importer.ErrUnknownRepo) && !opts.TrustCatalog {
+			return catalog.ErrNotAnchored
+		}
+		if !errors.Is(terr, importer.ErrUnknownRepo) {
+			return fmt.Errorf("E_SOURCE_UNAVAILABLE: anchor fetch for %s@%s: %w", resolved.Repo, resolved.Revision, terr)
+		}
+		fmt.Fprintln(out, "warning: rescued model — trust shifts from Hugging Face to the catalog provider (--trust-catalog given)")
+	}
+	body := map[string]any{"repo": repo, "trustCatalog": opts.TrustCatalog}
+	if opts.Quant != "" {
+		body["quant"] = opts.Quant
+	}
+	var job Job
+	if err := c.DoJSON(ctx, http.MethodPost, "/v1/import/catalog", body, &job); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "pull started: job %s\n", job.ID)
+	last := ""
+	term, err := c.WaitJob(ctx, job.ID, func(j Job) {
+		bar := fmt.Sprintf("%d/%d", j.FilesDone, j.FilesTotal)
+		if bar != last {
+			fmt.Fprintf(out, "\r  %s %s", j.State, bar)
+			last = bar
+		}
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(out)
+	if term.State == "failed" {
+		return term.Error
+	}
+	if term.Result != nil {
+		for _, w := range term.Result.Warnings {
+			fmt.Fprintf(out, "  warning: %s\n", w)
+		}
+		for _, q := range term.Result.Quants {
+			fmt.Fprintf(out, "  quant %s\n", q)
+		}
+	}
+	fmt.Fprintf(out, "done: shardr:///%s (seeding the catalog swarm — good citizen)\n", strings.ToLower(repo))
 	return nil
 }
 

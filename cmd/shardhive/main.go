@@ -13,6 +13,7 @@ import (
 
 	"github.com/Cyb3rDudu/shardr/internal/api"
 	"github.com/Cyb3rDudu/shardr/internal/cas"
+	"github.com/Cyb3rDudu/shardr/internal/catalog"
 	"github.com/Cyb3rDudu/shardr/internal/swarm"
 )
 
@@ -90,6 +91,10 @@ func runServe(args []string) int {
 		fmt.Fprintln(os.Stderr, "shardhive:", err)
 		return 1
 	}
+	if swarmCfg.CatalogUploadLimit, err = loadCatalogUploadLimit(swarmCfg.UploadLimit); err != nil {
+		fmt.Fprintln(os.Stderr, "shardhive:", err)
+		return 1
+	}
 	if *noSeedVerify {
 		if !swarmCfg.Enabled {
 			fmt.Fprintln(os.Stderr, "shardhive: --seed-no-verify without [swarm] enabled = true is meaningless")
@@ -132,6 +137,7 @@ func runServe(args []string) int {
 		return 1
 	}
 	srv.Swarm = sw
+	srv.Catalog = catalog.NewPirateface()
 	if err := srv.Listen(); err != nil {
 		fmt.Fprintln(os.Stderr, "shardhive:", err)
 		return 1

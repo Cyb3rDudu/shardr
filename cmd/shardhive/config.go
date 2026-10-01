@@ -13,10 +13,15 @@ import (
 // those). Unknown [swarm] keys are a loud error (fail closed).
 
 const swarmSection = "swarm"
+const catalogSection = "catalog"
 
 var swarmKeys = map[string]bool{
 	"enabled": true, "seed": true, "upload_limit": true, "dht": true,
 	"no_seed_verify": true, "webseed_addr": true,
+}
+
+var catalogKeys = map[string]bool{
+	"upload_limit": true,
 }
 
 // loadSwarmConfig reads config.toml and returns the [swarm] config, or
@@ -63,6 +68,42 @@ func loadSwarmConfig() (swarm.Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+// resolveCatalogUploadLimit resolves the good-citizen seeding budget
+// (Epic #65 ruling 2): [catalog] upload_limit when set, else INHERIT
+// [swarm] upload_limit (same semantics, 0 = unlimited). Unknown
+// [catalog] keys are a loud error (fail closed, like [swarm]).
+func resolveCatalogUploadLimit(f config.File, swarmUploadLimit int64) (int64, error) {
+	sec, ok := f[catalogSection]
+	if !ok {
+		return swarmUploadLimit, nil
+	}
+	for _, key := range sortedKeys(sec) {
+		if !catalogKeys[key] {
+			return 0, fmt.Errorf("config %s: unknown [catalog] key %q (known: upload_limit)", configPathForError(), key)
+		}
+	}
+	v, ok := sec["upload_limit"]
+	if !ok {
+		return swarmUploadLimit, nil
+	}
+	if v.Kind != config.KindInt {
+		return 0, fmt.Errorf("config: [catalog] upload_limit must be an integer")
+	}
+	if v.Int < 0 {
+		return 0, fmt.Errorf("config: [catalog] upload_limit must be >= 0")
+	}
+	return v.Int, nil
+}
+
+// loadCatalogUploadLimit is the standalone form (config loaded here).
+func loadCatalogUploadLimit(swarmUploadLimit int64) (int64, error) {
+	f, err := config.Load()
+	if err != nil {
+		return 0, err
+	}
+	return resolveCatalogUploadLimit(f, swarmUploadLimit)
 }
 
 func sortedKeys(sec map[string]config.Value) []string {

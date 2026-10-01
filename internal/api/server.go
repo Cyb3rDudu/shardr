@@ -31,6 +31,7 @@ import (
 
 	"github.com/Cyb3rDudu/shardr/internal/artifact"
 	"github.com/Cyb3rDudu/shardr/internal/cas"
+	"github.com/Cyb3rDudu/shardr/internal/catalog"
 	"github.com/Cyb3rDudu/shardr/internal/importer"
 	"github.com/Cyb3rDudu/shardr/internal/ref"
 	"github.com/Cyb3rDudu/shardr/internal/swarm"
@@ -72,7 +73,10 @@ type Server struct {
 	Swarm *swarm.Client
 	// HF is the Hugging Face client; nil disables /import/hf with a loud
 	// error. Tests inject a stub via this field before Listen.
-	HF      *importer.HFClient
+	HF *importer.HFClient
+	// Catalog is the community-catalog provider (Epic #65); nil disables
+	// /v1/import/catalog loudly.
+	Catalog *catalog.Pirateface
 	socket  string
 	ln      net.Listener
 	httpSrv *http.Server
@@ -262,6 +266,7 @@ func (s *Server) router() http.Handler {
 	mux.HandleFunc("POST /v1/import/local", s.handleImportLocal)
 	mux.HandleFunc("POST /v1/import/hf", s.handleImportHF)
 	mux.HandleFunc("POST /v1/import/bt", s.handleImportBT)
+	mux.HandleFunc("POST /v1/import/catalog", s.handleImportCatalog)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
 	// Everything else: version negotiation (loud) or plain 404.
 	mux.HandleFunc("/", s.handleUnknown)
@@ -819,6 +824,79 @@ func (s *Server) handleImportBT(w http.ResponseWriter, r *http.Request) {
 
 // handleJob returns a job by id. The stored pointer is immutable after
 // publication; the copy keeps future mutation-safety obvious.
+// handleImportCatalog (Epic #65): POST {repo, quant?, trustCatalog?, as?} —
+// anchored pull of a community-listed model torrent. The daemon owns the
+// whole trust path: it resolves the listing from the provider itself
+// (never trusting CLI-supplied magnets), builds the anchor (HF tree at
+// the pinned revision; rescued → loud E_NOT_ANCHORED without
+// trustCatalog; catalog checksums with it), and runs the foreign-swarm
+// import + good-citizen seeding.
+func (s *Server) handleImportCatalog(w http.ResponseWriter, r *http.Request) {
+	if s.Catalog == nil {
+		writeErr(w, http.StatusServiceUnavailable, ErrSourceUnavail, "catalog provider disabled")
+		return
+	}
+	if s.Swarm == nil {
+		writeErr(w, http.StatusServiceUnavailable, ErrSourceUnavail, "swarm client disabled ([swarm] enabled) — catalog pulls need the swarm")
+		return
+	}
+	var body struct {
+		Repo         string   `json:"repo"`
+		Quant        string   `json:"quant"`
+		TrustCatalog bool     `json:"trustCatalog"`
+		As           string   `json:"as"`
+		Peers        []string `json:"peers"` // operational hints, 005 §3 (like import/bt)
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, ErrBadRequest, "body must be JSON {\"repo\":…,\"quant\":?,\"trustCatalog\":?,\"as\":?}: "+err.Error())
+		return
+	}
+	if body.Repo == "" {
+		writeErr(w, http.StatusBadRequest, ErrBadRequest, "missing required field: repo")
+		return
+	}
+	// Resolve + anchor BEFORE any job: refusal is immediate, the error
+	// carries the full reason (no half-started jobs for unanchorable pulls).
+	resolved, err := s.Catalog.Resolve(r.Context(), body.Repo)
+	if err != nil {
+		he := mapImportError(err)
+		writeErr(w, http.StatusBadGateway, he.Code, he.Message)
+		return
+	}
+	anchor, err := catalog.ResolveAnchor(r.Context(), s.HF, s.Catalog, resolved, body.TrustCatalog)
+	if err != nil {
+		he := mapImportError(err)
+		status := http.StatusBadGateway
+		if he.Code == "E_NOT_ANCHORED" {
+			status = http.StatusUnprocessableEntity
+		}
+		writeErr(w, status, he.Code, he.Message)
+		return
+	}
+	as := body.As
+	if as == "" {
+		as = strings.ToLower(body.Repo)
+	}
+	job := &Job{ID: newJobID(), CreatedAt: time.Now().UTC(), Kind: "import-catalog", Ref: body.Repo, As: as, State: "waiting", FilesTotal: len(anchor.Files)}
+	s.publishJob(job)
+	go s.runImport(job, func(progress func(int, int)) (*importer.ImportResult, error) {
+		res, err := s.Swarm.ImportCatalog(context.Background(), &swarm.CatalogPull{
+			Resolved: resolved, Anchor: anchor, Quant: body.Quant, As: body.As, Peers: body.Peers,
+		}, progress)
+		if err != nil {
+			return nil, err
+		}
+		imp := res.Import
+		if res.Warning != "" {
+			// The trust-shift notice rides the job result — it must be
+			// visible to whoever reads the job, not just the log.
+			imp.Warnings = append(append([]string{}, res.Warning), imp.Warnings...)
+		}
+		return imp, nil
+	})
+	writeJSON(w, http.StatusCreated, job)
+}
+
 func (s *Server) handleJob(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	s.mu.Lock()
@@ -1052,6 +1130,13 @@ func mapImportError(err error) *APIError {
 	case errors.Is(err, importer.ErrUnknownRepo):
 		return &APIError{Code: "E_UNKNOWN_REF", Message: err.Error()}
 	case errors.Is(err, importer.ErrHFUnreachable):
+		return &APIError{Code: ErrSourceUnavail, Message: err.Error()}
+	case errors.Is(err, catalog.ErrNotAnchored):
+		// Epic #65 trust chain 3: the rescued refusal is its own class.
+		return &APIError{Code: "E_NOT_ANCHORED", Message: err.Error()}
+	case errors.Is(err, catalog.ErrNotListed):
+		return &APIError{Code: "E_UNKNOWN_REF", Message: err.Error()}
+	case errors.Is(err, catalog.ErrCatalogUnreachable), errors.Is(err, catalog.ErrBadListing):
 		return &APIError{Code: ErrSourceUnavail, Message: err.Error()}
 	default:
 		return &APIError{Code: ErrInternal, Message: err.Error()}
