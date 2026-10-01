@@ -37,6 +37,11 @@ type Config struct {
 	// WebseedAddr is the webseed HTTP bind address (":0" = ephemeral).
 	// Empty disables the webseed listener (peer protocol still works).
 	WebseedAddr string
+	// CatalogUploadLimit is the good-citizen seeding budget for FOREIGN
+	// catalog swarms (Epic #65), bytes/sec, 0 = unlimited. The config
+	// layer resolves [catalog] upload_limit, inheriting [swarm]
+	// upload_limit when unset — this field is the RESOLVED value.
+	CatalogUploadLimit int64
 	// DataRoot is the CAS root; empty = cas.ResolveRoot().
 	DataRoot string
 	// DisableIPv6 and ListenHost keep tests deterministic.
@@ -70,6 +75,16 @@ type Client struct {
 
 	seedsMu sync.Mutex
 	seeds   map[string]*seedEntry // infohash hex → registered seed
+
+	// Foreign (catalog) engine state (Epic #65): lazy second torrent
+	// client for community v1 torrents, its CAS-backed v1 driver, and
+	// the live good-citizen handles.
+	foreignOnce  sync.Once
+	foreignErr   error
+	foreignTC    *torrent.Client
+	foreignStor  *ForeignStorage
+	foreignMu    sync.Mutex
+	foreignSeeds map[string]*foreignSeedEntry // v1 infohash hex → handle
 }
 
 type seedEntry struct {
@@ -121,15 +136,16 @@ func New(cfg Config) (*Client, error) {
 	}
 
 	c := &Client{
-		cfg:       cfg,
-		store:     store,
-		tc:        tc,
-		casSt:     casSt,
-		verify:    verify,
-		uploadLim: uploadLim,
-		seeds:     map[string]*seedEntry{},
-		wsFiles:   map[string]FileSpec{},
-		wsLayers:  map[string]string{},
+		cfg:          cfg,
+		store:        store,
+		tc:           tc,
+		casSt:        casSt,
+		verify:       verify,
+		uploadLim:    uploadLim,
+		seeds:        map[string]*seedEntry{},
+		wsFiles:      map[string]FileSpec{},
+		wsLayers:     map[string]string{},
+		foreignSeeds: map[string]*foreignSeedEntry{},
 	}
 	if err := c.startWebseed(); err != nil {
 		tc.Close()
@@ -148,8 +164,21 @@ func (c *Client) WebseedURL() string { return c.wsURL }
 // PeerAddrs returns this node's TCP listener addresses (the x.pe-style
 // direct-peer hint data; TCP only — a bare host:port is dialed as TCP).
 func (c *Client) PeerAddrs() []string {
+	return c.listenAddrs(c.tc)
+}
+
+// ForeignPeerAddrs returns the FOREIGN (catalog) engine's listener
+// addresses — the x.pe-style hints for good-citizen seeding.
+func (c *Client) ForeignPeerAddrs() []string {
+	if c.foreignTC == nil {
+		return nil
+	}
+	return c.listenAddrs(c.foreignTC)
+}
+
+func (c *Client) listenAddrs(tc *torrent.Client) []string {
 	var out []string
-	for _, a := range c.tc.ListenAddrs() {
+	for _, a := range tc.ListenAddrs() {
 		if a.Network() == "tcp" {
 			out = append(out, a.String())
 		}
@@ -233,6 +262,15 @@ func (c *Client) Close() {
 		c.wsSrv.Close()
 	}
 	c.tc.Close()
+	if c.foreignTC != nil {
+		c.foreignTC.Close()
+	}
+}
+
+// uploadLimiter builds the shared-budget limiter (burst covers one peer
+// request window, matching the swarm client's convention).
+func uploadLimiter(bytesPerSec int64) *rate.Limiter {
+	return rate.NewLimiter(rate.Limit(bytesPerSec), 1<<16)
 }
 
 // ---------------------------------------------------------------------------
