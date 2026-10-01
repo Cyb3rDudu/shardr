@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/Cyb3rDudu/shardr/internal/config"
 )
 
 // TestConfigDocsExampleParses proves the config.toml example in
@@ -45,5 +47,18 @@ func TestConfigDocsExampleParses(t *testing.T) {
 	}
 	if !cfg.Enabled || !cfg.Seed || !cfg.DHT || cfg.UploadLimit != 0 || cfg.NoSeedVerify {
 		t.Fatalf("docs example must yield the documented defaults, got %+v", cfg)
+	}
+	// The example's [catalog] section must resolve through the production
+	// loader too (the docs block and the parser cannot drift apart).
+	f, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	limit, err := resolveCatalogUploadLimit(f, cfg.UploadLimit)
+	if err != nil {
+		t.Fatalf("docs example [catalog] must parse: %v", err)
+	}
+	if limit != 524288 {
+		t.Fatalf("docs example [catalog] upload_limit must resolve to 524288, got %d", limit)
 	}
 }
