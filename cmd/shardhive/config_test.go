@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/Cyb3rDudu/shardr/internal/catalog"
 	"github.com/Cyb3rDudu/shardr/internal/swarm"
 )
 
@@ -215,5 +217,51 @@ func TestCatalogURLResolution(t *testing.T) {
 	t.Setenv("SHARDR_CONFIG", write("[catalog]\nurl = \"https://mirror.example\"\nupload_limit = 4096\n"))
 	if n, err := loadCatalogUploadLimit(1 << 20); err != nil || n != 4096 {
 		t.Fatalf("upload_limit beside url: %d %v", n, err)
+	}
+}
+
+// TestNewCatalogProviderWiring pins the daemon chain resolveCatalogURL
+// → loadCatalogURL → NewPiratefaceAt: the configured [catalog] url must
+// reach the provider. The dead-loopback URL makes the proof offline —
+// if the wiring ignored config and fell back to the default, Search
+// would hit the live provider and not fail with "unreachable".
+func TestNewCatalogProviderWiring(t *testing.T) {
+	write := func(toml string) string {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte(toml), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	// Configured dead loopback → provider pinned to it; Search fails
+	// offline (connection refused), proving no fallback to the default.
+	t.Setenv("SHARDR_CONFIG", write("[catalog]\nurl = \"https://127.0.0.1:1\"\n"))
+	t.Setenv("SHARDR_CATALOG_URL", "") // config must be the only override
+	p, err := newCatalogProvider()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.BaseURL != "https://127.0.0.1:1" {
+		t.Fatalf("provider base: %q", p.BaseURL)
+	}
+	if _, serr := p.Search(context.Background(), "tinyllm"); serr == nil || !strings.Contains(serr.Error(), "unreachable") {
+		t.Fatalf("dead loopback must answer unreachable, got %v", serr)
+	}
+
+	// Unset → the documented default, behavior unchanged.
+	t.Setenv("SHARDR_CONFIG", write("[catalog]\nupload_limit = 5\n"))
+	p, err = newCatalogProvider()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.BaseURL != catalog.DefaultPiratefaceURL {
+		t.Fatalf("unset must keep the default, got %q", p.BaseURL)
+	}
+
+	// Invalid url → loud, no provider.
+	t.Setenv("SHARDR_CONFIG", write("[catalog]\nurl = \"http://insecure.example\"\n"))
+	if _, err := newCatalogProvider(); err == nil || !strings.Contains(err.Error(), "[catalog] url must be") {
+		t.Fatalf("invalid url must be loud: %v", err)
 	}
 }

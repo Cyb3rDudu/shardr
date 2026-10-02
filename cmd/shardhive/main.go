@@ -78,6 +78,18 @@ func run(args []string) int {
 	}
 }
 
+// newCatalogProvider builds the daemon's catalog provider with the
+// configured base URL: [catalog] url (validated fail-closed), else
+// $SHARDR_CATALOG_URL, else the default. Test-pinned chain
+// resolveCatalogURL → NewPiratefaceAt (TestNewCatalogProviderWiring).
+func newCatalogProvider() (*catalog.Pirateface, error) {
+	u, err := loadCatalogURL()
+	if err != nil {
+		return nil, err
+	}
+	return catalog.NewPiratefaceAt(u), nil
+}
+
 // runServe starts the daemon and blocks until SIGINT/SIGTERM.
 func runServe(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
@@ -92,11 +104,6 @@ func runServe(args []string) int {
 		return 1
 	}
 	if swarmCfg.CatalogUploadLimit, err = loadCatalogUploadLimit(swarmCfg.UploadLimit); err != nil {
-		fmt.Fprintln(os.Stderr, "shardhive:", err)
-		return 1
-	}
-	catalogURL, err := loadCatalogURL()
-	if err != nil {
 		fmt.Fprintln(os.Stderr, "shardhive:", err)
 		return 1
 	}
@@ -142,7 +149,11 @@ func runServe(args []string) int {
 		return 1
 	}
 	srv.Swarm = sw
-	srv.Catalog = catalog.NewPiratefaceAt(catalogURL)
+	srv.Catalog, err = newCatalogProvider()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "shardhive:", err)
+		return 1
+	}
 	if err := srv.Listen(); err != nil {
 		fmt.Fprintln(os.Stderr, "shardhive:", err)
 		return 1

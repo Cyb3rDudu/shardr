@@ -92,10 +92,12 @@ upload_limit = 524288     # 512 KiB/s give-back to community swarms
 url = "https://pirateface.co"   # unset = the same default
 ```
 
-`url` changes where the daemon resolves listings, model pages, and
-checksum records from — the anchor still comes from Hugging Face, and
-magnet webseeds still come from the listing content itself (they are
-not derived from `url`). Choosing a provider is a trust decision.
+`url` changes where the daemon **and the CLI catalog commands**
+resolve listings, model pages, and checksum records from — the anchor
+still comes from Hugging Face, and magnet webseeds still come from the
+listing content itself (they are not derived from `url`). Precedence:
+`[catalog] url` over `$SHARDR_CATALOG_URL` over the built-in default.
+Choosing a provider is a trust decision.
 
 ## `[references]` — CLI-only comfort
 
