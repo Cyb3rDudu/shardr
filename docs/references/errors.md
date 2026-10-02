@@ -46,8 +46,11 @@ envelope `{"error":{"code","message","candidates"?}}` (see
 ## Artifact validation — `internal/artifact/validate.go`
 
 Structural 001 rule violations. They surface as the `message` of
-`E_INVALID_INDEX` (index validation) or `E_NOT_IMPORTABLE` (manifest
-validation in an import job) — the class names the exact broken rule:
+`E_INVALID_INDEX` (import and resolve paths — `mapImportError` maps a
+`ValidationError` there) or `E_NOT_IMPORTABLE` (swarm/fill paths —
+`mapSwarmError`; in an import job `E_NOT_IMPORTABLE` comes only from
+the eligibility gate, not from manifest rules) — the class names the
+exact broken rule:
 
 | Code | Rule violated |
 | --- | --- |
