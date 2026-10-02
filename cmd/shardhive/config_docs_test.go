@@ -61,4 +61,13 @@ func TestConfigDocsExampleParses(t *testing.T) {
 	if limit != 524288 {
 		t.Fatalf("docs example [catalog] upload_limit must resolve to 524288, got %d", limit)
 	}
+	// The example's [catalog] url must resolve through the production
+	// validation too (docs and parser cannot drift apart).
+	catURL, err := resolveCatalogURL(f)
+	if err != nil {
+		t.Fatalf("docs example [catalog] url must parse: %v", err)
+	}
+	if catURL != "https://pirateface.co" {
+		t.Fatalf("docs example [catalog] url must resolve to https://pirateface.co, got %q", catURL)
+	}
 }

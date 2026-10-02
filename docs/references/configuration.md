@@ -48,6 +48,7 @@ Read by `shardhive serve` (`cmd/shardhive/config.go`). Defaults from
 | Key | Type | Default | Effect |
 | --- | --- | --- | --- |
 | `upload_limit` | int | inherit `[swarm] upload_limit` | separate good-citizen seeding budget for catalog swarms (bytes/second, `0` = unlimited). When unset, the `[swarm]` value applies — the two budgets never eat each other |
+| `url` | string | provider default (`https://pirateface.co`) | catalog provider base URL (mirror/testing). Validated fail-closed at startup: absolute `https://` with host, no path/query/fragment/userinfo (scheme + host, optional port). The URL flows to every provider-derived endpoint (listings, model pages, checksums); magnet webseeds stay content-driven (they come from the listing itself) |
 
 Unknown `[catalog]` keys are a loud error, same as `[swarm]`.
 
@@ -105,6 +106,7 @@ upload_limit = 1048576          # 1 MiB/s, shared budget
 
 [catalog]
 upload_limit = 524288           # catalog seeding gets its own 512 KiB/s
+url = "https://pirateface.co"    # provider base URL; unset = the same default
 
 [references]
 default_selector = "q4_k_m"
