@@ -159,3 +159,61 @@ func TestCatalogUploadLimitResolution(t *testing.T) {
 		t.Fatalf("unknown key must be loud: %v", err)
 	}
 }
+
+func TestCatalogURLResolution(t *testing.T) {
+	write := func(toml string) string {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte(toml), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	// Unset (absent section, absent key) → "" → provider default;
+	// behavior unchanged.
+	for _, toml := range []string{"", "[swarm]\nenabled = true\n", "[catalog]\nupload_limit = 5\n"} {
+		t.Setenv("SHARDR_CONFIG", write(toml))
+		if u, err := loadCatalogURL(); err != nil || u != "" {
+			t.Fatalf("unset must stay \"\" (default): %q %v", u, err)
+		}
+	}
+	// Valid: scheme + host, optional port — exactly that.
+	for _, valid := range []string{"https://mirror.example", "https://mirror.example:8443"} {
+		t.Setenv("SHARDR_CONFIG", write("[catalog]\nurl = \""+valid+"\"\n"))
+		if u, err := loadCatalogURL(); err != nil || u != valid {
+			t.Fatalf("valid url %q: got %q %v", valid, u, err)
+		}
+	}
+	// Invalid: loud startup error naming the rule — never a fallback.
+	for _, invalid := range []string{
+		"",                        // explicit empty
+		"http://mirror.example",   // not https
+		"https://mirror.example/", // trailing path
+		"https://mirror.example/api",
+		"https://mirror.example/?q=1",
+		"https://mirror.example#frag",
+		"https://",                    // no host
+		"https://user@mirror.example", // userinfo
+		"mirror.example",              // not absolute
+	} {
+		t.Setenv("SHARDR_CONFIG", write("[catalog]\nurl = \""+invalid+"\"\n"))
+		_, err := loadCatalogURL()
+		if err == nil || !strings.Contains(err.Error(), "[catalog] url must be") {
+			t.Fatalf("invalid url %q must be loud with reason, got %v", invalid, err)
+		}
+	}
+	// Wrong type: loud too.
+	t.Setenv("SHARDR_CONFIG", write("[catalog]\nurl = 5\n"))
+	if _, err := loadCatalogURL(); err == nil || !strings.Contains(err.Error(), "quoted string") {
+		t.Fatalf("non-string url must be loud: %v", err)
+	}
+	// Unknown key stays loud even next to a valid url (fail-closed set).
+	t.Setenv("SHARDR_CONFIG", write("[catalog]\nurl = \"https://mirror.example\"\nseed_faster = true\n"))
+	if _, err := loadCatalogURL(); err == nil || !strings.Contains(err.Error(), "unknown [catalog] key") {
+		t.Fatalf("unknown key must stay loud: %v", err)
+	}
+	// upload_limit behavior untouched alongside url.
+	t.Setenv("SHARDR_CONFIG", write("[catalog]\nurl = \"https://mirror.example\"\nupload_limit = 4096\n"))
+	if n, err := loadCatalogUploadLimit(1 << 20); err != nil || n != 4096 {
+		t.Fatalf("upload_limit beside url: %d %v", n, err)
+	}
+}

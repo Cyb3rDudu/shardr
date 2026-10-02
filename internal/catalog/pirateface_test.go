@@ -165,3 +165,45 @@ func TestUnreachableProvider(t *testing.T) {
 		t.Fatalf("want unreachable error, got %v", err)
 	}
 }
+
+func TestNewPiratefaceDefaults(t *testing.T) {
+	t.Setenv("SHARDR_CATALOG_URL", "")
+	if p := NewPirateface(); p.BaseURL != DefaultPiratefaceURL {
+		t.Fatalf("unset env and config → default: %q", p.BaseURL)
+	}
+	t.Setenv("SHARDR_CATALOG_URL", "https://env.example")
+	if p := NewPirateface(); p.BaseURL != "https://env.example" {
+		t.Fatalf("env override: %q", p.BaseURL)
+	}
+	// Config url (NewPiratefaceAt arg) wins over env: config is the
+	// explicit daemon knob, env is the CLI/test override.
+	if p := NewPiratefaceAt("https://cfg.example"); p.BaseURL != "https://cfg.example" {
+		t.Fatalf("config must win over env: %q", p.BaseURL)
+	}
+	if p := NewPiratefaceAt(""); p.BaseURL != "https://env.example" {
+		t.Fatalf("empty config falls back to env: %q", p.BaseURL)
+	}
+}
+
+// TestSearchHitsConfiguredURL proves a configured base URL flows into
+// the provider's own endpoints (search /s/<q>): the request must hit
+// the test server, never pirateface.co. No network beyond loopback.
+func TestSearchHitsConfiguredURL(t *testing.T) {
+	hit := ""
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = r.URL.EscapedPath()
+		fmt.Fprint(w, realSearchBody)
+	}))
+	defer srv.Close()
+	p := NewPiratefaceAt(srv.URL)
+	models, err := p.Search(context.Background(), "tinyllm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hit != "/s/tinyllm" {
+		t.Fatalf("request went to %q, not the configured server's /s/<q>", hit)
+	}
+	if len(models) != 1 || models[0].Repo != "arnir0/Tiny-LLM" {
+		t.Fatalf("models: %+v", models)
+	}
+}

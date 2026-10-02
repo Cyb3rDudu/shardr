@@ -46,13 +46,23 @@ type Pirateface struct {
 	HTTP    *http.Client
 }
 
-// NewPirateface builds a client with env-derived defaults.
-func NewPirateface() *Pirateface {
-	base := os.Getenv("SHARDR_CATALOG_URL")
+// NewPiratefaceAt builds a client pinned to base — the [catalog] url
+// from config.toml. base == "" falls back to $SHARDR_CATALOG_URL, then
+// DefaultPiratefaceURL (config wins over env when both are set: config
+// is the explicit daemon knob, env is the CLI/test override).
+func NewPiratefaceAt(base string) *Pirateface {
+	if base == "" {
+		base = os.Getenv("SHARDR_CATALOG_URL")
+	}
 	if base == "" {
 		base = DefaultPiratefaceURL
 	}
 	return &Pirateface{BaseURL: base, HTTP: &http.Client{Timeout: 30 * time.Second}}
+}
+
+// NewPirateface builds a client with env-derived defaults.
+func NewPirateface() *Pirateface {
+	return NewPiratefaceAt("")
 }
 
 // Name implements Provider.
