@@ -411,6 +411,18 @@ func TestImportCatalogRequiresCatalog(t *testing.T) {
 	}
 }
 
+// A nil HF client must answer 503 like /import/hf, never reach the
+// anchor resolver.
+func TestImportCatalogRequiresHF(t *testing.T) {
+	h := newHarness(t)
+	h.startCatalogE2E(t)
+	h.server.HF = nil
+	code, _ := h.postJSON("/v1/import/catalog", map[string]any{"repo": "owner/repo"})
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("nil HF must be 503, got %d", code)
+	}
+}
+
 // jobsSnapshot for the no-job assertion.
 func (s *Server) jobsSnapshot() []string {
 	s.mu.Lock()

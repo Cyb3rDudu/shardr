@@ -55,6 +55,13 @@ Provider facts worth knowing (verified 2026-10):
   seeders online** fails after two minutes with a loud error. A magnet
   alone never carries the file tree.
 
+Threat note: the daemon fetches bytes from the sources the listing
+names (peers, trackers, webseeds). Byte integrity is never at stake —
+the anchor gates every file — but a hostile provider can point the
+daemon's HTTP fetches at hosts of its choosing (SSRF surface). Choosing
+a provider is a trust decision; a webseed host allowlist is a possible
+later hardening.
+
 ## Rescued models
 
 When the Hugging Face source of a listing is gone (removed repo or

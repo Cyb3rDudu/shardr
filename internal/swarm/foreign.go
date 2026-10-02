@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 
 	g "github.com/anacrolix/generics"
@@ -47,6 +48,13 @@ type ForeignFile struct {
 	SHA256  string // bare 64-hex anchor digest; "" = unpinned
 	GitSHA1 string // 40-hex git blob id (non-LFS HF anchor); "" = none
 }
+
+// emptyContentSHA256 is the well-known SHA-256 of zero bytes — v1-legal
+// empty torrent files seal under it at open (they carry no stream bytes
+// and no pieces, but they ARE files: the wanted target must be able to
+// count them, and an anchor pinning anything else on an empty file is a
+// torrent/anchor mismatch).
+const emptyContentSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 // foreignReg is one torrent's registration: the anchor set plus its
 // strictness. Strict (live HF anchor): every torrent file must be
@@ -168,18 +176,32 @@ func newForeignTorrent(parent *ForeignStorage, key string, info *metainfo.Info, 
 			return nil, fmt.Errorf("swarm: foreign: torrent file tree contains non-canonical path %q (empty/./.. segments rejected)", slashJoin(fi.Path))
 		}
 		path := slashJoin(fi.Path)
+		a, anchored := reg.files[path]
+		if !anchored && reg.strict {
+			return nil, fmt.Errorf("swarm: foreign: torrent carries %q outside the anchor (%d pinned files) — unanchorable bytes; refusing (E_NOT_ANCHORED class)", path, len(reg.files))
+		}
 		if fi.Length == 0 {
-			continue // v1 allows empty files; they occupy no bytes
+			// v1-legal empty file: no stream bytes, no pieces. Seal AT OPEN
+			// under the empty digest (CAS-Put once, Has-guarded — a
+			// recognized empty file is still read by the importer, and
+			// artifact completeness needs the blob). An anchor pinning any
+			// OTHER digest on an empty file is a mismatch — refuse at open.
+			if a.SHA256 != "" && a.SHA256 != emptyContentSHA256 {
+				return nil, fmt.Errorf("swarm: foreign: anchor pins %s on empty file %q — the torrent is not what the anchor describes; refusing", a.SHA256, path)
+			}
+			if !parent.store.Has(emptyContentSHA256) {
+				if err := parent.store.Put(emptyContentSHA256, strings.NewReader("")); err != nil {
+					return nil, err
+				}
+			}
+			t.states[path] = &foreignState{name: path, anchor: ForeignFile{Path: path, Size: 0, SHA256: emptyContentSHA256}, sealed: true, digest: emptyContentSHA256}
+			continue
 		}
 		begin, end := off, off+fi.Length
 		off = end
 		t.files = append(t.files, foreignFileRange{path: path, begin: begin, end: end})
-		a, anchored := reg.files[path]
 		if anchored && a.Size != 0 && a.Size != fi.Length {
 			return nil, fmt.Errorf("swarm: foreign: anchor size mismatch for %q: anchor says %d bytes, torrent says %d — the torrent is not what the anchor describes; refusing", path, a.Size, fi.Length)
-		}
-		if !anchored && reg.strict {
-			return nil, fmt.Errorf("swarm: foreign: torrent carries %q outside the anchor (%d pinned files) — unanchorable bytes; refusing (E_NOT_ANCHORED class)", path, len(reg.files))
 		}
 		n := int((end-1)/pl) - int(begin/pl) + 1
 		st := &foreignState{name: path, anchor: ForeignFile{Path: path, Size: fi.Length, SHA256: a.SHA256, GitSHA1: a.GitSHA1}, pieces: make([]bool, n)}
@@ -269,9 +291,13 @@ func (t *foreignTorrent) SealedFiles() map[string]string {
 	return out
 }
 
-// WaitSealed blocks until n files are sealed, the driver closes, or an
-// anchor verification fails.
-func (t *foreignTorrent) WaitSealed(ctx context.Context, n int) error {
+// WaitSealedWanted blocks until every WANTED file is sealed, the driver
+// closes, or an anchor verification fails. Counting only the wanted set
+// matters: v1 pieces span files, so an UNwanted file can seal as a
+// side effect of a neighbouring wanted file's pieces — a plain total
+// would let a quant-filtered pull return early with a partial artifact
+// (or never notice the wanted file is still open).
+func (t *foreignTorrent) WaitSealedWanted(ctx context.Context, wanted map[string]bool) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for {
@@ -279,19 +305,19 @@ func (t *foreignTorrent) WaitSealed(ctx context.Context, n int) error {
 			return err
 		}
 		done := 0
-		for _, st := range t.states {
+		for path, st := range t.states {
 			if st.failed != nil {
 				return fmt.Errorf("swarm: foreign: anchor verification failed: %w", st.failed)
 			}
-			if st.sealed {
+			if st.sealed && wanted[path] {
 				done++
 			}
 		}
-		if done >= n {
+		if done >= len(wanted) {
 			return nil
 		}
 		if t.closed {
-			return fmt.Errorf("swarm: foreign: driver closed before %d files sealed (got %d)", n, done)
+			return fmt.Errorf("swarm: foreign: driver closed before the wanted files sealed (%d/%d)", done, len(wanted))
 		}
 		stop := make(chan struct{})
 		go func() {
@@ -305,6 +331,43 @@ func (t *foreignTorrent) WaitSealed(ctx context.Context, n int) error {
 		}()
 		t.doneCond.Wait()
 		close(stop)
+	}
+}
+
+// VerifyPreSealed drives BEST-EFFORT engine piece checks over pieces
+// that overlap files sealed at open (CAS hits), BEFORE download
+// priorities rise: the engine hashes the CAS bytes itself and marks
+// those pieces complete, so a partial-CAS re-pull never re-downloads
+// sealed ranges. Pieces spanning sealed AND unsealed files cannot
+// verify yet (the unsealed side has no bytes) — they download
+// normally, and with sealed-range writes dropped (writeAtLocked) they
+// verify fine afterwards. Per-piece failures are ignored on purpose:
+// worst case the piece re-downloads and the engine's own piece hash
+// decides (loud either way).
+func (t *foreignTorrent) VerifyPreSealed(ctx context.Context, tr *torrent.Torrent) {
+	total := t.info.TotalLength()
+	pl := int64(t.info.PieceLength)
+	t.mu.Lock()
+	var pieces []int
+	for i := 0; i < t.info.NumPieces(); i++ {
+		b := int64(i) * pl
+		e := b + pl
+		if e > total {
+			e = total
+		}
+		for _, f := range t.files {
+			if f.begin >= e {
+				break
+			}
+			if f.end > b && t.states[f.path].sealed {
+				pieces = append(pieces, i)
+				break
+			}
+		}
+	}
+	t.mu.Unlock()
+	for _, i := range pieces {
+		_ = tr.Piece(i).VerifyDataContext(ctx) // best effort, see above
 	}
 }
 
@@ -370,7 +433,18 @@ func (p *foreignPiece) writeAtLocked(abs int64, b []byte) error {
 			return st.failed
 		}
 		if st.sealed {
-			return fmt.Errorf("swarm: foreign: write into sealed blob %s refused (CAS is immutable)", st.digest)
+			// Duplicate write into a sealed (CAS-pinned) range: DROP and
+			// ACK. The engine re-downloads pieces overlapping CAS hits
+			// before its piece states catch up, and refusing here makes it
+			// disable data download for the whole torrent (a liveness hang
+			// on every partial-CAS re-pull). Dropping is sound: the sealed
+			// bytes are anchor-pinned in the CAS and piece verification
+			// reads them back from the blob via ReadAt — an evil differing
+			// duplicate can never influence the piece hash, which only
+			// passes with the correct CAS bytes.
+			abs += n
+			b = b[n:]
+			continue
 		}
 		if st.part == nil {
 			part, err := p.t.parent.newPart("foreign")
@@ -397,9 +471,19 @@ func (p *foreignPiece) WriteAt(b []byte, off int64) (int, error) {
 	return len(b), nil
 }
 
+// ReadAt serves a piece range across the files it spans, under t.mu:
+// a concurrent seal of a neighbouring piece closes the part file, and
+// an unlocked read could hit a closed FD mid-flight (the engine would
+// read that as piece corruption). Holding the lock through the read
+// serializes seal-vs-read; the IO under the lock is bounded by one
+// piece length.
+// ponytail: piece-bounded disk IO under the torrent lock; refcounted
+// part handles if piece-read latency ever matters here.
 func (p *foreignPiece) ReadAt(b []byte, off int64) (int, error) {
 	abs := p.off + off
 	read := 0
+	p.t.mu.Lock()
+	defer p.t.mu.Unlock()
 	for read < len(b) {
 		fs := p.t.filesInRange(abs+int64(read), abs+int64(len(b)))
 		if len(fs) == 0 {
@@ -413,29 +497,27 @@ func (p *foreignPiece) ReadAt(b []byte, off int64) (int, error) {
 		if n <= 0 {
 			break
 		}
-		p.t.mu.Lock()
 		st := p.t.states[f.path]
-		var src io.ReaderAt
 		switch {
 		case st.sealed:
 			fl, err := p.t.parent.store.Open(st.digest)
 			if err != nil {
-				p.t.mu.Unlock()
 				return read, fmt.Errorf("swarm: foreign: open sealed blob %s: %w", st.digest, err)
 			}
-			defer fl.Close()
-			src = fl
+			m, err := fl.ReadAt(b[read:int64(read)+n], abs+int64(read)-f.begin)
+			fl.Close()
+			read += m
+			if err != nil {
+				return read, err
+			}
 		case st.part != nil:
-			src = st.part
+			m, err := st.part.ReadAt(b[read:int64(read)+n], abs+int64(read)-f.begin)
+			read += m
+			if err != nil {
+				return read, err
+			}
 		default:
-			p.t.mu.Unlock()
 			return read, fmt.Errorf("swarm: foreign: read of unstarted bytes in %q at offset %d (not downloading)", f.path, abs+int64(read))
-		}
-		p.t.mu.Unlock()
-		m, err := src.ReadAt(b[read:int64(read)+n], abs+int64(read)-f.begin)
-		read += m
-		if err != nil {
-			return read, err
 		}
 	}
 	if read == 0 {
