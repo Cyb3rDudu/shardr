@@ -291,3 +291,30 @@ func TestStatusNewestFirst(t *testing.T) {
 		t.Fatalf("newest must be first:\n%s", out.String())
 	}
 }
+
+// TestCatalogCommandsUseConfigURL pins that the CLI catalog commands
+// honor [catalog] url from config.toml (same resolution as the daemon):
+// a mirror configured for the daemon must be what the CLI talks to.
+// Offline-deterministic: the unreachable error names the configured
+// host, so a silent fallback to the live default cannot pass.
+func TestCatalogCommandsUseConfigURL(t *testing.T) {
+	t.Setenv("SHARDR_CATALOG_URL", "")
+	t.Setenv("SHARDR_CONFIG", writeCfg(t, "[catalog]\nurl = \"https://127.0.0.1:1\"\n"))
+
+	err := CatalogSearch(context.Background(), []string{"tinyllm"}, &strings.Builder{})
+	if err == nil || !strings.Contains(err.Error(), "127.0.0.1:1") {
+		t.Fatalf("search must hit the configured dead mirror (error names it), got %v", err)
+	}
+	// CatalogPull resolves against the same provider BEFORE contacting
+	// the daemon — a nil-client is safe: resolve must fail first.
+	err = CatalogPull(context.Background(), &Client{}, "arnir0/Tiny-LLM", CatalogPullOptions{}, &strings.Builder{})
+	if err == nil || !strings.Contains(err.Error(), "127.0.0.1:1") {
+		t.Fatalf("pull must resolve via the configured mirror (error names it), got %v", err)
+	}
+
+	// Invalid url → loud E_CONFIG, never a silent fallback to default.
+	t.Setenv("SHARDR_CONFIG", writeCfg(t, "[catalog]\nurl = \"http://insecure.example\"\n"))
+	if err := CatalogSearch(context.Background(), []string{"tinyllm"}, &strings.Builder{}); err == nil || !strings.Contains(err.Error(), "E_CONFIG") {
+		t.Fatalf("invalid [catalog] url must be loud E_CONFIG: %v", err)
+	}
+}

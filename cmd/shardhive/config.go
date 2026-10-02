@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"net/url"
 
 	"github.com/Cyb3rDudu/shardr/internal/catalog"
 	"github.com/Cyb3rDudu/shardr/internal/config"
@@ -121,10 +120,11 @@ func loadCatalogUploadLimit(swarmUploadLimit int64) (int64, error) {
 
 // resolveCatalogURL resolves [catalog] url (Epic #65 follow-up):
 // "" when unset — the provider then applies its own default
-// (DefaultPiratefaceURL; behavior unchanged). A set value is validated
-// fail-closed: an ABSOLUTE https:// URL with a host and NO
-// path/query/fragment (scheme + host, optional port) — anything else
-// is a loud startup error with the reason, never a silent fallback.
+// (DefaultPiratefaceURL; behavior unchanged). The value rule itself is
+// single-sourced in catalog.ResolveConfigURL (shared with the CLI so
+// the two cannot drift); this wrapper adds the daemon's fail-closed
+// section check: any unknown [catalog] key is loud here, whichever
+// resolver runs first.
 func resolveCatalogURL(f config.File) (string, error) {
 	sec, ok := f[catalogSection]
 	if !ok {
@@ -133,18 +133,7 @@ func resolveCatalogURL(f config.File) (string, error) {
 	if err := unknownCatalogKey(sec); err != nil {
 		return "", err
 	}
-	v, ok := sec["url"]
-	if !ok {
-		return "", nil
-	}
-	if v.Kind != config.KindString {
-		return "", fmt.Errorf("config: [catalog] url must be a quoted string")
-	}
-	u, err := url.Parse(v.Str)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
-		return "", fmt.Errorf("config: [catalog] url must be an absolute https:// URL with host and without path/query/fragment (scheme + host, optional port; unset = default %q), got %q", catalog.DefaultPiratefaceURL, v.Str)
-	}
-	return v.Str, nil
+	return catalog.ResolveConfigURL(f)
 }
 
 // loadCatalogURL is the standalone form (config loaded here).

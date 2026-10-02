@@ -118,13 +118,36 @@ func runImportJob(ctx context.Context, c *Client, out io.Writer, path string, bo
 	return nil
 }
 
+// catalogProvider builds the CLI's catalog provider with the SAME
+// base-URL resolution as the daemon: [catalog] url from config.toml
+// (validated by the shared catalog.ResolveConfigURL), else
+// $SHARDR_CATALOG_URL, else the default. Without this, a mirror
+// configured for the daemon would be invisible to `catalog search`
+// and `pull` — the CLI pre-checks must see the provider the daemon
+// will actually use. Config errors are loud (E_CONFIG), never a
+// silent fallback to the default.
+func catalogProvider() (*catalog.Pirateface, error) {
+	f, err := config.Load()
+	if err != nil {
+		return nil, fmt.Errorf("E_CONFIG: %w", err)
+	}
+	u, err := catalog.ResolveConfigURL(f)
+	if err != nil {
+		return nil, fmt.Errorf("E_CONFIG: %w", err)
+	}
+	return catalog.NewPiratefaceAt(u), nil
+}
+
 // CatalogSearch runs a provider search and renders the listing
 // (repo, size, reported seeds, magnet).
 func CatalogSearch(ctx context.Context, terms []string, out io.Writer) error {
 	if len(terms) == 0 {
 		return fmt.Errorf("E_BAD_REQUEST: catalog search needs terms")
 	}
-	pf := catalog.NewPirateface()
+	pf, err := catalogProvider()
+	if err != nil {
+		return err
+	}
 	models, err := pf.Search(ctx, strings.Join(terms, " "))
 	if err != nil {
 		return err
@@ -150,7 +173,10 @@ type CatalogPullOptions struct {
 // trust path itself — the CLI is comfort, never authority), then the
 // import job with its trust-shift warning rendered on top.
 func CatalogPull(ctx context.Context, c *Client, repo string, opts CatalogPullOptions, out io.Writer) error {
-	pf := catalog.NewPirateface()
+	pf, err := catalogProvider()
+	if err != nil {
+		return err
+	}
 	resolved, err := pf.Resolve(ctx, repo)
 	if err != nil {
 		return err

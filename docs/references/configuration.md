@@ -48,9 +48,13 @@ Read by `shardhive serve` (`cmd/shardhive/config.go`). Defaults from
 | Key | Type | Default | Effect |
 | --- | --- | --- | --- |
 | `upload_limit` | int | inherit `[swarm] upload_limit` | separate good-citizen seeding budget for catalog swarms (bytes/second, `0` = unlimited). When unset, the `[swarm]` value applies — the two budgets never eat each other |
-| `url` | string | provider default (`https://pirateface.co`) | catalog provider base URL (mirror/testing). Validated fail-closed at startup: absolute `https://` with host, no path/query/fragment/userinfo (scheme + host, optional port). The URL flows to every provider-derived endpoint (listings, model pages, checksums); magnet webseeds stay content-driven (they come from the listing itself) |
+| `url` | string | provider default (`https://pirateface.co`) | catalog provider base URL (mirror/testing), honored by the daemon **and** the CLI catalog commands. Validated fail-closed at startup: absolute `https://` with host, no path/query/fragment/userinfo (scheme + host, optional port). The URL flows to every provider-derived endpoint (listings, model pages, checksums); magnet webseeds stay content-driven (they come from the listing itself) |
 
 Unknown `[catalog]` keys are a loud error, same as `[swarm]`.
+
+Base-URL precedence: `[catalog] url` wins over `$SHARDR_CATALOG_URL`,
+which wins over the built-in default — config is the explicit knob,
+the env var is the CLI/test override.
 
 ## `[references]` — CLI comfort only
 
@@ -132,6 +136,7 @@ build/fetch tooling):
 | `SHARDR_CAS` | CAS | store root override |
 | `XDG_DATA_HOME` | CAS | default store root base (`…/shardr/cas`) |
 | `SHARDR_HF_TOKEN` | importer | Hugging Face bearer token for gated repos |
+| `SHARDR_CATALOG_URL` | catalog provider | base-URL override when `[catalog] url` is unset (config wins; env is the CLI/test fallback) |
 | `HF_ENDPOINT` | importer | Hugging Face API endpoint override (mirrors) |
 | `SHARDR_LLAMA_SERVER` | runner | llama-server binary override (else: next to the `shardr` executable, then `$PATH`) |
 | `GITHUB_TOKEN` | llama-lock fetch / workflows | GitHub release-API token — without it the prebuilt fetch can rate-limit (403) |
