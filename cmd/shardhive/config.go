@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"net/url"
 
+	"github.com/Cyb3rDudu/shardr/internal/catalog"
 	"github.com/Cyb3rDudu/shardr/internal/config"
 	"github.com/Cyb3rDudu/shardr/internal/swarm"
 )
@@ -22,6 +24,7 @@ var swarmKeys = map[string]bool{
 
 var catalogKeys = map[string]bool{
 	"upload_limit": true,
+	"url":          true,
 }
 
 // loadSwarmConfig reads config.toml and returns the [swarm] config, or
@@ -70,6 +73,18 @@ func loadSwarmConfig() (swarm.Config, error) {
 	return cfg, nil
 }
 
+// unknownCatalogKey validates the [catalog] key set once — both
+// resolvers call it, so any unknown key is loud whichever value the
+// daemon reads first (fail closed on the section, not the key).
+func unknownCatalogKey(sec map[string]config.Value) error {
+	for _, key := range sortedKeys(sec) {
+		if !catalogKeys[key] {
+			return fmt.Errorf("config %s: unknown [catalog] key %q (known: upload_limit, url)", configPathForError(), key)
+		}
+	}
+	return nil
+}
+
 // resolveCatalogUploadLimit resolves the good-citizen seeding budget
 // (Epic #65 ruling 2): [catalog] upload_limit when set, else INHERIT
 // [swarm] upload_limit (same semantics, 0 = unlimited). Unknown
@@ -79,10 +94,8 @@ func resolveCatalogUploadLimit(f config.File, swarmUploadLimit int64) (int64, er
 	if !ok {
 		return swarmUploadLimit, nil
 	}
-	for _, key := range sortedKeys(sec) {
-		if !catalogKeys[key] {
-			return 0, fmt.Errorf("config %s: unknown [catalog] key %q (known: upload_limit)", configPathForError(), key)
-		}
+	if err := unknownCatalogKey(sec); err != nil {
+		return 0, err
 	}
 	v, ok := sec["upload_limit"]
 	if !ok {
@@ -104,6 +117,43 @@ func loadCatalogUploadLimit(swarmUploadLimit int64) (int64, error) {
 		return 0, err
 	}
 	return resolveCatalogUploadLimit(f, swarmUploadLimit)
+}
+
+// resolveCatalogURL resolves [catalog] url (Epic #65 follow-up):
+// "" when unset — the provider then applies its own default
+// (DefaultPiratefaceURL; behavior unchanged). A set value is validated
+// fail-closed: an ABSOLUTE https:// URL with a host and NO
+// path/query/fragment (scheme + host, optional port) — anything else
+// is a loud startup error with the reason, never a silent fallback.
+func resolveCatalogURL(f config.File) (string, error) {
+	sec, ok := f[catalogSection]
+	if !ok {
+		return "", nil
+	}
+	if err := unknownCatalogKey(sec); err != nil {
+		return "", err
+	}
+	v, ok := sec["url"]
+	if !ok {
+		return "", nil
+	}
+	if v.Kind != config.KindString {
+		return "", fmt.Errorf("config: [catalog] url must be a quoted string")
+	}
+	u, err := url.Parse(v.Str)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return "", fmt.Errorf("config: [catalog] url must be an absolute https:// URL with host and without path/query/fragment (scheme + host, optional port; unset = default %q), got %q", catalog.DefaultPiratefaceURL, v.Str)
+	}
+	return v.Str, nil
+}
+
+// loadCatalogURL is the standalone form (config loaded here).
+func loadCatalogURL() (string, error) {
+	f, err := config.Load()
+	if err != nil {
+		return "", err
+	}
+	return resolveCatalogURL(f)
 }
 
 func sortedKeys(sec map[string]config.Value) []string {
