@@ -834,6 +834,12 @@ func (s *Server) handleImportCatalog(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, ErrSourceUnavail, "catalog provider disabled")
 		return
 	}
+	if s.HF == nil {
+		// Same guard as /import/hf: a nil HF client must answer 503, not
+		// dereference inside the anchor resolver.
+		writeErr(w, http.StatusServiceUnavailable, ErrSourceUnavail, "HF client disabled — catalog anchors derive from Hugging Face")
+		return
+	}
 	if s.Swarm == nil {
 		writeErr(w, http.StatusServiceUnavailable, ErrSourceUnavail, "swarm client disabled ([swarm] enabled) — catalog pulls need the swarm")
 		return

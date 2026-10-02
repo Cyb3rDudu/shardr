@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/anacrolix/torrent"
+	"golang.org/x/time/rate"
 
 	"github.com/Cyb3rDudu/shardr/internal/cas"
 	"github.com/Cyb3rDudu/shardr/internal/catalog"
@@ -47,9 +48,9 @@ type CatalogResult struct {
 // DHT presence and upload budget from the v2 client).
 func (c *Client) foreignEngine() (*torrent.Client, error) {
 	c.foreignOnce.Do(func() {
-		c.foreignStor = NewForeignStorage(c.store)
+		stor := NewForeignStorage(c.store)
 		tcfg := torrent.NewDefaultClientConfig()
-		tcfg.DefaultStorage = c.foreignStor
+		tcfg.DefaultStorage = stor
 		tcfg.NoDHT = !c.cfg.DHT
 		tcfg.Seed = true // good-citizen mode is the point of the strand
 		tcfg.DisableIPv6 = c.cfg.DisableIPv6
@@ -57,16 +58,26 @@ func (c *Client) foreignEngine() (*torrent.Client, error) {
 			tcfg.ListenHost = func(string) string { return c.cfg.ListenHost }
 		}
 		tcfg.ListenPort = 0
+		var lim *rate.Limiter
 		if c.cfg.CatalogUploadLimit > 0 {
-			c.foreignLim = uploadLimiter(c.cfg.CatalogUploadLimit)
+			lim = uploadLimiter(c.cfg.CatalogUploadLimit)
+			tcfg.UploadRateLimiter = lim
 		}
 		tc, err := torrent.NewClient(tcfg)
+		c.foreignMu.Lock()
+		c.foreignStor = stor
+		c.foreignLim = lim
+		c.foreignTcfg = tcfg // retained for the wiring test (limiter attachment)
 		if err != nil {
 			c.foreignErr = fmt.Errorf("swarm: catalog: foreign engine: %w", err)
+			c.foreignMu.Unlock()
 			return
 		}
 		c.foreignTC = tc
+		c.foreignMu.Unlock()
 	})
+	c.foreignMu.Lock()
+	defer c.foreignMu.Unlock()
 	if c.foreignErr != nil {
 		return nil, c.foreignErr
 	}
@@ -133,6 +144,16 @@ func (c *Client) ImportCatalog(ctx context.Context, pull *CatalogPull, progress 
 		return nil, fmt.Errorf("swarm: catalog: %s listed a v2 torrent; the catalog provider ships v1 (strand assumption broken — file this)", r.Repo)
 	}
 
+	drv := c.foreignStor.driverFor(r.Infohash)
+	if drv == nil {
+		dropTorrent(t)
+		return nil, fmt.Errorf("swarm: catalog: foreign driver not open for %s (anchor open failed?)", r.Infohash)
+	}
+	// Best-effort pre-verification of CAS-hit pieces BEFORE priorities
+	// rise: the engine hashes the sealed blobs itself and never
+	// re-downloads them (partial-CAS re-pulls stay on the missing files).
+	drv.VerifyPreSealed(ctx, t)
+
 	// Wanted set: --quant filters GGUF weights to one quant family;
 	// everything else (companions, configs, tokenizer) always comes.
 	// v1 pieces can span a wanted and an unwanted file — those unwanted
@@ -151,11 +172,6 @@ func (c *Client) ImportCatalog(ctx context.Context, pull *CatalogPull, progress 
 		}
 	}
 
-	drv := c.foreignStor.driverFor(r.Infohash)
-	if drv == nil {
-		dropTorrent(t)
-		return nil, fmt.Errorf("swarm: catalog: foreign driver not open for %s (anchor open failed?)", r.Infohash)
-	}
 	target := len(wanted)
 	if progress != nil {
 		// The poller MUST die with this function: a live poller keeps
@@ -167,7 +183,7 @@ func (c *Client) ImportCatalog(ctx context.Context, pull *CatalogPull, progress 
 		defer pollCancel()
 		go pollProgress(pollCtx, drv, target, progress)
 	}
-	if err := drv.WaitSealed(ctx, target); err != nil {
+	if err := drv.WaitSealedWanted(ctx, wanted); err != nil {
 		dropTorrent(t)
 		return nil, err
 	}
@@ -202,6 +218,10 @@ func (c *Client) ImportCatalog(ctx context.Context, pull *CatalogPull, progress 
 		As: as, HFRepo: r.Repo, HFRevision: r.Revision,
 	})
 	if err != nil {
+		// No good-citizen handle for a failed pull: without this drop the
+		// torrent keeps running in the engine untracked, downloading and
+		// seeding under the catalog budget with no way to control it.
+		dropTorrent(t)
 		return nil, err
 	}
 
