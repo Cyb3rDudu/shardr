@@ -4,7 +4,8 @@ A catalog pull fetches a community-listed model torrent into your CAS
 and keeps seeding the swarm it came from. The first (and currently only)
 provider is [pirateface.co](https://pirateface.co), a listing of
 checksum-verified BitTorrent torrents for Apache-2.0/MIT Hugging Face
-models.
+models. The provider base URL is configurable ([`[catalog] url`](config.md)
+for mirrors/testing; unset = the built-in default).
 
 ```sh
 shardr catalog search smollm2

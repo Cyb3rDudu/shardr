@@ -30,6 +30,8 @@ dht = true                # DHT + PEX
 # good-citizen seeding budget for foreign catalog swarms; unset
 # inherits [swarm] upload_limit
 upload_limit = 524288
+# catalog provider base URL; unset = the built-in default
+url = "https://pirateface.co"
 
 [references]
 # Interactive-CLI comfort ONLY: applied when a human types a
@@ -68,24 +70,32 @@ Rules the parser enforces:
 - Keys inside other sections are **not** validated by shardhive — those
   sections belong to other components.
 
-## `[catalog]` — community seeding budget
+## `[catalog]` — community seeding budget & provider URL
 
-The good-citizen seeding budget for foreign catalog swarms (see
-[Catalog pulls](catalog.md)). One key:
+The good-citizen seeding budget for foreign catalog swarms and the
+catalog provider base URL (see
+[Catalog pulls](catalog.md)). Two keys:
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `upload_limit` | int | inherits `[swarm] upload_limit` | bytes/sec for seeding catalog-listed torrents, `0` = unlimited; must be ≥ 0 |
+| `url` | string | the built-in provider default | provider base URL (mirror/testing). Must be an absolute `https://` URL with a host and no path/query/fragment — anything else is a loud startup error |
 
-When the key is unset, the `[swarm]` value applies — one budget for
-your own swarms, a separate, explicitly-configurable budget for
+When `upload_limit` is unset, the `[swarm]` value applies — one budget
+for your own swarms, a separate, explicitly-configurable budget for
 community swarms. Unknown `[catalog]` keys are a loud error (same
 fail-closed rule as `[swarm]`).
 
 ```toml
 [catalog]
 upload_limit = 524288     # 512 KiB/s give-back to community swarms
+url = "https://pirateface.co"   # unset = the same default
 ```
+
+`url` changes where the daemon resolves listings, model pages, and
+checksum records from — the anchor still comes from Hugging Face, and
+magnet webseeds still come from the listing content itself (they are
+not derived from `url`). Choosing a provider is a trust decision.
 
 ## `[references]` — CLI-only comfort
 
