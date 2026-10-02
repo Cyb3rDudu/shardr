@@ -7,8 +7,8 @@ checksum-verified BitTorrent torrents for Apache-2.0/MIT Hugging Face
 models.
 
 ```sh
-shardr catalog search qwen 0.5b gguf
-shardr pull bartowski/Qwen2.5-0.5B-Instruct-GGUF --quant raw
+shardr catalog search smollm2
+shardr pull HuggingFaceTB/SmolLM2-135M-Instruct
 ```
 
 A bare `owner/repo` argument (no `:quant` selector) is a catalog pull.
