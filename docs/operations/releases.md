@@ -41,8 +41,8 @@ plus upstream commit short SHA, matching the lock.
 
 ## Daily update flow (bot: workflow A → E2E gate → merge)
 
-`.github/workflows/llama-upstream-check.yml` runs daily (cron 17:03
-UTC) and never merges, never releases:
+`.github/workflows/llama-upstream-check.yml` runs daily (cron
+`17 3 * * *` — 03:17 UTC) and never merges, never releases:
 
 1. **Verify the current pin** — if upstream re-uploaded assets under
    the same bNNNN (digests no longer match), the run goes red *before*
@@ -121,6 +121,7 @@ shardr-runner/
                             # runtime_source, platform, built_at
   LICENSES/
     llama.cpp               # upstream license (from the prebuilt archive)
+    shardr                  # shardr's own license
     go/<module>/…           # Go dependency licenses from the module cache
 ```
 

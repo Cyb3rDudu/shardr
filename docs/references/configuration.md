@@ -72,7 +72,9 @@ loud error at run time, with provenance of the layer it came from
 | 3 · `--config <file>` | same schema as layer 2, from an explicit file |
 | 4 · `--set key=value` | repeatable command-line overrides |
 
-Allowlist (spec 002 §7.1, as mapped in `internal/runner/overlay.go`):
+Allowlist (spec 002 §7.1, as mapped in `internal/runner/overlay.go`;
+valid in layers 2–4 — the **advisory layer accepts only `ctx_size` and
+`jinja`**, publisher content must stay machine-neutral per 002 §2.1):
 
 | Key | Type | llama-server flag |
 | --- | --- | --- |
@@ -117,6 +119,9 @@ ctx_size = 8192                 # per-model override, wins per key
 
 ## Environment variables
 
+User-relevant variables across the components (daemon, CLI, runner,
+build/fetch tooling):
+
 | Variable | Consumer | Effect |
 | --- | --- | --- |
 | `SHARDR_CONFIG` | config loader | config.toml path override |
@@ -125,3 +130,6 @@ ctx_size = 8192                 # per-model override, wins per key
 | `SHARDR_CAS` | CAS | store root override |
 | `XDG_DATA_HOME` | CAS | default store root base (`…/shardr/cas`) |
 | `SHARDR_HF_TOKEN` | importer | Hugging Face bearer token for gated repos |
+| `HF_ENDPOINT` | importer | Hugging Face API endpoint override (mirrors) |
+| `SHARDR_LLAMA_SERVER` | runner | llama-server binary override (else: next to the `shardr` executable, then `$PATH`) |
+| `GITHUB_TOKEN` | llama-lock fetch / workflows | GitHub release-API token — without it the prebuilt fetch can rate-limit (403) |

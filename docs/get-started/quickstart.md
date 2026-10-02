@@ -34,22 +34,27 @@ shardhive 0.0.1-dev listening on /var/folders/…/T/shardhive-501/shardhive.sock
 ```
 
 In a second shell the CLI speaks to it over the Unix socket (the
-socket permission is the access boundary — mode 0600):
+socket permission is the access boundary — mode 0600). A fresh store
+is honest about being empty (executed against a fresh CAS):
 
 ```console
 $ ./bin/shardr models
-minicpmv/mmproj    index present    raw
+no models imported yet — shardr import local <paths> --as ns/name
 ```
 
 ## 3. Import a model
 
 Local import (namespace is mandatory — files must be regular files;
-filenames drive quant classification, so keep quant tokens lowercase):
+filenames drive quant classification, so keep quant tokens lowercase;
+executed with the pinned SmolLM2-135M Q4_K_M weights, digest
+`ed5fa30c487b282e…`):
 
 ```console
 $ ./bin/shardr import local /tmp/toy-model --as gold/smollm2-135m-instruct
-# job terminal state:
-#   state done  quants [q4_k_m]  skipped 0
+import started: job 4bce521b40d9ea6e
+  fetching 0/1  fetching 1/3  done 1/1
+  quant q4_k_m
+done
 ```
 
 The same flow works over the API (`POST /v1/import/local`), from
@@ -65,9 +70,12 @@ seeders online fails loudly after two minutes — see
 
 ```console
 $ ./bin/shardr models
-gold/smollm2-135m-instruct    index present    q4_k_m,q4km,raw
-minicpmv/mmproj               index present    raw
+gold/smollm2-135m-instruct    index present    q4_k_m
 ```
+
+(Re-importing the same bytes under other names converges into the
+same index and adds the derived quants as members — see the table in
+the [URI grammar](../references/uri-references.md#where-quant-names-come-from).)
 
 ## 5. Run the model
 
@@ -79,6 +87,7 @@ spawn <worktree>/bin/llama-server
 serving shardr:///gold/smollm2-135m-instruct:q4_k_m
   id       docs-e2e
   endpoint http://127.0.0.1:63441
+  model    shardr:///gold/smollm2-135m-instruct:q4_k_m
 ```
 
 The weights path is the CAS blob itself — llama-server mmaps it

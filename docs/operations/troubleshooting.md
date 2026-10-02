@@ -138,7 +138,9 @@ stopped docs-e2e
 - **Foreground `shardr run` hangs after Ctrl-C** — SIGTERM is sent;
   the supervisor waits up to 30 s before SIGKILL. A second Ctrl-C does
   not skip the window.
-- **llama-server not found** — the runner resolves `llama-server`
-  next to the `shardr` executable (`bin/llama-server`, a symlink
-  into the pinned extract dir). Run `make llama` (part of
-  `make all`).
+- **llama-server not found (`E_BINARY`)** — the runner resolves
+  `llama-server` next to the `shardr` executable (`bin/llama-server`, a
+  symlink into the pinned extract dir); the message names all remedies.
+  Run `make llama` (part of `make all`), or point
+  `$SHARDR_LLAMA_SERVER` at a binary, or install llama-server on
+  `$PATH`.

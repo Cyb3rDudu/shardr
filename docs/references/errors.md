@@ -45,11 +45,26 @@ envelope `{"error":{"code","message","candidates"?}}` (see
 
 ## Artifact validation — `internal/artifact/validate.go`
 
-| Code | Meaning | Typical cause | Remedy |
-| --- | --- | --- | --- |
-| `E_VALIDATION` | generic 001 artifact rule violation | structurally invalid manifest/index | terminal — content does not meet the format |
-| `E_VALIDATION_KIND` | wrong artifact `artifactType` | kind confusion between index/manifest | check the producer |
-| `E_VALIDATION_RESERVED_PATH` | reserved path rule violation (001) | file path shape the format forbids | terminal — content is not importable |
+Structural 001 rule violations. They surface as the `message` of
+`E_INVALID_INDEX` (index validation) or `E_NOT_IMPORTABLE` (manifest
+validation in an import job) — the class names the exact broken rule:
+
+| Code | Rule violated |
+| --- | --- |
+| `E_VALIDATION` | generic 001 document rule (bad JSON shape, wrong `schemaVersion`, missing `artifactType`, unknown file kind, config-name/cardinality rules, path collisions) |
+| `E_VALIDATION_KIND` | unknown `artifactType` |
+| `E_VALIDATION_RESERVED_PATH` | `manifest/` path prefix is reserved for the embedded manifest document (001 §3.1 rule 1, ruling R2) |
+| `E_VALIDATION_WEIGHTS_MIX` | more than one weights format in an artifact (`weights.gguf` + `weights.safetensors`) |
+| `E_VALIDATION_WEIGHTS_MISSING` | artifact requires at least one weights entry (001 §3.1) |
+| `E_VALIDATION_CARDINALITY` | tokenizer/chat-template entries exceed their 0..1 cardinality |
+| `E_VALIDATION_PARTS` | split-GGUF parts not contiguous `1..n` (duplicates/gaps caught element-wise) |
+| `E_VALIDATION_RUNTIME_DUP` | more than one runtime-config entry for the same runtime id (001 §3.1: ≤ 1) |
+| `E_VALIDATION_FILE_ORDER` | manifest files violate the canonical file order |
+| `E_VALIDATION_QUANT_DUP` | duplicate quant among index members |
+| `E_VALIDATION_INFOHASH` | distribution-record infohash rule failure |
+
+All are terminal verdicts on the content — the content does not meet
+the format; no retry changes that.
 
 ## CLI — `internal/cli/` (client side)
 
@@ -61,6 +76,17 @@ envelope `{"error":{"code","message","candidates"?}}` (see
 | `E_STATE` | client-side state problems: socket resolution, serve-registry/split-scratch issues, pid identity verification failures | stale registry entries, pid reuse, leftover scratch dirs | the message names the file to inspect and clean manually |
 | `E_CONFIG` | CLI-side config problems (`--config` read/parse, advisory runtime-config entries) | malformed TOML/JSON overlay file | fix the named file/key |
 | `E_RUNTIME` | runner subprocess/scratch problems | split-part linking failures, scratch cleanup | the message names the path; usually disk/permission state |
+| `E_BINARY` | llama-server binary not found (`internal/runner/llama.go`) — the first-run failure when the pinned runtime was never fetched; also fires for a bad `$SHARDR_LLAMA_SERVER` override | fresh checkout without `make llama`; typo in the override | the message names all three remedies: `make llama`, `$SHARDR_LLAMA_SERVER`, or llama-server on `$PATH` |
+
+## Runtime tooling — `internal/llamalock`, `cmd/llama-lock`
+
+Surfaced by `make llama` and the lockfile workflows, not the daemon
+API:
+
+| Code | Meaning | Typical cause | Remedy |
+| --- | --- | --- | --- |
+| `E_DIGEST` | fetched runtime asset does not hash to the pinned SHA-256 (`llamalock.go`) | upstream re-uploaded assets under the same bNNNN, corrupted download | re-fetch; if it persists, upstream moved — the pin must be re-derived (never force past it) |
+| `E_PROVENANCE` | release-API digest or tag commit disagrees with the lock (`cmd/llama-lock`) | tag moved upstream, release re-packed | the lockfile PR flow re-pins deliberately; never auto-accept |
 
 Daemon-side config failures (unknown `[swarm]`/`[catalog]` key, wrong
 value type) are loud startup errors on stderr, not `E_` classes
