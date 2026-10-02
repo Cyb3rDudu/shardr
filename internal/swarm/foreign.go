@@ -56,6 +56,10 @@ type ForeignFile struct {
 // torrent/anchor mismatch).
 const emptyContentSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
+// emptyGitBlobSHA1 is git's blob id of zero bytes (an HF anchor for an
+// empty non-LFS file pins exactly this).
+const emptyGitBlobSHA1 = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+
 // foreignReg is one torrent's registration: the anchor set plus its
 // strictness. Strict (live HF anchor): every torrent file must be
 // covered — a file outside the anchor is unanchorable and refused.
@@ -180,14 +184,26 @@ func newForeignTorrent(parent *ForeignStorage, key string, info *metainfo.Info, 
 		if !anchored && reg.strict {
 			return nil, fmt.Errorf("swarm: foreign: torrent carries %q outside the anchor (%d pinned files) — unanchorable bytes; refusing (E_NOT_ANCHORED class)", path, len(reg.files))
 		}
+		// Size gate FIRST — before the empty-file special case: a live
+		// anchor claiming bytes (non-LFS files carry Size + git oid, no
+		// sha256) on an empty torrent file is a metadata mismatch and
+		// must refuse, not silently seal empty (a.Size == 0 is the honest
+		// no-size record of catalog anchors and passes).
+		if anchored && a.Size != 0 && a.Size != fi.Length {
+			return nil, fmt.Errorf("swarm: foreign: anchor size mismatch for %q: anchor says %d bytes, torrent says %d — the torrent is not what the anchor describes; refusing", path, a.Size, fi.Length)
+		}
 		if fi.Length == 0 {
 			// v1-legal empty file: no stream bytes, no pieces. Seal AT OPEN
 			// under the empty digest (CAS-Put once, Has-guarded — a
 			// recognized empty file is still read by the importer, and
 			// artifact completeness needs the blob). An anchor pinning any
-			// OTHER digest on an empty file is a mismatch — refuse at open.
+			// OTHER digest (sha256 or git blob) on an empty file is a
+			// mismatch — refuse at open.
 			if a.SHA256 != "" && a.SHA256 != emptyContentSHA256 {
 				return nil, fmt.Errorf("swarm: foreign: anchor pins %s on empty file %q — the torrent is not what the anchor describes; refusing", a.SHA256, path)
+			}
+			if a.GitSHA1 != "" && a.GitSHA1 != emptyGitBlobSHA1 {
+				return nil, fmt.Errorf("swarm: foreign: anchor pins git blob %s on empty file %q — the torrent is not what the anchor describes; refusing", a.GitSHA1, path)
 			}
 			if !parent.store.Has(emptyContentSHA256) {
 				if err := parent.store.Put(emptyContentSHA256, strings.NewReader("")); err != nil {
@@ -200,9 +216,6 @@ func newForeignTorrent(parent *ForeignStorage, key string, info *metainfo.Info, 
 		begin, end := off, off+fi.Length
 		off = end
 		t.files = append(t.files, foreignFileRange{path: path, begin: begin, end: end})
-		if anchored && a.Size != 0 && a.Size != fi.Length {
-			return nil, fmt.Errorf("swarm: foreign: anchor size mismatch for %q: anchor says %d bytes, torrent says %d — the torrent is not what the anchor describes; refusing", path, a.Size, fi.Length)
-		}
 		n := int((end-1)/pl) - int(begin/pl) + 1
 		st := &foreignState{name: path, anchor: ForeignFile{Path: path, Size: fi.Length, SHA256: a.SHA256, GitSHA1: a.GitSHA1}, pieces: make([]bool, n)}
 		if a.SHA256 != "" && parent.store != nil && parent.store.Has(a.SHA256) {
